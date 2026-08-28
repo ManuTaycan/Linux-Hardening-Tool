@@ -24,11 +24,15 @@ sudo ./harden.sh \
   --aggressive \
   --remote-log-server 10.0.0.9 \
   --remote-log-port 5140 \
-  --remote-log-protocol tcp \
-  2>&1 | tee hardening-apply.log
+  --remote-log-protocol tcp
 
-sudo lynis audit system 2>&1 | tee lynis-after.log
+sudo cp /var/log/server-hardening.log ./hardening-apply.log
+sudo cp /root/lynis-after-hardening.txt ./lynis-after.log
 ```
 
-Bei Pipe-/`tee`-Ausgabe werden Farben absichtlich deaktiviert. Prüfe vor dem
-Hochladen `scripts/collect-test-artifacts.sh`-Archive auf sensible Informationen.
+Der offizielle Apply-/Zielsystemtest wird direkt und ohne externe Pipe oder
+`tee` gestartet. Nur so bleibt die automatische TTY-Farberkennung aktiv; das
+Skript schreibt den vollständigen ANSI-freien Lauf selbst nach
+`/var/log/server-hardening.log`. `--no-color` oder `NO_COLOR` deaktivieren die
+interaktive Farbausgabe. Prüfe vor dem Hochladen
+`scripts/collect-test-artifacts.sh`-Archive auf sensible Informationen.

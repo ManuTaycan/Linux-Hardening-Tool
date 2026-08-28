@@ -65,6 +65,14 @@ if [[ -z "$aide_call_line" || -z "$phase17_line" || -z "$module_lock_line" \
     report "kernel.modules_disabled final gate is not ordered after AIDE at phase 17"
 fi
 
+for streamed_command in update-grub update-initramfs augenrules chronyd rkhunter; do
+    grep -Eq "run_streamed[[:space:]]+${streamed_command}([[:space:]]|$)" harden.sh \
+        || report "${streamed_command} is not routed through synchronous logging"
+done
+if grep -Eq 'harden[.]sh.*[|][[:space:]]*tee|tee.*harden[.]sh' docs/TESTING.md README.md; then
+    report "official harden.sh test documentation still requires external tee"
+fi
+
 script_version="$(sed -nE 's/^readonly SCRIPT_VERSION="([^"]+)"$/\1/p' harden.sh)"
 version_file="$(tr -d '\r\n' < VERSION)"
 [[ -n "$script_version" && "$script_version" == "$version_file" ]] || report "VERSION does not match SCRIPT_VERSION"

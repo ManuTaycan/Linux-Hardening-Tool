@@ -897,14 +897,14 @@ EOF
 
     if [[ "$MODE" == "apply" ]]; then
         install -d -o root -g systemd-journal -m 2750 /var/log/journal
-        systemd-tmpfiles --create --prefix /var/log/journal || true
-        if ! systemctl restart systemd-journald; then
+        run_streamed systemd-tmpfiles --create --prefix /var/log/journal || true
+        if ! run_streamed systemctl restart systemd-journald; then
             log WARN "systemd-journald restart failed; persistent settings remain installed for the next service start"
         fi
         if command -v rsyslogd >/dev/null 2>&1; then
-            if rsyslogd -N1 \
-                && systemctl enable --now rsyslog.service \
-                && systemctl restart rsyslog.service \
+            if run_streamed rsyslogd -N1 \
+                && run_streamed systemctl enable --now rsyslog.service \
+                && run_streamed systemctl restart rsyslog.service \
                 && systemctl is-active --quiet rsyslog.service \
                 && remote_logging_destination_loaded; then
                 logger -p authpriv.notice -t harden.sh "rsyslog local/remote forwarding validation probe $(timestamp)" || true
@@ -915,7 +915,7 @@ EOF
             else
                 transaction_restore /etc/rsyslog.d/10-security-hardening.conf rsyslog-local.conf
                 transaction_restore /etc/rsyslog.d/90-remote-hardening.conf rsyslog-remote.conf
-                rsyslogd -N1 >/dev/null 2>&1 && systemctl restart rsyslog.service || true
+                rsyslogd -N1 >/dev/null 2>&1 && run_streamed systemctl restart rsyslog.service || true
                 REMOTE_LOG_STATUS="FAILED"
                 log ERROR "rsyslog validation failed; restored the prior local hardening fragment"
             fi
@@ -1427,7 +1427,7 @@ ${wireguard_rule}
 }
 EOF
     sed "s/hardening_filter/hardening_filter_validate_$$/g" "$candidate" > "$check_candidate"
-    if ! nft -c -f "$check_candidate"; then
+    if ! run_streamed nft -c -f "$check_candidate"; then
         rm -f "$candidate" "$check_candidate"
         FIREWALL_STATUS="FAILED"
         die "Candidate owned nftables table failed validation; all live firewall tables are untouched"
@@ -1459,12 +1459,12 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
+    run_streamed systemctl daemon-reload
     nft delete table inet hardening_filter 2>/dev/null || true
-    if nft -f /etc/nftables.d/99-security-hardening.nft \
+    if run_streamed nft -f /etc/nftables.d/99-security-hardening.nft \
         && nft list chain inet hardening_filter input >/dev/null 2>&1 \
-        && systemctl enable server-hardening-firewall.service \
-        && systemctl restart server-hardening-firewall.service; then
+        && run_streamed systemctl enable server-hardening-firewall.service \
+        && run_streamed systemctl restart server-hardening-firewall.service; then
         if [[ "$tailscale_healthy_before" -eq 1 ]] && ! tailscale status >/dev/null 2>&1; then
             log ERROR "Tailscale health check failed after loading the owned table"
         else
@@ -1477,11 +1477,11 @@ EOF
     nft delete table inet hardening_filter 2>/dev/null || true
     [[ -n "$own_before" ]] && nft -f "$own_before" || true
     if [[ -e "$BACKUP_DIR/transactions/firewall-service.absent" ]]; then
-        systemctl disable server-hardening-firewall.service 2>/dev/null || true
+        systemctl disable server-hardening-firewall.service >/dev/null 2>&1 || true
     fi
     transaction_restore /etc/nftables.d/99-security-hardening.nft nftables-hardening-table.nft
     transaction_restore /etc/systemd/system/server-hardening-firewall.service firewall-service
-    systemctl daemon-reload
+    run_streamed systemctl daemon-reload
     FIREWALL_STATUS="FAILED/OWNED TABLE ROLLED BACK"
     die "Owned nftables table failed activation or health validation; unrelated tables were never modified"
 }
@@ -1583,7 +1583,7 @@ EOF
         SSH_STATUS="FAILED"
         die "Firewall does not visibly allow the active SSH port ${SSH_PORT}; refusing to reload SSH"
     fi
-    if systemctl reload "$SSH_SERVICE" && systemctl is-active --quiet "$SSH_SERVICE" && "$SSHD_BIN" -t; then
+    if run_streamed systemctl reload "$SSH_SERVICE" && systemctl is-active --quiet "$SSH_SERVICE" && "$SSHD_BIN" -t; then
         SSH_STATUS="OK"
         record_change "Validated and reloaded hardened SSH configuration without terminating existing sessions"
         if [[ -z "$ADMIN_USER" ]]; then
@@ -1595,7 +1595,7 @@ EOF
         transaction_restore /etc/ssh/sshd_config.d/99-hardening.conf sshd-hardening.conf
         [[ -e "$BACKUP_DIR/transactions/sshd_config" || -e "$BACKUP_DIR/transactions/sshd_config.absent" ]] \
             && transaction_restore /etc/ssh/sshd_config sshd_config
-        systemctl reload "$SSH_SERVICE" || true
+        run_streamed systemctl reload "$SSH_SERVICE" || true
         SSH_STATUS="FAILED/ROLLED BACK"
         die "SSH reload/health check failed; prior configuration restored"
     fi
@@ -1634,7 +1634,9 @@ EOF
         FAIL2BAN_STATUS="PLANNED"
         return 0
     fi
-    if fail2ban-client -t && systemctl enable --now fail2ban.service && systemctl restart fail2ban.service; then
+    if run_streamed fail2ban-client -t \
+        && run_streamed systemctl enable --now fail2ban.service \
+        && run_streamed systemctl restart fail2ban.service; then
         if fail2ban-client status sshd >/dev/null 2>&1; then
             FAIL2BAN_STATUS="OK"
             record_change "Enabled and validated Fail2ban SSH jail using nftables"
@@ -1644,7 +1646,7 @@ EOF
     else
         transaction_restore /etc/fail2ban/jail.local fail2ban-global.local
         transaction_restore /etc/fail2ban/jail.d/99-sshd-hardening.local fail2ban-jail.local
-        systemctl restart fail2ban.service || true
+        run_streamed systemctl restart fail2ban.service || true
         FAIL2BAN_STATUS="FAILED/ROLLED BACK"
         log ROLLBACK "Fail2ban configuration failed validation or startup"
     fi
@@ -2042,12 +2044,12 @@ EOF
     done < /etc/audit/rules.d/99-hardening.rules > "$filtered"
     install -o root -g root -m 0600 "$filtered" /etc/audit/rules.d/99-hardening.rules
     rm -f "$filtered"
-    if ! augenrules --check; then
+    if ! run_streamed augenrules --check; then
         log INFO "augenrules reports that the compiled rules need regeneration; proceeding to the validating load"
     fi
-    if augenrules --load; then
-        systemctl enable auditd.service || true
-        if systemctl is-active --quiet auditd.service || service auditd start; then
+    if run_streamed augenrules --load; then
+        run_streamed systemctl enable auditd.service || true
+        if systemctl is-active --quiet auditd.service || run_streamed service auditd start; then
             local loaded_rules
             loaded_rules="$(auditctl -l 2>&1 || true)"
             if [[ -n "$loaded_rules" && "$loaded_rules" != "No rules" ]] \
@@ -2063,7 +2065,7 @@ EOF
         fi
     else
         transaction_restore /etc/audit/rules.d/99-hardening.rules audit-hardening.rules
-        augenrules --load || true
+        run_streamed augenrules --load || true
         AUDIT_STATUS="FAILED/ROLLED BACK"
         log ROLLBACK "Audit rules failed augenrules validation/load"
     fi
@@ -2333,7 +2335,7 @@ configure_startup_service_review() {
         return 0
     fi
     local default_target report=/root/startup-service-review.txt
-    systemctl set-default multi-user.target
+    run_streamed systemctl set-default multi-user.target
     default_target="$(systemctl get-default 2>/dev/null || true)"
     [[ "$default_target" == "multi-user.target" ]] \
         || die "Default systemd target verification failed: ${default_target:-unknown}"
@@ -2484,11 +2486,12 @@ systemd_verify_unit() {
 rollback_service_dropin() {
     local service="$1" destination="$2" transaction_label="$3" was_active="$4" health_action="$5" reason="$6"
     transaction_restore "$destination" "$transaction_label"
-    systemctl daemon-reload || true
+    run_streamed systemctl daemon-reload || true
     if [[ "$was_active" -eq 1 ]]; then
-        systemctl "$health_action" "$service" || systemctl restart "$service" || true
+        run_streamed systemctl "$health_action" "$service" \
+            || run_streamed systemctl restart "$service" || true
     else
-        systemctl stop "$service" 2>/dev/null || true
+        systemctl stop "$service" >/dev/null 2>&1 || true
     fi
     printf '%-36s ROLLED BACK: %s\n' "$service" "$reason" >> "$SYSTEMD_HARDENING_REPORT"
     log ROLLBACK "${reason}; restored the prior drop-in for ${service}"
@@ -2565,21 +2568,21 @@ install_service_dropin() {
         return 0
     fi
     chmod 0600 "$postverify_file"
-    if ! systemctl daemon-reload; then
+    if ! run_streamed systemctl daemon-reload; then
         rollback_service_dropin "$service" "$destination" "$transaction_label" "$was_active" "$health_action" "systemd daemon-reload failed"
         return 0
     fi
     if [[ "$was_active" -eq 1 ]]; then
-        if ! systemctl "$health_action" "$service" || ! systemctl is-active --quiet "$service"; then
+        if ! run_streamed systemctl "$health_action" "$service" || ! systemctl is-active --quiet "$service"; then
             rollback_service_dropin "$service" "$destination" "$transaction_label" "$was_active" "$health_action" "active-service health check failed"
             return 0
         fi
     elif [[ "$service" == "uuidd.service" ]]; then
-        if ! systemctl start "$service" || systemctl is-failed --quiet "$service"; then
+        if ! run_streamed systemctl start "$service" || systemctl is-failed --quiet "$service"; then
             rollback_service_dropin "$service" "$destination" "$transaction_label" "$was_active" "$health_action" "safe inactive-service health check failed"
             return 0
         fi
-        systemctl stop "$service" || true
+        run_streamed systemctl stop "$service" || true
     elif systemctl is-failed --quiet "$service"; then
         rollback_service_dropin "$service" "$destination" "$transaction_label" "$was_active" "$health_action" "inactive service is in failed state"
         return 0
@@ -2854,11 +2857,11 @@ EOF
     if [[ "$MODE" == "apply" ]]; then
         local chrony_config=/etc/chrony/chrony.conf
         [[ -f "$chrony_config" ]] || chrony_config=/etc/chrony.conf
-        if chronyd -p -f "$chrony_config" >/dev/null; then
-            systemctl disable --now systemd-timesyncd.service 2>/dev/null || true
-            systemctl disable --now ntp.service ntpsec.service 2>/dev/null || true
-            systemctl enable --now chrony.service
-            systemctl restart chrony.service
+        if run_streamed chronyd -p -f "$chrony_config"; then
+            run_streamed systemctl disable --now systemd-timesyncd.service || true
+            run_streamed systemctl disable --now ntp.service ntpsec.service || true
+            run_streamed systemctl enable --now chrony.service
+            run_streamed systemctl restart chrony.service
             record_change "Configured exactly one active time service: chrony"
         else
             log WARN "Chrony configuration validation failed"
@@ -2890,7 +2893,7 @@ GRUB_DISABLE_RECOVERY="true"
 GRUB_DISABLE_OS_PROBER="true"
 EOF
     if [[ "$MODE" == "apply" ]]; then
-        if update-grub; then
+        if run_streamed update-grub; then
             chmod 0600 /boot/grub/grub.cfg
             REBOOT_REQUIRED=1
             record_change "Disabled GRUB recovery entries and OS probing without boot authentication; regenerated grub.cfg"
@@ -2899,7 +2902,7 @@ EOF
             if [[ "$removed_managed_auth" -eq 1 ]]; then
                 transaction_restore /etc/grub.d/01_hardening_users grub-hardening-users
             fi
-            update-grub || true
+            run_streamed update-grub || true
             log ROLLBACK "GRUB regeneration failed; hardening fragment restored/removed"
         fi
     fi
@@ -2970,7 +2973,7 @@ configure_malware_scanner() {
         replace_setting /etc/default/rkhunter CRON_DB_UPDATE '"true"' '='
         replace_setting /etc/default/rkhunter APT_AUTOGEN '"true"' '='
         if [[ "$MODE" == "apply" ]]; then
-            rkhunter --propupd || true
+            run_streamed rkhunter --propupd || true
             record_change "Enabled daily rkhunter checks and updated the trusted property baseline"
         fi
     elif command -v chkrootkit >/dev/null 2>&1; then
@@ -3001,6 +3004,57 @@ aide_runtime_path() {
     ' "$config"
 }
 
+validate_aide_service_context() {
+    local service="$1" vendor_context="$2" runtime_config="$3" database_path="$4" aide_policy="$5"
+    local context_report="$BACKUP_DIR/aide-service-context.txt"
+    local load_state="" service_user="" ambient_caps="" result="" exec_status=""
+    load_state="$(systemctl show "$service" -p LoadState --value 2>/dev/null || true)"
+    service_user="$(systemctl show "$service" -p User --value 2>/dev/null || true)"
+    ambient_caps="$(systemctl show "$service" -p AmbientCapabilities --value 2>/dev/null || true)"
+    if [[ "$load_state" != "loaded" ]]; then
+        log ERROR "AIDE check service ${service} is not loaded"
+        return 1
+    fi
+    if [[ "$vendor_context" -eq 1 ]]; then
+        if [[ "$service_user" != "_aide" ]] \
+            || ! grep -Eiq 'CAP_DAC_READ_SEARCH' <<<"$ambient_caps" \
+            || ! grep -Eiq 'CAP_AUDIT_WRITE' <<<"$ambient_caps"; then
+            log ERROR "Vendor AIDE service ${service} lacks the expected _aide user/capability context"
+            return 1
+        fi
+    fi
+    {
+        printf 'AIDE service context validated %s\n' "$(timestamp)"
+        systemctl show "$service" -p Id -p LoadState -p User -p Group \
+            -p AmbientCapabilities -p CapabilityBoundingSet -p ExecStart
+        stat -c 'runtime %U:%G %a %n' "$runtime_config"
+        stat -c 'policy %U:%G %a %n' "$aide_policy"
+        stat -c 'database %U:%G %a %n' "$database_path"
+    } > "$context_report" 2>&1 || {
+        log ERROR "Could not record the AIDE service/config/database execution context"
+        return 1
+    }
+    chmod 0600 "$context_report"
+    run_streamed systemctl reset-failed "$service" || true
+    log INFO "Running one validated AIDE check through the actual ${service} execution context"
+    if ! run_streamed systemctl start "$service"; then
+        log ERROR "AIDE check service ${service} failed against the active runtime/database"
+        return 1
+    fi
+    result="$(systemctl show "$service" -p Result --value 2>/dev/null || true)"
+    exec_status="$(systemctl show "$service" -p ExecMainStatus --value 2>/dev/null || true)"
+    {
+        printf 'Result=%s\n' "$result"
+        printf 'ExecMainStatus=%s\n' "$exec_status"
+    } >> "$context_report"
+    if [[ "$result" != "success" ]] || systemctl is-failed --quiet "$service"; then
+        log ERROR "AIDE service-context check was not successful (Result=${result:-unknown}, ExecMainStatus=${exec_status:-unknown})"
+        return 1
+    fi
+    log OK "AIDE service-context check succeeded via ${service} as ${service_user:-root}"
+    return 0
+}
+
 configure_aide() {
     if [[ "$MODE" == "dry-run" ]]; then
         log INFO "Would validate the distribution AIDE runtime, add SHA256+SHA512 policy, atomically activate a missing or policy-obsolete baseline, verify aide --check, and only then enable its timer"
@@ -3018,7 +3072,8 @@ configure_aide() {
     if ! command -v aide >/dev/null 2>&1; then
         install_package aide || true
     fi
-    local aide_raw="" aide_config="" runtime_config="" aide_timer=""
+    local aide_raw="" aide_config="" runtime_config="" aide_timer="" aide_service=""
+    local vendor_service_context=0
     local database_path="" database_out_path="" aide_check_output="" aide_check_rc=0
     local aide_policy="${aide_etc_dir}/aide.conf.d/99_harden_sha2"
     local aide_policy_changed=0 aide_config_changed=0 baseline_required=0
@@ -3034,12 +3089,12 @@ configure_aide() {
     done
     if [[ -z "$aide_raw" || -z "$aide_config" ]]; then
         AIDE_STATUS="FAILED"
-        systemctl disable --now aide-check.timer dailyaidecheck.timer 2>/dev/null || true
+        systemctl disable --now aide-check.timer dailyaidecheck.timer >/dev/null 2>&1 || true
         record_skip "FINT-4315" "AIDE binary and a real non-empty configuration are both required; aide-common did not provide one"
         return 0
     fi
-    systemctl stop aide-check.timer dailyaidecheck.timer \
-        aide-check.service dailyaidecheck.service 2>/dev/null || true
+    run_streamed systemctl stop aide-check.timer dailyaidecheck.timer \
+        aide-check.service dailyaidecheck.service || true
     policy_content='# Managed by harden.sh: SHA-2 integrity policy v1.1.3
 HardenSHA2 = p+ftype+i+l+n+u+g+s+b+m+c+sha256+sha512
 =/etc/passwd HardenSHA2
@@ -3068,13 +3123,13 @@ HardenSHA2 = p+ftype+i+l+n+u+g+s+b+m+c+sha256+sha512
     if ! grep -Eiq '(^|[^[:alnum:]])sha256([^[:alnum:]]|$)' <<<"$version_output" \
         || ! grep -Eiq '(^|[^[:alnum:]])sha512([^[:alnum:]]|$)' <<<"$version_output"; then
         AIDE_STATUS="FAILED"
-        systemctl disable --now aide-check.timer dailyaidecheck.timer 2>/dev/null || true
+        systemctl disable --now aide-check.timer dailyaidecheck.timer >/dev/null 2>&1 || true
         record_skip "FINT-4402" "the installed AIDE binary does not report both SHA256 and SHA512 support"
         return 0
     fi
     if ! "$aide_raw" --config="$runtime_config" --config-check > "$BACKUP_DIR/aide-config-check.txt" 2>&1; then
         AIDE_STATUS="FAILED"
-        systemctl disable --now aide-check.timer dailyaidecheck.timer 2>/dev/null || true
+        systemctl disable --now aide-check.timer dailyaidecheck.timer >/dev/null 2>&1 || true
         record_skip "FINT-4315" "AIDE rejected active runtime configuration ${runtime_config}; no timer was enabled"
         return 0
     fi
@@ -3084,7 +3139,7 @@ HardenSHA2 = p+ftype+i+l+n+u+g+s+b+m+c+sha256+sha512
     database_out_path="$(aide_runtime_path "$runtime_config" database_out 2>/dev/null || true)"
     if [[ -z "$database_path" || -z "$database_out_path" || "$database_path" == "$database_out_path" ]]; then
         AIDE_STATUS="FAILED"
-        systemctl disable --now aide-check.timer dailyaidecheck.timer 2>/dev/null || true
+        systemctl disable --now aide-check.timer dailyaidecheck.timer >/dev/null 2>&1 || true
         record_skip "FINT-4316" "active runtime ${runtime_config} must declare distinct absolute database_in and database_out file paths"
         return 0
     fi
@@ -3096,13 +3151,16 @@ HardenSHA2 = p+ftype+i+l+n+u+g+s+b+m+c+sha256+sha512
     policy_stamp="${database_path}.harden-policy.sha256"
     if unit_file_exists dailyaidecheck.timer; then
         aide_timer=dailyaidecheck.timer
+        aide_service=dailyaidecheck.service
+        vendor_service_context=1
         if [[ -f "${systemd_dir}/aide-check.timer" ]] \
             && grep -q '^Description=Daily AIDE integrity check' "${systemd_dir}/aide-check.timer"; then
-            systemctl disable --now aide-check.timer 2>/dev/null || true
+            systemctl disable --now aide-check.timer >/dev/null 2>&1 || true
         fi
         log INFO "Using the aide-common vendor timer ${aide_timer}"
     else
         aide_timer=aide-check.timer
+        aide_service=aide-check.service
         install_managed_file "${systemd_dir}/aide-check.service" 0644 "$managed_owner" "$managed_group" <<EOF
 [Unit]
 Description=File integrity check with AIDE
@@ -3139,7 +3197,7 @@ Persistent=true
 WantedBy=timers.target
 EOF
     fi
-    if ! systemctl daemon-reload; then
+    if ! run_streamed systemctl daemon-reload; then
         AIDE_STATUS="FAILED"
         record_skip "FINT-4316" "systemd could not load the validated AIDE timer definition"
         return 0
@@ -3147,7 +3205,7 @@ EOF
     # A persistent timer must not race an initialization against a missing or
     # policy-obsolete database. It is enabled again only after a readable
     # baseline has been proven below.
-    systemctl stop "$aide_timer" 2>/dev/null || true
+    run_streamed systemctl stop "$aide_timer" || true
     if [[ ! -s "$database_path" || ! -s "$policy_stamp" \
         || "$(tr -d '[:space:]' < "$policy_stamp" 2>/dev/null || true)" != "$policy_digest" \
         || "$aide_policy_changed" -eq 1 || "$aide_config_changed" -eq 1 ]]; then
@@ -3157,7 +3215,7 @@ EOF
         if ! "$aide_raw" --config="$runtime_config" --init > "$BACKUP_DIR/aideinit.txt" 2>&1 \
             || [[ ! -s "$database_out_path" ]]; then
             AIDE_STATUS="FAILED"
-            systemctl disable --now "$aide_timer" 2>/dev/null || true
+            systemctl disable --now "$aide_timer" >/dev/null 2>&1 || true
             record_skip "FINT-4316" "aide --init failed to create database_out declared by ${runtime_config}; see ${BACKUP_DIR}/aideinit.txt"
             return 0
         fi
@@ -3187,7 +3245,7 @@ EOF
     fi
     if [[ ! -s "$database_path" ]]; then
         AIDE_STATUS="FAILED"
-        systemctl disable --now "$aide_timer" 2>/dev/null || true
+        systemctl disable --now "$aide_timer" >/dev/null 2>&1 || true
         record_skip "FINT-4316" "active database_in ${database_path} is absent or empty after initialization"
         return 0
     fi
@@ -3200,17 +3258,24 @@ EOF
     chmod 0600 "$BACKUP_DIR/aide-initial-check.txt"
     if [[ "$aide_check_rc" -gt 7 ]]; then
         AIDE_STATUS="FAILED"
-        systemctl disable --now "$aide_timer" 2>/dev/null || true
+        systemctl disable --now "$aide_timer" >/dev/null 2>&1 || true
         record_skip "FINT-4316" "the generated database exists but AIDE could not read and check it (exit ${aide_check_rc}); see ${BACKUP_DIR}/aide-initial-check.txt"
         return 0
     elif [[ "$aide_check_rc" -ne 0 ]]; then
         log WARN "AIDE baseline is readable but the immediate check reported changes (exit ${aide_check_rc}); see ${BACKUP_DIR}/aide-initial-check.txt"
     fi
-    if ! systemctl enable --now "$aide_timer" \
+    if ! validate_aide_service_context "$aide_service" "$vendor_service_context" \
+        "$runtime_config" "$database_path" "$aide_policy"; then
+        AIDE_STATUS="FAILED"
+        systemctl disable --now "$aide_timer" >/dev/null 2>&1 || true
+        record_skip "FINT-4316" "the actual ${aide_service} execution context could not read and check the active AIDE runtime/database"
+        return 0
+    fi
+    if ! run_streamed systemctl enable --now "$aide_timer" \
         || ! systemctl is-enabled --quiet "$aide_timer" \
         || ! systemctl is-active --quiet "$aide_timer"; then
         AIDE_STATUS="FAILED"
-        systemctl disable --now "$aide_timer" 2>/dev/null || true
+        systemctl disable --now "$aide_timer" >/dev/null 2>&1 || true
         record_skip "FINT-4316" "the validated AIDE timer could not be enabled after baseline verification"
         return 0
     fi
@@ -3257,7 +3322,7 @@ remediate_deleted_open_files() {
         esac
     done <<<"$pids"
     for unit in "${!restart_units[@]}"; do
-        if systemctl is-active --quiet "$unit" && systemctl restart "$unit" \
+        if systemctl is-active --quiet "$unit" && run_streamed systemctl restart "$unit" \
             && systemctl is-active --quiet "$unit"; then
             record_change "Restarted safe service ${unit} to release deleted open files"
         else
@@ -3441,7 +3506,7 @@ second_optimization_pass() {
     fi
     if grep -q '\[DEB-0880\]' "$first"; then configure_fail2ban; fi
     if grep -q '\[SSH-7408\]' "$first" && [[ -n "$SSHD_BIN" ]]; then
-        "$SSHD_BIN" -t && systemctl reload "$SSH_SERVICE" || true
+        "$SSHD_BIN" -t && run_streamed systemctl reload "$SSH_SERVICE" || true
     fi
     if grep -q '\[PKGS-7346\]' "$first"; then purge_removed_packages; fi
     if grep -q '\[PKGS-7370\]' "$first"; then configure_debsums; fi
