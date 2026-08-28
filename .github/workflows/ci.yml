@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  static-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes shellcheck
+      - name: Check whitespace
+        run: ./scripts/ci-whitespace-check.sh
+      - name: Run safe local checks
+        run: make check
+      - name: Verify help path
+        run: ./harden.sh --help
+      - name: Verify executable mode and checksum
+        run: |
+          test -x harden.sh
+          sha256sum -c SHA256SUMS
+      - name: Test installer in temporary path
+        run: |
+          tmp_dir="$(mktemp -d)"
+          trap 'sudo rm -rf "$tmp_dir"' EXIT
+          sudo bash install.sh --ref "$GITHUB_SHA" --install-path "$tmp_dir/new-parent/linux-hardening-tool"
+          test -f "$tmp_dir/new-parent/linux-hardening-tool"
+          test -x "$tmp_dir/new-parent/linux-hardening-tool"
+          test ! -d "$tmp_dir/new-parent/linux-hardening-tool"
+          existing_parent="$tmp_dir/existing-parent"
+          mkdir "$existing_parent"
+          chmod 0700 "$existing_parent"
+          parent_mode_before="$(stat -c '%a' "$existing_parent")"
+          sudo bash install.sh --ref "$GITHUB_SHA" --install-path "$existing_parent/linux-hardening-tool"
+          parent_mode_after="$(stat -c '%a' "$existing_parent")"
+          test "$parent_mode_after" = "$parent_mode_before"
+          test -f "$existing_parent/linux-hardening-tool"
+          test -x "$existing_parent/linux-hardening-tool"
+          test "$(stat -c '%a' "$existing_parent/linux-hardening-tool")" = 755
+          test ! -d "$existing_parent/linux-hardening-tool"

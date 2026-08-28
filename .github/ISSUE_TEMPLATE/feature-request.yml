@@ -1,0 +1,14 @@
+name: Feature request
+description: Beschreibe einen klar abgegrenzten Verbesserungsvorschlag.
+title: "feature: "
+body:
+  - type: textarea
+    attributes:
+      label: Problem und Ziel
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Sicherheitsauswirkung, Nicht-Ziele und Alternativen
+    validations:
+      required: true
