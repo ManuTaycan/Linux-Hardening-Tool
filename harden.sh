@@ -16,7 +16,7 @@ IFS=$'\n\t'
 umask 027
 
 readonly SCRIPT_VERSION="1.1.3"
-readonly LOG_FILE="/var/log/server-hardening.log"
+readonly LOG_FILE="${HARDEN_LOG_FILE:-/var/log/server-hardening.log}"
 readonly SYSTEMD_HARDENING_REPORT="/root/systemd-hardening-report.txt"
 readonly SOURCE_LYNIS_INDEX="86"
 readonly MAIN_PID="$BASHPID"
@@ -58,12 +58,15 @@ FAIL2BAN_STATUS="NOT RUN"
 UPDATES_STATUS="NOT RUN"
 REMOTE_LOG_STATUS="DISABLED"
 USE_COLOR=0
-LOG_CAPTURE_ACTIVE=0
+LOG_READY=0
 CURRENT_PHASE=0
 COMPLETED=0
 VALIDATION_COMPLETED=0
 FINAL_LYNIS_COMPLETED=0
 SUMMARY_PRINTED=0
+NETWORK_HARDENING_COMPLETED=0
+FIREWALL_COMPLETED=0
+APPARMOR_COMPLETED=0
 SYSTEMD_EXPOSURE_RESULT=""
 
 readonly COLOR_RESET=$'\033[0m'
@@ -76,7 +79,7 @@ readonly COLOR_BLUE=$'\033[34m'
 readonly COLOR_MAGENTA=$'\033[35m'
 readonly COLOR_CYAN=$'\033[36m'
 
-if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+if [[ -t 1 && -z "${NO_COLOR+x}" ]]; then
     USE_COLOR=1
 fi
 
@@ -176,7 +179,10 @@ render_colored_line() {
 
 emit_line() {
     local line="$1"
-    if [[ "$USE_COLOR" -eq 1 && "$LOG_CAPTURE_ACTIVE" -eq 0 ]]; then
+    if [[ "$MODE" == "apply" && "$LOG_READY" -eq 1 ]]; then
+        printf '%s\n' "$line" >> "$LOG_FILE" || true
+    fi
+    if [[ "$USE_COLOR" -eq 1 ]]; then
         render_colored_line "$line"
     else
         printf '%s\n' "$line"
@@ -253,8 +259,8 @@ on_exit() {
         if ! printf '%s\n' "$message" 2>/dev/null > /dev/tty; then
             printf '%s\n' "$message" >&2
         fi
-        if [[ "$LOG_CAPTURE_ACTIVE" -eq 1 ]]; then
-            printf '%s\n' "$message" >&4 || true
+        if [[ "$LOG_READY" -eq 1 ]]; then
+            printf '%s\n' "$message" >> "$LOG_FILE" || true
         fi
     fi
     exit "$status"
@@ -277,7 +283,14 @@ run() {
         return 0
     fi
     log INFO "Running: $(printf '%q ' "$@")"
-    "$@"
+    run_streamed "$@"
+}
+
+run_streamed() {
+    local -a pipeline_status=()
+    "$@" 2>&1 | emit_block
+    pipeline_status=("${PIPESTATUS[@]}")
+    [[ "${pipeline_status[0]}" -eq 0 && "${pipeline_status[1]}" -eq 0 ]]
 }
 
 record_change() {
@@ -392,26 +405,21 @@ detect_os() {
 }
 
 init_logging() {
+    local backup_root="${HARDEN_BACKUP_ROOT:-/root}"
+    local log_parent=""
     if [[ "$MODE" == "dry-run" ]]; then
         return 0
     fi
-    install -d -m 0750 /var/log
+    log_parent="$(dirname -- "$LOG_FILE")"
+    if [[ -e "$log_parent" || -L "$log_parent" ]]; then
+        [[ -d "$log_parent" ]] || die "Log parent is not a directory: ${log_parent}"
+    else
+        install -d -m 0750 "$log_parent"
+    fi
     touch "$LOG_FILE"
     chmod 0640 "$LOG_FILE"
-    exec 3>&1
-    exec 4>>"$LOG_FILE"
-    LOG_CAPTURE_ACTIVE=1
-    exec > >(
-        while IFS= read -r line || [[ -n "$line" ]]; do
-            printf '%s\n' "$line" >&4
-            if [[ "$USE_COLOR" -eq 1 ]]; then
-                render_colored_line "$line" >&3
-            else
-                printf '%s\n' "$line" >&3
-            fi
-        done
-    ) 2>&1
-    BACKUP_DIR="/root/hardening-backup-$(date '+%Y%m%d-%H%M%S')"
+    LOG_READY=1
+    BACKUP_DIR="${backup_root}/hardening-backup-$(date '+%Y%m%d-%H%M%S')"
     install -d -m 0700 "$BACKUP_DIR"
     CHANGE_LOG="$BACKUP_DIR/changes.tsv"
     : > "$CHANGE_LOG"
@@ -571,7 +579,7 @@ install_package() {
         log INFO "Would install available package: ${package}"
         return 0
     fi
-    if DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$package"; then
+    if run_streamed env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$package"; then
         PACKAGES_INSTALLED+=("$package")
         record_change "Installed package ${package}"
         return 0
@@ -583,7 +591,7 @@ install_package() {
 prepare_packages() {
     if [[ "$MODE" == "apply" ]]; then
         log INFO "Refreshing APT metadata from configured repositories"
-        DEBIAN_FRONTEND=noninteractive apt-get update
+        run_streamed env DEBIAN_FRONTEND=noninteractive apt-get update
     else
         log INFO "Would run apt-get update before package availability checks"
     fi
@@ -634,7 +642,7 @@ EOF
         if [[ "$suspicious" -eq 1 ]]; then
             record_skip "APT repositories" "trusted=yes or allow-insecure=yes found; source was not silently rewritten"
         fi
-        apt-get check
+        run_streamed apt-get check
     fi
 }
 
@@ -726,7 +734,7 @@ purge_removed_packages() {
         record_skip "PKGS-7346" "APT simulation included a protected dependency; nothing was purged"
         return 0
     fi
-    if DEBIAN_FRONTEND=noninteractive apt-get purge -y "${safe[@]}"; then
+    if run_streamed env DEBIAN_FRONTEND=noninteractive apt-get purge -y "${safe[@]}"; then
         PACKAGES_REMOVED+=("${safe[@]}")
         record_change "Purged only simulated, non-protected residual package configurations: ${safe[*]}"
     fi
@@ -1097,7 +1105,7 @@ configure_sysctl() {
     install -o root -g root -m 0644 "$temporary" /etc/sysctl.d/99-security-hardening.conf
     rm -f "$temporary"
     record_change "Installed supported kernel/network controls in /etc/sysctl.d/99-security-hardening.conf"
-    if ! sysctl --system; then
+    if ! run_streamed sysctl --system; then
         log WARN "sysctl --system returned a failure, possibly from an unrelated vendor file"
     fi
     local failed=0
@@ -1204,7 +1212,7 @@ configure_kernel_modules() {
     printf '%s\n' "$content" | install_managed_file /etc/modprobe.d/99-security-hardening.conf 0644
     if [[ "$MODE" == "apply" ]]; then
         if command -v update-initramfs >/dev/null 2>&1; then
-            if update-initramfs -u; then
+            if run_streamed update-initramfs -u; then
                 REBOOT_REQUIRED=1
             else
                 record_skip "initramfs" "update-initramfs failed; module policy is installed but boot image may not contain it"
@@ -1216,17 +1224,19 @@ configure_kernel_modules() {
 }
 
 prepare_kernel_module_lock() {
+    local module_control="${HARDEN_MODULES_DISABLED_PATH:-/proc/sys/kernel/modules_disabled}"
+    local lock_unit="${HARDEN_MODULE_LOCK_UNIT:-/etc/systemd/system/kernel-module-lockdown.service}"
     if [[ "$AGGRESSIVE" -ne 1 ]]; then
         return 0
     fi
-    if [[ ! -e /proc/sys/kernel/modules_disabled ]]; then
+    if [[ ! -e "$module_control" ]]; then
         return 0
     fi
     if [[ "$MODE" == "dry-run" ]]; then
-        log INFO "Would install and enable (without starting) the late kernel module lock unit"
+        log INFO "Would install, but not enable or start, the late kernel module lock unit until the final gate"
         return 0
     fi
-    install_managed_file /etc/systemd/system/kernel-module-lockdown.service 0644 <<'EOF'
+    install_managed_file "$lock_unit" 0644 <<'EOF'
 [Unit]
 Description=Late irreversible kernel module loading lock
 Documentation=man:sysctl(8)
@@ -1241,19 +1251,24 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
-    if systemctl daemon-reload && systemctl enable kernel-module-lockdown.service; then
-        record_change "Prepared and enabled the late kernel module loading lock unit without starting it"
+    if systemctl daemon-reload; then
+        if [[ "$(sysctl -n kernel.modules_disabled 2>/dev/null || true)" != "1" ]]; then
+            systemctl disable kernel-module-lockdown.service >/dev/null 2>&1 || true
+        fi
+        record_change "Prepared the late kernel module loading lock unit without enabling or starting it before the final gate"
     else
-        record_skip "kernel.modules_disabled" "late lock unit could not be enabled; runtime locking will be skipped"
+        record_skip "kernel.modules_disabled" "late lock unit could not be loaded; runtime locking will be skipped"
     fi
 }
 
 lock_kernel_modules_late() {
+    local module_control="${HARDEN_MODULES_DISABLED_PATH:-/proc/sys/kernel/modules_disabled}"
+    local lock_unit="${HARDEN_MODULE_LOCK_UNIT:-/etc/systemd/system/kernel-module-lockdown.service}"
     if [[ "$AGGRESSIVE" -ne 1 ]]; then
         record_skip "kernel.modules_disabled" "requires --aggressive because the change is irreversible until reboot"
         return 0
     fi
-    if [[ ! -e /proc/sys/kernel/modules_disabled ]]; then
+    if [[ ! -e "$module_control" ]]; then
         record_skip "kernel.modules_disabled" "the running kernel does not expose this control"
         return 0
     fi
@@ -1261,18 +1276,25 @@ lock_kernel_modules_late() {
         log WARN "Would set kernel.modules_disabled=1 only at the final lock-down stage after module, network, firewall, AppArmor, validation, and AIDE work"
         return 0
     fi
-    [[ -f /etc/systemd/system/kernel-module-lockdown.service ]] \
+    if [[ "$CURRENT_PHASE" -ne 17 || "$NETWORK_HARDENING_COMPLETED" -ne 1 \
+        || "$FIREWALL_COMPLETED" -ne 1 || "$APPARMOR_COMPLETED" -ne 1 \
+        || "$VALIDATION_COMPLETED" -ne 1 || "$AIDE_STATUS" != "OK" ]]; then
+        record_skip "kernel.modules_disabled" "final prerequisite gate failed (phase=${CURRENT_PHASE}, network=${NETWORK_HARDENING_COMPLETED}, firewall=${FIREWALL_COMPLETED}, AppArmor=${APPARMOR_COMPLETED}, validation=${VALIDATION_COMPLETED}, AIDE=${AIDE_STATUS})"
+        return 1
+    fi
+    [[ -f "$lock_unit" ]] \
         || { record_skip "kernel.modules_disabled" "late lock unit preparation was not completed"; return 1; }
-    systemctl is-enabled --quiet kernel-module-lockdown.service \
-        || { record_skip "kernel.modules_disabled" "late lock unit is not enabled; runtime locking was skipped"; return 1; }
     if [[ "$(sysctl -n kernel.modules_disabled 2>/dev/null || true)" == "1" ]]; then
-        log INFO "Kernel module loading was already locked; retaining the late-boot unit"
+        systemctl enable kernel-module-lockdown.service >/dev/null 2>&1 || true
+        [[ "$(sysctl -n kernel.modules_disabled 2>/dev/null || true)" == "1" ]] || return 1
+        log INFO "Kernel module loading was already locked; verified runtime value 1 and retained the late-boot unit"
         return 0
     fi
     log WARN "Final irreversible step: disabling further kernel module loading until reboot"
-    if sysctl -w kernel.modules_disabled=1 \
+    if systemctl enable kernel-module-lockdown.service \
+        && sysctl -w kernel.modules_disabled=1 \
         && [[ "$(sysctl -n kernel.modules_disabled 2>/dev/null || true)" == "1" ]]; then
-        record_change "Set kernel.modules_disabled=1 at the final lock-down stage and enabled the late-boot unit"
+        record_change "Set and verified kernel.modules_disabled=1 at the final prerequisite gate and enabled the late-boot unit"
         return 0
     fi
     record_skip "kernel.modules_disabled" "the final runtime write failed; the failure was not hidden"
@@ -2978,49 +3000,43 @@ aide_runtime_path() {
 
 configure_aide() {
     if [[ "$MODE" == "dry-run" ]]; then
-        log INFO "Would add a managed SHA256+SHA512 policy for critical files, validate the generated AIDE configuration, refresh the baseline only when that policy changes, and enable the daily timer"
+        log INFO "Would validate the distribution AIDE runtime, add SHA256+SHA512 policy, atomically activate a missing or policy-obsolete baseline, verify aide --check, and only then enable its timer"
         AIDE_STATUS="PLANNED"
         return 0
     fi
-    if [[ ! -s /etc/aide/aide.conf && ! -s /etc/aide.conf ]]; then
+    local aide_etc_dir="${HARDEN_AIDE_ETC_DIR:-/etc/aide}"
+    local aide_state_dir="${HARDEN_AIDE_STATE_DIR:-/var/lib/aide}"
+    local systemd_dir="${HARDEN_SYSTEMD_DIR:-/etc/systemd/system}"
+    local managed_owner="${HARDEN_TEST_OWNER:-root}"
+    local managed_group="${HARDEN_TEST_GROUP:-root}"
+    if [[ ! -s "${aide_etc_dir}/aide.conf" && ! -s /etc/aide.conf ]]; then
         install_package aide-common || true
     fi
     if ! command -v aide >/dev/null 2>&1; then
         install_package aide || true
     fi
-    local aide_raw="" aide_binary="" aide_config="" runtime_config="" database="" aide_timer="" aide_service_args="--check"
+    local aide_raw="" aide_config="" runtime_config="" aide_timer=""
     local database_path="" database_out_path="" aide_check_output="" aide_check_rc=0
-    local aide_policy=/etc/aide/aide.conf.d/99_harden_sha2 aide_policy_changed=0
+    local aide_policy="${aide_etc_dir}/aide.conf.d/99_harden_sha2"
+    local aide_policy_changed=0 aide_config_changed=0 baseline_required=0
+    local policy_content="" candidate="" version_output="" active_tmp=""
+    local database_owner="" database_group="" database_parent=""
+    local policy_digest="" policy_stamp="" stamp_tmp=""
     aide_raw="$(command -v aide 2>/dev/null || true)"
-    if command -v aide.wrapper >/dev/null 2>&1; then
-        aide_binary="$(command -v aide.wrapper)"
-    else
-        aide_binary="$aide_raw"
-    fi
-    local candidate
-    for candidate in /etc/aide/aide.conf /etc/aide.conf /usr/local/etc/aide.conf; do
+    for candidate in "${aide_etc_dir}/aide.conf" /etc/aide.conf /usr/local/etc/aide.conf; do
         if [[ -s "$candidate" ]]; then
             aide_config="$candidate"
             break
         fi
     done
-    if [[ -z "$aide_raw" || -z "$aide_binary" || -z "$aide_config" ]]; then
+    if [[ -z "$aide_raw" || -z "$aide_config" ]]; then
         AIDE_STATUS="FAILED"
         systemctl disable --now aide-check.timer dailyaidecheck.timer 2>/dev/null || true
         record_skip "FINT-4315" "AIDE binary and a real non-empty configuration are both required; aide-common did not provide one"
         return 0
     fi
-    if ! command -v update-aide.conf >/dev/null 2>&1; then
-        AIDE_STATUS="FAILED"
-        record_skip "FINT-4402" "the distribution update-aide.conf mechanism is unavailable; no detached policy fragment was installed"
-        return 0
-    fi
-    if ! grep -Fxq '# Managed by harden.sh: SHA-2 integrity policy v1.1.3' "$aide_policy" 2>/dev/null; then
-        aide_policy_changed=1
-    fi
-    transaction_copy "$aide_policy" aide-sha2-policy
-    install_managed_file "$aide_policy" 0640 <<'EOF'
-# Managed by harden.sh: SHA-2 integrity policy v1.1.3
+    systemctl stop aide-check.timer dailyaidecheck.timer 2>/dev/null || true
+    policy_content='# Managed by harden.sh: SHA-2 integrity policy v1.1.3
 HardenSHA2 = p+ftype+i+l+n+u+g+s+b+m+c+sha256+sha512
 =/etc/passwd HardenSHA2
 =/etc/group HardenSHA2
@@ -3030,56 +3046,67 @@ HardenSHA2 = p+ftype+i+l+n+u+g+s+b+m+c+sha256+sha512
 /etc/sudoers\.d/.* HardenSHA2
 /etc/ssh/.* HardenSHA2
 /etc/pam\.d/.* HardenSHA2
-/etc/audit/.* HardenSHA2
-EOF
+/etc/audit/.* HardenSHA2'
+    if [[ ! -f "$aide_policy" ]] || ! cmp -s <(printf '%s\n' "$policy_content") "$aide_policy"; then
+        aide_policy_changed=1
+    fi
+    transaction_copy "$aide_policy" aide-sha2-policy
+    printf '%s\n' "$policy_content" | install_managed_file "$aide_policy" 0644 "$managed_owner" "$managed_group"
     runtime_config="$aide_config"
-    if ! update-aide.conf > "$BACKUP_DIR/aide-config-generation.txt" 2>&1 \
-        || [[ ! -s /var/lib/aide/aide.conf.autogenerated ]]; then
-        transaction_restore "$aide_policy" aide-sha2-policy
-        update-aide.conf >/dev/null 2>&1 || true
+    if ! awk -v directory="${aide_etc_dir}/aide.conf.d" \
+        '$1 ~ /^@@(x_)?include$/ && $2 == directory {found=1} END {exit !found}' "$runtime_config" \
+        && ! grep -Fqx "@@include ${aide_policy}" "$runtime_config"; then
+        transaction_copy "$runtime_config" aide-runtime-config
+        printf '\n@@include %s\n' "$aide_policy" >> "$runtime_config"
+        aide_config_changed=1
+    fi
+    version_output="$("$aide_raw" --version 2>&1 || true)"
+    if ! grep -Eiq '(^|[^[:alnum:]])sha256([^[:alnum:]]|$)' <<<"$version_output" \
+        || ! grep -Eiq '(^|[^[:alnum:]])sha512([^[:alnum:]]|$)' <<<"$version_output"; then
         AIDE_STATUS="FAILED"
         systemctl disable --now aide-check.timer dailyaidecheck.timer 2>/dev/null || true
-        record_skip "FINT-4315" "update-aide.conf rejected the managed SHA-2 policy; the prior policy was restored"
+        record_skip "FINT-4402" "the installed AIDE binary does not report both SHA256 and SHA512 support"
         return 0
     fi
-    chmod 0600 "$BACKUP_DIR/aide-config-generation.txt"
-    runtime_config=/var/lib/aide/aide.conf.autogenerated
-    if ! "$aide_raw" --config="$runtime_config" -D > "$BACKUP_DIR/aide-config-check.txt" 2>&1; then
-        transaction_restore "$aide_policy" aide-sha2-policy
-        update-aide.conf >/dev/null 2>&1 || true
+    if ! "$aide_raw" --config="$runtime_config" --config-check > "$BACKUP_DIR/aide-config-check.txt" 2>&1; then
         AIDE_STATUS="FAILED"
         systemctl disable --now aide-check.timer dailyaidecheck.timer 2>/dev/null || true
-        record_skip "FINT-4315" "AIDE rejected runtime configuration ${runtime_config}; no timer was enabled"
-        return 0
-    fi
-    if ! grep -F 'sha256+sha512' "$runtime_config" >/dev/null; then
-        transaction_restore "$aide_policy" aide-sha2-policy
-        update-aide.conf >/dev/null 2>&1 || true
-        AIDE_STATUS="FAILED"
-        record_skip "FINT-4402" "the generated AIDE runtime configuration did not contain the validated SHA256+SHA512 rule; the prior policy was restored"
+        record_skip "FINT-4315" "AIDE rejected active runtime configuration ${runtime_config}; no timer was enabled"
         return 0
     fi
     chmod 0600 "$BACKUP_DIR/aide-config-check.txt"
-    if [[ "$aide_binary" == "$aide_raw" ]]; then
-        aide_service_args="--config=${runtime_config} --check"
+    database_path="$(aide_runtime_path "$runtime_config" database_in 2>/dev/null || true)"
+    [[ -n "$database_path" ]] || database_path="$(aide_runtime_path "$runtime_config" database 2>/dev/null || true)"
+    database_out_path="$(aide_runtime_path "$runtime_config" database_out 2>/dev/null || true)"
+    if [[ -z "$database_path" || -z "$database_out_path" || "$database_path" == "$database_out_path" ]]; then
+        AIDE_STATUS="FAILED"
+        systemctl disable --now aide-check.timer dailyaidecheck.timer 2>/dev/null || true
+        record_skip "FINT-4316" "active runtime ${runtime_config} must declare distinct absolute database_in and database_out file paths"
+        return 0
     fi
+    case "$database_path:$database_out_path" in
+        "${aide_state_dir}"/*:"${aide_state_dir}"/*) ;;
+        *) log WARN "AIDE runtime uses distribution-defined database paths outside ${aide_state_dir}: ${database_path}, ${database_out_path}" ;;
+    esac
+    policy_digest="$(sha256sum "$aide_policy" | awk '{print $1}')"
+    policy_stamp="${database_path}.harden-policy.sha256"
     if unit_file_exists dailyaidecheck.timer; then
         aide_timer=dailyaidecheck.timer
-        if [[ -f /etc/systemd/system/aide-check.timer ]] \
-            && grep -q '^Description=Daily AIDE integrity check' /etc/systemd/system/aide-check.timer; then
+        if [[ -f "${systemd_dir}/aide-check.timer" ]] \
+            && grep -q '^Description=Daily AIDE integrity check' "${systemd_dir}/aide-check.timer"; then
             systemctl disable --now aide-check.timer 2>/dev/null || true
         fi
         log INFO "Using the aide-common vendor timer ${aide_timer}"
     else
         aide_timer=aide-check.timer
-        install_managed_file /etc/systemd/system/aide-check.service 0644 <<EOF
+        install_managed_file "${systemd_dir}/aide-check.service" 0644 "$managed_owner" "$managed_group" <<EOF
 [Unit]
 Description=File integrity check with AIDE
 After=local-fs.target
 
 [Service]
 Type=oneshot
-ExecStart=${aide_binary} ${aide_service_args}
+ExecStart=${aide_raw} --config=${runtime_config} --check
 Nice=19
 IOSchedulingClass=idle
 NoNewPrivileges=yes
@@ -3095,7 +3122,7 @@ LockPersonality=yes
 UMask=0027
 SuccessExitStatus=1 2 3 4 5 6 7
 EOF
-        install_managed_file /etc/systemd/system/aide-check.timer 0644 <<'EOF'
+        install_managed_file "${systemd_dir}/aide-check.timer" 0644 "$managed_owner" "$managed_group" <<'EOF'
 [Unit]
 Description=Daily AIDE integrity check
 
@@ -3117,53 +3144,47 @@ EOF
     # policy-obsolete database. It is enabled again only after a readable
     # baseline has been proven below.
     systemctl stop "$aide_timer" 2>/dev/null || true
-    database_path="$(aide_runtime_path "$runtime_config" database_in 2>/dev/null || true)"
-    [[ -n "$database_path" ]] || database_path="$(aide_runtime_path "$runtime_config" database 2>/dev/null || true)"
-    database_out_path="$(aide_runtime_path "$runtime_config" database_out 2>/dev/null || true)"
-    if [[ -n "$database_path" && -s "$database_path" ]]; then
-        database="$database_path"
-    else
-        database="$(find /var/lib/aide -maxdepth 1 -type f \( -name 'aide.db' -o -name 'aide.db.gz' \) -size +0c -print -quit 2>/dev/null || true)"
-    fi
-    if [[ -z "$database" || "$aide_policy_changed" -eq 1 ]]; then
-        if command -v aideinit >/dev/null 2>&1; then
-            log INFO "Initializing the AIDE database with the validated SHA-2 policy; this can take several minutes"
-            if ! DEBIAN_FRONTEND=noninteractive aideinit --yes --force --config "$runtime_config" \
-                > "$BACKUP_DIR/aideinit.txt" 2>&1; then
-                transaction_restore "$aide_policy" aide-sha2-policy
-                update-aide.conf >/dev/null 2>&1 || true
-                AIDE_STATUS="FAILED"
-                systemctl disable --now "$aide_timer" 2>/dev/null || true
-                record_skip "FINT-4316" "aideinit failed while creating the SHA-2 baseline; see ${BACKUP_DIR}/aideinit.txt"
-                return 0
-            fi
-            chmod 0600 "$BACKUP_DIR/aideinit.txt"
-            if [[ -n "$database_path" && -n "$database_out_path" \
-                && "$database_path" != "$database_out_path" && -s "$database_out_path" \
-                && ! -s "$database_path" ]]; then
-                install -d -o root -g root -m 0700 "$(dirname "$database_path")"
-                mv -- "$database_out_path" "$database_path"
-            elif [[ -f /var/lib/aide/aide.db.new.gz && ! -f /var/lib/aide/aide.db.gz ]]; then
-                mv /var/lib/aide/aide.db.new.gz /var/lib/aide/aide.db.gz
-            elif [[ -f /var/lib/aide/aide.db.new && ! -f /var/lib/aide/aide.db ]]; then
-                mv /var/lib/aide/aide.db.new /var/lib/aide/aide.db
-            fi
-        else
+    if [[ ! -s "$database_path" || ! -s "$policy_stamp" \
+        || "$(tr -d '[:space:]' < "$policy_stamp" 2>/dev/null || true)" != "$policy_digest" \
+        || "$aide_policy_changed" -eq 1 || "$aide_config_changed" -eq 1 ]]; then
+        baseline_required=1
+        log INFO "Initializing the AIDE database from validated runtime ${runtime_config}; this can take several minutes"
+        rm -f -- "$database_out_path"
+        if ! "$aide_raw" --config="$runtime_config" --init > "$BACKUP_DIR/aideinit.txt" 2>&1 \
+            || [[ ! -s "$database_out_path" ]]; then
             AIDE_STATUS="FAILED"
             systemctl disable --now "$aide_timer" 2>/dev/null || true
-            record_skip "FINT-4316" "AIDE database is absent and aideinit is unavailable"
+            record_skip "FINT-4316" "aide --init failed to create database_out declared by ${runtime_config}; see ${BACKUP_DIR}/aideinit.txt"
             return 0
         fi
-    fi
-    if [[ -n "$database_path" && -s "$database_path" ]]; then
-        database="$database_path"
+        chmod 0600 "$BACKUP_DIR/aideinit.txt"
+        database_parent="$(dirname -- "$database_path")"
+        if [[ -e "$database_parent" || -L "$database_parent" ]]; then
+            [[ -d "$database_parent" ]] || {
+                AIDE_STATUS="FAILED"
+                record_skip "FINT-4316" "database_in parent is not a directory: ${database_parent}"
+                return 0
+            }
+        else
+            install -d -o "$managed_owner" -g "$managed_group" -m 0700 "$database_parent"
+        fi
+        database_owner="$(stat -c '%U' "$database_out_path" 2>/dev/null || printf '%s' "$managed_owner")"
+        database_group="$(stat -c '%G' "$database_out_path" 2>/dev/null || printf '%s' "$managed_group")"
+        active_tmp="$(mktemp "${database_path}.harden.XXXXXX")"
+        install -o "$database_owner" -g "$database_group" -m 0600 "$database_out_path" "$active_tmp"
+        mv -f -- "$active_tmp" "$database_path"
+        stamp_tmp="$(mktemp "${policy_stamp}.harden.XXXXXX")"
+        printf '%s\n' "$policy_digest" > "$stamp_tmp"
+        install -o "$database_owner" -g "$database_group" -m 0600 "$stamp_tmp" "${policy_stamp}.new"
+        mv -f -- "${policy_stamp}.new" "$policy_stamp"
+        rm -f -- "$stamp_tmp"
     else
-        database="$(find /var/lib/aide -maxdepth 1 -type f \( -name 'aide.db' -o -name 'aide.db.gz' \) -size +0c -print -quit 2>/dev/null || true)"
+        log INFO "Existing active AIDE database matches the unchanged managed policy; baseline rebuild skipped"
     fi
-    if [[ -z "$database" || ! -s "$database" ]]; then
+    if [[ ! -s "$database_path" ]]; then
         AIDE_STATUS="FAILED"
         systemctl disable --now "$aide_timer" 2>/dev/null || true
-        record_skip "FINT-4316" "aideinit completed without producing the active non-empty database declared by ${runtime_config}"
+        record_skip "FINT-4316" "active database_in ${database_path} is absent or empty after initialization"
         return 0
     fi
     if aide_check_output="$("$aide_raw" --config="$runtime_config" --check 2>&1)"; then
@@ -3182,6 +3203,7 @@ EOF
         log WARN "AIDE baseline is readable but the immediate check reported changes (exit ${aide_check_rc}); see ${BACKUP_DIR}/aide-initial-check.txt"
     fi
     if ! systemctl enable --now "$aide_timer" \
+        || ! systemctl is-enabled --quiet "$aide_timer" \
         || ! systemctl is-active --quiet "$aide_timer"; then
         AIDE_STATUS="FAILED"
         systemctl disable --now "$aide_timer" 2>/dev/null || true
@@ -3189,7 +3211,7 @@ EOF
         return 0
     fi
     AIDE_STATUS="OK"
-    record_change "Validated effective SHA256/SHA512 runtime ${runtime_config}, non-empty database ${database}, readable baseline, and active ${aide_timer}"
+    record_change "Validated SHA256/SHA512 runtime ${runtime_config}, atomically activated database ${database_path}, successful readable check, and enabled active ${aide_timer} (baseline rebuilt: ${baseline_required})"
     return 0
 }
 
@@ -3354,13 +3376,14 @@ run_lynis() {
         return 1
     fi
     log INFO "Running Lynis ${label}; output will be saved to ${output}"
-    local rc tee_rc
+    local rc tee_rc render_rc
     local -a pipeline_status=()
     set +e
-    TERM=dumb NO_COLOR=1 lynis audit system 2>&1 | tee "$output"
+    TERM=dumb NO_COLOR=1 lynis audit system 2>&1 | tee "$output" | emit_block
     pipeline_status=("${PIPESTATUS[@]}")
     rc="${pipeline_status[0]}"
     tee_rc="${pipeline_status[1]}"
+    render_rc="${pipeline_status[2]}"
     set -e
     [[ -s "$output" ]] || {
         log ERROR "Lynis ${label} produced no report output"
@@ -3375,6 +3398,10 @@ run_lynis() {
     if [[ "$tee_rc" -ne 0 ]]; then
         log ERROR "Could not persist the Lynis ${label} output (tee exit ${tee_rc})"
         return "$tee_rc"
+    fi
+    if [[ "$render_rc" -ne 0 ]]; then
+        log ERROR "Could not render/log the Lynis ${label} output (renderer exit ${render_rc})"
+        return "$render_rc"
     fi
     record_change "Completed Lynis ${label} and saved a non-empty report to ${output}"
     return 0
@@ -3468,7 +3495,7 @@ explain_open_test() {
         LOGG-2190) printf '%s\n' 'Deleted files remain open after allowlisted safe service restarts.' 'Review deleted-open-files-after-remediation.txt and restart the remaining owner only during an approved maintenance window.' 'Blind service restarts can interrupt SSH, networking, storage, or applications.' ;;
         PROC-3614) printf '%s\n' 'One or more processes were observed in uninterruptible IO wait.' 'Review /root/hardening-iowait-processes.txt and diagnose the named device, filesystem, or kernel wait channel.' 'Killing a blocked process can corrupt data and often cannot complete until the kernel IO wait resolves.' ;;
         ACCT-9622|ACCT-9628|ACCT-9630) printf '%s\n' 'Accounting/audit package or service was unavailable, rejected rules, could not start, or runtime rules were empty.' 'Review journalctl and auditctl -l, correct any rejected kernel-specific rule, and reload with augenrules.' 'Invalid or overly broad audit rules can cause boot delay, log exhaustion, or lost events.' ;;
-        FINT-4315|FINT-4316|FINT-4350|FINT-4402) printf '%s\n' 'AIDE was unavailable, its effective SHA-2 runtime policy failed validation, or its declared active database was absent.' 'Review the saved update-aide.conf, aideinit, and aide --check output, then initialize a trusted SHA256/SHA512 baseline.' 'A baseline created on a compromised system legitimizes malicious files; scans are I/O intensive.' ;;
+        FINT-4315|FINT-4316|FINT-4350|FINT-4402) printf '%s\n' 'AIDE was unavailable, its effective SHA-2 runtime policy failed validation, or its declared active database was absent.' 'Review the saved config-check, aide --init, and aide --check output, then initialize a trusted SHA256/SHA512 baseline.' 'A baseline created on a compromised system legitimizes malicious files; scans are I/O intensive.' ;;
         TOOL-5002) printf '%s\n' 'No automation platform was installed solely to satisfy a score.' 'Adopt a real configuration-management platform when there is an operational owner.' 'An unused privileged agent expands attack surface and supply-chain trust.' ;;
         FILE-7524) printf '%s\n' 'At least one Lynis static permission target still differs from its profile.' 'Use lynis show details FILE-7524 and correct only the named object.' 'Blind recursive chmod can break package ownership, setuid helpers, ACLs, and services.' ;;
         KRNL-6000) printf '%s\n' 'All managed sysctls are validated; with active Tailscale, net.ipv4.conf.all.rp_filter=2 is an intentional overlay-routing exception to Lynis expected value 1.' 'Keep value 2 while asymmetric Tailscale routing is required; correct any separately listed mismatched key.' 'Forcing strict reverse-path filtering can discard valid overlay traffic and remove remote access.' ;;
@@ -3605,9 +3632,12 @@ main() {
     VALIDATION_COMPLETED=0
     FINAL_LYNIS_COMPLETED=0
     SUMMARY_PRINTED=0
+    NETWORK_HARDENING_COMPLETED=0
+    FIREWALL_COMPLETED=0
+    APPARMOR_COMPLETED=0
     parse_args "$@"
     check_root
-    # Complete all terminal input before the asynchronous log renderer starts.
+    # Complete all terminal input before file logging starts.
     ask_remote_logging
     init_logging
     if [[ "$REMOTE_LOG_ENABLED" -eq 1 ]]; then
@@ -3626,6 +3656,7 @@ main() {
     backup_config
 
     phase 03 18 "Package Security"
+    log WARN "Phase 03 installs and configures security packages and may legitimately take several minutes on a fresh server; package operations are not subject to artificial timeouts"
     prepare_packages
     configure_apt
     configure_updates
@@ -3639,6 +3670,7 @@ main() {
 
     phase 05 18 "Kernel Hardening"
     configure_sysctl
+    NETWORK_HARDENING_COMPLETED=1
     configure_core_dumps
     configure_kernel_modules
 
@@ -3649,6 +3681,7 @@ main() {
 
     phase 07 18 "Firewall"
     configure_firewall
+    if [[ "$MODE" != "apply" || "$FIREWALL_STATUS" == OK* ]]; then FIREWALL_COMPLETED=1; fi
 
     phase 08 18 "SSH"
     harden_ssh
@@ -3674,6 +3707,7 @@ main() {
 
     phase 12 18 "AppArmor"
     configure_apparmor
+    if [[ "$MODE" != "apply" || "$APPARMOR_STATUS" != FAILED* ]]; then APPARMOR_COMPLETED=1; fi
     prepare_kernel_module_lock
 
     phase 13 18 "Validation"
@@ -3693,8 +3727,8 @@ main() {
         die "AIDE phase did not produce a validated SHA-2 configuration, active database, and timer"
     fi
 
-    phase 17 18 "Lynis Final"
-    lock_kernel_modules_late || true
+    phase 17 18 "Final Lockdown and Lynis"
+    lock_kernel_modules_late
     run_lynis /root/lynis-after-hardening.txt "final pass"
     FINAL_LYNIS_COMPLETED=1
     extract_lynis_summary
@@ -3718,4 +3752,6 @@ main() {
     return 0
 }
 
-main "$@"
+if [[ "${HARDEN_SOURCE_ONLY:-0}" != "1" ]]; then
+    main "$@"
+fi

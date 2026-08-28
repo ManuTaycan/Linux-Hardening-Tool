@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 .DEFAULT_GOAL := check
 
-.PHONY: syntax shellcheck static checksum check
+.PHONY: syntax shellcheck static regression checksum check
 
 syntax:
 	bash -n harden.sh
@@ -16,7 +16,10 @@ shellcheck:
 static:
 	./scripts/ci-static-checks.sh
 
+regression:
+	./scripts/regression-tests.sh
+
 checksum:
 	sha256sum -c SHA256SUMS
 
-check: syntax shellcheck static checksum
+check: syntax shellcheck static regression checksum

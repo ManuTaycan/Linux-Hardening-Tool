@@ -1,5 +1,12 @@
 # Linux Hardening Tool
 
+> **WORK IN PROGRESS / PRE-RELEASE / NOT PRODUCTION READY**
+>
+> Real target validation is currently incomplete. The Ubuntu 26.04.1 Apply
+> path still requires a fresh full-system retest through phase 18, and open
+> issues remain. No stability or release readiness is promised. Use only on a
+> disposable test system or with a verified snapshot and recovery access.
+
 [![CI](https://github.com/ManuTaycan/Linux-Hardening-Tool/actions/workflows/ci.yml/badge.svg)](https://github.com/ManuTaycan/Linux-Hardening-Tool/actions/workflows/ci.yml)
 
 Idempotentes Bash-Werkzeug zur aggressiven, überprüfbaren Härtung frischer
