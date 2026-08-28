@@ -6,7 +6,7 @@ Idempotentes Bash-Werkzeug zur aggressiven, überprüfbaren Härtung frischer
 Ubuntu- und Debian-Server mit Dry-Run, Backups, Rollback, Lynis-Auswertung und
 systemd-Service-Sandboxing.
 
-**Version:** 1.1.3  
+**Version:** 1.1.3
 **Status:** Pre-Release / Zielsystemtest ausstehend
 
 ## Wichtiger Sicherheitshinweis

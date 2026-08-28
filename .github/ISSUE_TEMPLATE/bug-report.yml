@@ -1,0 +1,19 @@
+name: Bug report
+description: Melde einen reproduzierbaren Fehler ohne Geheimnisse.
+title: "bug: "
+body:
+  - type: textarea
+    attributes:
+      label: Erwartetes und tatsächliches Verhalten
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Reproduktionsschritte und bereinigte Logs
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: Version und Commit
+    validations:
+      required: true

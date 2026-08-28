@@ -1,0 +1,16 @@
+name: Work package
+description: Plane ein klar begrenztes Sicherheits-Arbeitspaket.
+title: "work: "
+body:
+  - type: textarea
+    attributes: {label: Ursprung/Finding und Ziel}
+    validations: {required: true}
+  - type: textarea
+    attributes: {label: Scope, Nicht-Ziele und Sicherheitsgrenzen}
+    validations: {required: true}
+  - type: textarea
+    attributes: {label: Implementierungsschritte und Testplan}
+    validations: {required: true}
+  - type: textarea
+    attributes: {label: Rollback-Plan, Abnahmekriterien und abhängige Issues}
+    validations: {required: true}

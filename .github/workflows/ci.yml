@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  static-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes shellcheck
+      - name: Check whitespace
+        run: git diff --check
+      - name: Run safe local checks
+        run: make check
+      - name: Verify help path
+        run: ./harden.sh --help
+      - name: Verify executable mode and checksum
+        run: |
+          test -x harden.sh
+          sha256sum -c SHA256SUMS

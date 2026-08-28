@@ -1,0 +1,28 @@
+name: Server test finding
+description: Erfasse ein bereinigtes Finding aus einem Zielsystemtest.
+title: "finding: "
+body:
+  - type: input
+    attributes: {label: Script-Version}
+    validations: {required: true}
+  - type: input
+    attributes: {label: Commit-SHA}
+    validations: {required: true}
+  - type: input
+    attributes: {label: SHA-256}
+    validations: {required: true}
+  - type: input
+    attributes: {label: Distribution, Version, Kernel und Virtualisierung}
+    validations: {required: true}
+  - type: textarea
+    attributes: {label: Exakter Aufruf, betroffene Phase und Lynis-Score vorher/nachher}
+    validations: {required: true}
+  - type: textarea
+    attributes: {label: Lynis-Test-ID, erwartetes und tatsächliches Verhalten}
+    validations: {required: true}
+  - type: textarea
+    attributes: {label: Relevante bereinigte Logs und Reproduktionsschritte}
+    validations: {required: true}
+  - type: textarea
+    attributes: {label: Sicherheitsauswirkung, Rollback erfolgt und Abnahmekriterien}
+    validations: {required: true}
