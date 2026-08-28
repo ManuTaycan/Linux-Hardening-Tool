@@ -34,8 +34,18 @@ jobs:
         run: |
           tmp_dir="$(mktemp -d)"
           trap 'sudo rm -rf "$tmp_dir"' EXIT
-          sudo bash install.sh --ref chore/bootstrap-repository-v1.1.3 --install-path "$tmp_dir/linux-hardening-tool"
-          test -f "$tmp_dir/linux-hardening-tool"
-          test -x "$tmp_dir/linux-hardening-tool"
-          test ! -d "$tmp_dir/linux-hardening-tool"
-          "$tmp_dir/linux-hardening-tool" --help >/dev/null
+          sudo bash install.sh --ref "$GITHUB_SHA" --install-path "$tmp_dir/new-parent/linux-hardening-tool"
+          test -f "$tmp_dir/new-parent/linux-hardening-tool"
+          test -x "$tmp_dir/new-parent/linux-hardening-tool"
+          test ! -d "$tmp_dir/new-parent/linux-hardening-tool"
+          existing_parent="$tmp_dir/existing-parent"
+          mkdir "$existing_parent"
+          chmod 0700 "$existing_parent"
+          parent_mode_before="$(stat -c '%a' "$existing_parent")"
+          sudo bash install.sh --ref "$GITHUB_SHA" --install-path "$existing_parent/linux-hardening-tool"
+          parent_mode_after="$(stat -c '%a' "$existing_parent")"
+          test "$parent_mode_after" = "$parent_mode_before"
+          test -f "$existing_parent/linux-hardening-tool"
+          test -x "$existing_parent/linux-hardening-tool"
+          test "$(stat -c '%a' "$existing_parent/linux-hardening-tool")" = 755
+          test ! -d "$existing_parent/linux-hardening-tool"

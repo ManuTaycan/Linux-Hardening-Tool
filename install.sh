@@ -75,7 +75,12 @@ awk '$2 == "harden.sh" {print}' "$TEMP_DIR/SHA256SUMS" > "$TEMP_DIR/harden.sh.su
     sha256sum -c harden.sh.sum
 )
 
-install -d -o root -g root -m 0755 "$(dirname -- "$INSTALL_PATH")"
+parent="$(dirname -- "$INSTALL_PATH")"
+if [[ -e "$parent" || -L "$parent" ]]; then
+    [[ -d "$parent" ]] || die "install path parent is not a directory: $parent"
+else
+    install -d -o root -g root -m 0755 "$parent"
+fi
 install -o root -g root -m 0755 "$TEMP_DIR/harden.sh" "$INSTALL_PATH"
 
 printf 'Installed verified harden.sh as %s\n' "$INSTALL_PATH"
