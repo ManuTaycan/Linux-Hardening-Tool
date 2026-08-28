@@ -1,5 +1,28 @@
+# Runtime logs and reports
 *.log
+lynis-*.txt
+lynis-*.dat
+hardening-*.txt
+hardening-*.tar.gz
+server-hardening.log
+
+# Local test data and backups
+hardening-backup-*/
+test-artifacts*/
 *.tmp
+*.swp
+*.bak
+.shellcheck*
+
+# Integrity databases and local secrets
+*.db
+*.db.gz
 .env
+.env.*
+secrets/
+
+# Editor and operating-system files
 .idea/
 .vscode/
+.DS_Store
+Thumbs.db
