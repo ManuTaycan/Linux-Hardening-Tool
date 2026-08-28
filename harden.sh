@@ -3125,6 +3125,8 @@ restrict_compilers() {
     local tool path real mode owner group owner_id group_id package simulation="" unsafe_reason="" protected_build_packages=""
     local restricted_owner="${HARDEN_TEST_OWNER:-root}" restricted_group="${HARDEN_TEST_GROUP:-root}"
     local restricted_uid restricted_gid
+    local compiler_usr_root="${HARDEN_COMPILER_USR_ROOT:-/usr}"
+    local compiler_local_root="${HARDEN_COMPILER_LOCAL_ROOT:-/usr/local}"
     if [[ "$restricted_owner" =~ ^[0-9]+$ ]]; then restricted_uid="$restricted_owner"; else restricted_uid="$(id -u "$restricted_owner")"; fi
     if [[ "$restricted_group" =~ ^[0-9]+$ ]]; then restricted_gid="$restricted_group"; else restricted_gid="$(getent group "$restricted_group" | awk -F: 'NR == 1 {print $3}')"; fi
     local changed=0 nullglob_was_set=0 purge_completed=0
@@ -3145,12 +3147,13 @@ restrict_compilers() {
     shopt -q nullglob && nullglob_was_set=1
     shopt -s nullglob
     candidates+=(
-        /usr/bin/gcc-[0-9]* /usr/bin/g++-[0-9]* /usr/bin/cpp-[0-9]*
-        /usr/bin/clang-[0-9]* /usr/bin/clang++-[0-9]*
-        /usr/bin/*-linux-gnu-gcc /usr/bin/*-linux-gnu-gcc-[0-9]*
-        /usr/bin/*-linux-gnu-g++ /usr/bin/*-linux-gnu-g++-[0-9]*
-        /usr/bin/*-linux-gnu-as /usr/bin/*-linux-gnu-ld /usr/bin/*-linux-gnu-ld.*
-        /usr/local/bin/gcc* /usr/local/bin/g++* /usr/local/bin/clang* /usr/local/bin/cc /usr/local/bin/c++
+        "${compiler_usr_root}"/bin/gcc-[0-9]* "${compiler_usr_root}"/bin/g++-[0-9]* "${compiler_usr_root}"/bin/cpp-[0-9]*
+        "${compiler_usr_root}"/bin/clang-[0-9]* "${compiler_usr_root}"/bin/clang++-[0-9]*
+        "${compiler_usr_root}"/bin/*-linux-gnu-gcc "${compiler_usr_root}"/bin/*-linux-gnu-gcc-[0-9]*
+        "${compiler_usr_root}"/bin/*-linux-gnu-g++ "${compiler_usr_root}"/bin/*-linux-gnu-g++-[0-9]*
+        "${compiler_usr_root}"/bin/*-linux-gnu-as "${compiler_usr_root}"/bin/*-linux-gnu-ld "${compiler_usr_root}"/bin/*-linux-gnu-ld.*
+        "${compiler_local_root}"/bin/gcc* "${compiler_local_root}"/bin/g++* "${compiler_local_root}"/bin/clang*
+        "${compiler_local_root}"/bin/cc "${compiler_local_root}"/bin/c++
     )
     [[ "$nullglob_was_set" -eq 1 ]] || shopt -u nullglob
 
@@ -3221,11 +3224,11 @@ restrict_compilers() {
     shopt -q nullglob && nullglob_was_set=1
     shopt -s nullglob
     candidates+=(
-        /usr/bin/gcc-[0-9]* /usr/bin/g++-[0-9]* /usr/bin/cpp-[0-9]*
-        /usr/bin/clang-[0-9]* /usr/bin/clang++-[0-9]*
-        /usr/bin/*-linux-gnu-gcc /usr/bin/*-linux-gnu-gcc-[0-9]*
-        /usr/bin/*-linux-gnu-g++ /usr/bin/*-linux-gnu-g++-[0-9]*
-        /usr/bin/*-linux-gnu-as /usr/bin/*-linux-gnu-ld /usr/bin/*-linux-gnu-ld.*
+        "${compiler_usr_root}"/bin/gcc-[0-9]* "${compiler_usr_root}"/bin/g++-[0-9]* "${compiler_usr_root}"/bin/cpp-[0-9]*
+        "${compiler_usr_root}"/bin/clang-[0-9]* "${compiler_usr_root}"/bin/clang++-[0-9]*
+        "${compiler_usr_root}"/bin/*-linux-gnu-gcc "${compiler_usr_root}"/bin/*-linux-gnu-gcc-[0-9]*
+        "${compiler_usr_root}"/bin/*-linux-gnu-g++ "${compiler_usr_root}"/bin/*-linux-gnu-g++-[0-9]*
+        "${compiler_usr_root}"/bin/*-linux-gnu-as "${compiler_usr_root}"/bin/*-linux-gnu-ld "${compiler_usr_root}"/bin/*-linux-gnu-ld.*
     )
     [[ "$nullglob_was_set" -eq 1 ]] || shopt -u nullglob
     seen_compilers=()

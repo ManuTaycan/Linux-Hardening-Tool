@@ -487,7 +487,7 @@ EOF
 
 run_compiler_tests() {
     local case_root="$test_root/compiler" mock_bin="$test_root/compiler/bin" apt_log="$test_root/compiler/apt.log"
-    install -d "$mock_bin" "$case_root/backup"
+    install -d "$mock_bin" "$case_root/backup" "$case_root/empty-usr/bin" "$case_root/empty-local/bin"
     for binary in as gcc; do
         printf '#!/usr/bin/env bash\nexit 0\n' > "$mock_bin/$binary"
         chmod 0755 "$mock_bin/$binary"
@@ -525,7 +525,8 @@ fi
 EOF
     chmod +x "$mock_bin/dpkg-query" "$mock_bin/apt-get"
     env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 COMPILER_APT_LOG="$apt_log" \
-        COMPILER_BIN_DIR="$mock_bin" HARDEN_TEST_OWNER="$(id -u)" HARDEN_TEST_GROUP="$(id -g)" bash -c '
+        COMPILER_BIN_DIR="$mock_bin" HARDEN_TEST_OWNER="$(id -u)" HARDEN_TEST_GROUP="$(id -g)" \
+        HARDEN_COMPILER_USR_ROOT="$case_root/empty-usr" HARDEN_COMPILER_LOCAL_ROOT="$case_root/empty-local" bash -c '
             source "$1/harden.sh"
             trap - ERR EXIT
             MODE=apply
@@ -546,7 +547,8 @@ EOF
     : > "$apt_log"
     env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 COMPILER_APT_LOG="$apt_log" \
         COMPILER_BIN_DIR="$mock_bin" COMPILER_PROTECTED=1 HARDEN_TEST_OWNER="$(id -u)" \
-        HARDEN_TEST_GROUP="$(id -g)" bash -c '
+        HARDEN_TEST_GROUP="$(id -g)" HARDEN_COMPILER_USR_ROOT="$case_root/empty-usr" \
+        HARDEN_COMPILER_LOCAL_ROOT="$case_root/empty-local" bash -c '
             source "$1/harden.sh"
             trap - ERR EXIT
             MODE=apply
