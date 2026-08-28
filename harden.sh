@@ -48,6 +48,7 @@ REBOOT_REQUIRED=0
 LYNIS_AFTER="not run"
 LYNIS_WARNINGS="unknown"
 LYNIS_SUGGESTIONS="unknown"
+LYNIS_PARSE_STATUS="NOT RUN"
 FIREWALL_STATUS="NOT RUN"
 SSH_STATUS="NOT RUN"
 PAM_STATUS="NOT RUN"
@@ -68,6 +69,7 @@ NETWORK_HARDENING_COMPLETED=0
 FIREWALL_COMPLETED=0
 APPARMOR_COMPLETED=0
 SYSTEMD_EXPOSURE_RESULT=""
+IOWAIT_PREVIOUS_PIDS=""
 
 readonly COLOR_RESET=$'\033[0m'
 readonly COLOR_DIM=$'\033[2m'
@@ -1164,6 +1166,102 @@ root_or_boot_uses_usb() {
     return 1
 }
 
+configure_binfmt_misc() {
+    local binfmt_root="${HARDEN_BINFMT_ROOT:-/proc/sys/fs/binfmt_misc}"
+    local report="${BACKUP_DIR:-/root}/binfmt-misc-inventory.txt"
+    local modprobe_file="${HARDEN_BINFMT_MODPROBE_FILE:-/etc/modprobe.d/99-disable-unused-binfmt-misc.conf}"
+    local -a registrations=() consumers=() config_files=()
+    local entry package config_dir config_line status="unavailable" remaining_registration=""
+    local -a config_dirs=(/etc/binfmt.d /run/binfmt.d /usr/local/lib/binfmt.d /usr/lib/binfmt.d /lib/binfmt.d)
+    if [[ -n "${HARDEN_BINFMT_CONFIG_DIRS:-}" ]]; then
+        IFS=: read -r -a config_dirs <<<"$HARDEN_BINFMT_CONFIG_DIRS"
+    fi
+
+    if [[ -d "$binfmt_root" ]]; then
+        while IFS= read -r entry; do registrations+=("$entry"); done < <(
+            find "$binfmt_root" -maxdepth 1 -type f ! -name register ! -name status -printf '%f\n' 2>/dev/null | sort
+        )
+        [[ ! -r "$binfmt_root/status" ]] || status="$(tr -d '[:space:]' < "$binfmt_root/status" 2>/dev/null || true)"
+    fi
+    for config_dir in "${config_dirs[@]}"; do
+        [[ -d "$config_dir" ]] || continue
+        while IFS= read -r config_line; do config_files+=("$config_line"); done < <(
+            find "$config_dir" -maxdepth 1 -type f -name '*.conf' -print 2>/dev/null | sort
+        )
+    done
+    for package in qemu-user qemu-user-static binfmt-support wine wine64 wine32 mono-runtime default-jre default-jre-headless; do
+        package_installed "$package" && consumers+=("$package")
+    done
+    while IFS= read -r package; do
+        [[ -n "$package" ]] && consumers+=("$package")
+    done < <(dpkg-query -W -f='${db:Status-Abbrev}\t${binary:Package}\n' \
+        'qemu-user*' 'wine*' 'openjdk-*' '*-jre*' 2>/dev/null \
+        | awk '$1 ~ /^ii/ {print $2}' | sort -u || true)
+
+    if [[ "$MODE" == "dry-run" ]]; then
+        if ((${#registrations[@]} || ${#config_files[@]} || ${#consumers[@]})); then
+            log INFO "Would preserve binfmt_misc after inventory because registrations, configuration, or interpreter consumers exist"
+        elif [[ "$AGGRESSIVE" -eq 1 ]]; then
+            log INFO "Would persistently disable unused systemd-binfmt/binfmt_misc and verify no registrations remain"
+        else
+            record_skip "HRDN-7231" "unused binfmt_misc deactivation requires --aggressive"
+        fi
+        return 0
+    fi
+
+    {
+        printf 'binfmt_misc inventory generated %s\n' "$(timestamp)"
+        printf 'kernel-status=%s\n' "${status:-unknown}"
+        printf 'registrations=%s\n' "${registrations[*]:-none}"
+        for entry in "${registrations[@]}"; do
+            printf '\n[%s]\n' "$entry"
+            sed -n '1,80p' "$binfmt_root/$entry" 2>/dev/null || true
+        done
+        printf '\nconfiguration-files=%s\n' "${config_files[*]:-none}"
+        for entry in "${config_files[@]}"; do
+            printf '\n[%s]\n' "$entry"
+            grep -Ev '^[[:space:]]*(#|$)' "$entry" 2>/dev/null || true
+        done
+        printf '\nprotected-consumer-packages=%s\n' "${consumers[*]:-none}"
+    } > "$report"
+    chmod 0600 "$report"
+
+    if ((${#registrations[@]} || ${#config_files[@]} || ${#consumers[@]})); then
+        record_skip "HRDN-7231" "binfmt_misc preserved; active/configured formats or protected qemu/Wine/JVM consumers are inventoried in ${report}"
+        return 0
+    fi
+    if [[ "$AGGRESSIVE" -ne 1 ]]; then
+        record_skip "HRDN-7231" "no consumer was found, but persistent deactivation requires --aggressive; see ${report}"
+        return 0
+    fi
+
+    if [[ -w "$binfmt_root/status" ]]; then
+        printf '0\n' > "$binfmt_root/status"
+        status="$(tr -d '[:space:]' < "$binfmt_root/status" 2>/dev/null || true)"
+        [[ "$status" == disabled || "$status" == 0 ]] || {
+            record_skip "HRDN-7231" "binfmt_misc runtime status did not become disabled; see ${report}"
+            return 0
+        }
+    fi
+    if [[ -d "$binfmt_root" ]]; then
+        remaining_registration="$(find "$binfmt_root" -maxdepth 1 -type f ! -name register ! -name status -print 2>/dev/null || true)"
+    fi
+    if [[ -n "$remaining_registration" ]]; then
+        record_skip "HRDN-7231" "registrations remained after runtime disable; no persistent service/module block was installed and formats were not deleted blindly"
+        return 0
+    fi
+    install_managed_file "$modprobe_file" 0644 <<'EOF'
+# Managed by harden.sh after proving no active/configured foreign formats.
+install binfmt_misc /bin/false
+blacklist binfmt_misc
+EOF
+    if unit_file_exists systemd-binfmt.service; then
+        disable_service systemd-binfmt.service 1
+    fi
+    record_change "Inventoried and persistently disabled unused systemd-binfmt/binfmt_misc without deleting configured interpreters"
+    return 0
+}
+
 configure_kernel_modules() {
     local -a modules=(cramfs freevxfs hfs hfsplus jffs2 udf dccp sctp rds tipc)
     local module loaded_modules=""
@@ -1201,15 +1299,11 @@ configure_kernel_modules() {
         if [[ ! -d /sys/bus/thunderbolt/devices || -z "$(ls -A /sys/bus/thunderbolt/devices 2>/dev/null)" ]]; then
             content+=$'\ninstall thunderbolt /bin/false\nblacklist thunderbolt'
         fi
-        if ! systemctl is-active --quiet systemd-binfmt.service 2>/dev/null; then
-            content+=$'\ninstall binfmt_misc /bin/false\nblacklist binfmt_misc'
-        else
-            record_skip "non-native binary formats" "systemd-binfmt is active; disabling its kernel module could break configured interpreters"
-        fi
     else
         record_skip "USB-1000" "USB storage blocking requires --aggressive after verifying console and storage dependencies"
     fi
     printf '%s\n' "$content" | install_managed_file /etc/modprobe.d/99-security-hardening.conf 0644
+    configure_binfmt_misc
     if [[ "$MODE" == "apply" ]]; then
         if command -v update-initramfs >/dev/null 2>&1; then
             if run_streamed update-initramfs -u; then
@@ -1601,6 +1695,36 @@ EOF
     fi
 }
 
+verify_fail2ban_runtime() {
+    local attempts="${1:-1}" attempt ping_output="" jail_output="" report=""
+    if ! command -v fail2ban-client >/dev/null 2>&1; then
+        FAIL2BAN_STATUS="NOT AVAILABLE"
+        return 1
+    fi
+    [[ -z "$BACKUP_DIR" ]] || report="$BACKUP_DIR/fail2ban-runtime.txt"
+    for ((attempt=1; attempt<=attempts; attempt++)); do
+        ping_output="$(fail2ban-client ping 2>&1 || true)"
+        jail_output="$(fail2ban-client status sshd 2>&1 || true)"
+        if systemctl is-active --quiet fail2ban.service \
+            && grep -Eiq 'pong|server replied' <<<"$ping_output" \
+            && grep -Eiq 'status for the jail:[[:space:]]*sshd|jail.*sshd' <<<"$jail_output"; then
+            FAIL2BAN_STATUS="OK"
+            [[ -z "$report" ]] || {
+                printf 'verified=%s\nping=%s\n%s\n' "$(timestamp)" "$ping_output" "$jail_output" > "$report"
+                chmod 0600 "$report"
+            }
+            return 0
+        fi
+        ((attempt == attempts)) || sleep 1
+    done
+    FAIL2BAN_STATUS="FAILED"
+    [[ -z "$report" ]] || {
+        printf 'failed=%s\nping=%s\n%s\n' "$(timestamp)" "$ping_output" "$jail_output" > "$report"
+        chmod 0600 "$report"
+    }
+    return 1
+}
+
 configure_fail2ban() {
     if ! command -v fail2ban-client >/dev/null 2>&1 || [[ -z "$SSH_SERVICE" ]]; then
         FAIL2BAN_STATUS="NOT AVAILABLE"
@@ -1637,11 +1761,10 @@ EOF
     if run_streamed fail2ban-client -t \
         && run_streamed systemctl enable --now fail2ban.service \
         && run_streamed systemctl restart fail2ban.service; then
-        if fail2ban-client status sshd >/dev/null 2>&1; then
-            FAIL2BAN_STATUS="OK"
+        if verify_fail2ban_runtime 10; then
             record_change "Enabled and validated Fail2ban SSH jail using nftables"
         else
-            FAIL2BAN_STATUS="FAILED"
+            record_skip "DEB-0880" "Fail2ban started but its socket/sshd jail did not become verifiably ready; see ${BACKUP_DIR}/fail2ban-runtime.txt"
         fi
     else
         transaction_restore /etc/fail2ban/jail.local fail2ban-global.local
@@ -2355,6 +2478,94 @@ configure_startup_service_review() {
     return 0
 }
 
+configure_headless_packagekit() {
+    local -a installed=() removals=()
+    local package simulation="" removal="" unsafe=""
+    case "$OS_ID" in
+        ubuntu) log INFO "Applying Ubuntu headless PackageKit policy" ;;
+        debian) log INFO "Applying Debian headless PackageKit policy" ;;
+        *)
+            record_skip "PKGS-7394:PackageKit" "unsupported package policy platform ${OS_ID}; PackageKit was not changed"
+            return 0
+            ;;
+    esac
+    for package in packagekit packagekit-tools; do
+        package_installed "$package" && installed+=("$package")
+    done
+    if [[ "$MODE" == "dry-run" ]]; then
+        if ((${#installed[@]})); then
+            log INFO "Would simulate removal of headless PackageKit packages and preserve them unmasked if dependencies make removal unsafe (${OS_ID})"
+        else
+            log INFO "PackageKit is absent on this headless ${OS_ID} host; no service mask is needed"
+        fi
+        return 0
+    fi
+
+    # Remove stale harden.sh masks before auditing or removing the package. A masked
+    # D-Bus activatable service makes package auditors emit UnitMasked errors.
+    run_streamed systemctl unmask packagekit.service packagekit-offline-update.service \
+        packagekit-offline-update.timer || true
+    if ((${#installed[@]} == 0)); then
+        run_streamed systemctl daemon-reload || true
+        record_change "Verified PackageKit absent and removed stale service masks on headless ${OS_ID}"
+        return 0
+    fi
+    if ! apt-get check >/dev/null 2>&1; then
+        record_skip "PKGS-7394:PackageKit" "APT is not healthy before simulation; PackageKit was unmasked and retained"
+        return 0
+    fi
+    if command -v unattended-upgrade >/dev/null 2>&1 \
+        && ! unattended-upgrade --dry-run >/dev/null 2>&1; then
+        record_skip "PKGS-7394:PackageKit" "unattended-upgrades failed its pre-removal dry-run; PackageKit was unmasked and retained"
+        return 0
+    fi
+    simulation="$(apt-get -s purge "${installed[@]}" 2>&1)" || {
+        record_skip "PKGS-7394:PackageKit" "APT purge simulation failed; PackageKit was unmasked and retained"
+        return 0
+    }
+    mapfile -t removals < <(awk '$1 == "Remv" {print $2}' <<<"$simulation" | sort -u)
+    if ((${#removals[@]} == 0)); then
+        record_skip "PKGS-7394:PackageKit" "APT simulation did not confirm a removable PackageKit package"
+        return 0
+    fi
+    for removal in "${removals[@]}"; do
+        case "$removal" in
+            packagekit|packagekit-tools) ;;
+            linux-*|grub*|shim*|systemd*|dbus*|apt|apt-*|unattended-upgrades|ubuntu-*|debian-*|openssh*|sudo*|tailscale*|nftables*|iptables*|netplan*|network-manager*|ifupdown*|cloud-init*)
+                unsafe="$removal"
+                break
+                ;;
+            *)
+                unsafe="$removal"
+                break
+                ;;
+        esac
+    done
+    if [[ -n "$unsafe" ]]; then
+        record_skip "PKGS-7394:PackageKit" "APT simulation would also remove ${unsafe}; PackageKit was unmasked and retained"
+        return 0
+    fi
+    if run_streamed env DEBIAN_FRONTEND=noninteractive apt-get purge -y "${installed[@]}"; then
+        PACKAGES_REMOVED+=("${installed[@]}")
+    else
+        record_skip "PKGS-7394:PackageKit" "simulated PackageKit purge failed; no service was masked"
+        return 0
+    fi
+    if ! run_streamed apt-get check; then
+        UPDATES_STATUS="FAILED"
+        record_skip "PKGS-7394:PackageKit" "APT failed validation after PackageKit removal"
+        return 0
+    fi
+    if command -v unattended-upgrade >/dev/null 2>&1 \
+        && ! run_streamed unattended-upgrade --dry-run; then
+        UPDATES_STATUS="FAILED"
+        record_skip "PKGS-7394:PackageKit" "unattended-upgrades failed validation after PackageKit removal"
+        return 0
+    fi
+    record_change "Safely purged headless PackageKit after dependency simulation and revalidated APT/unattended-upgrades (${OS_ID})"
+    return 0
+}
+
 disable_unneeded_services() {
     configure_startup_service_review
     if [[ "$AGGRESSIVE" -eq 0 ]]; then
@@ -2439,9 +2650,7 @@ disable_unneeded_services() {
     if ! systemctl is-active --quiet display-manager.service 2>/dev/null; then
         disable_service udisks2.service 1
         disable_service upower.service 1
-        disable_service packagekit.service 1
-        disable_service packagekit-offline-update.service 1
-        disable_service packagekit-offline-update.timer 1
+        configure_headless_packagekit
     else
         log INFO "Preserved udisks2, upower, and PackageKit because a display manager is active"
     fi
@@ -2909,16 +3118,27 @@ EOF
 }
 
 restrict_compilers() {
-    local -a tools=(cc gcc g++ c++ clang clang++ cpp make as ld ld.bfd ld.gold)
-    local -a candidates=()
-    local tool path real mode owner group
-    local changed=0 nullglob_was_set=0
+    # Lynis 3.1.6 sets COMPILER_INSTALLED only for these five binary names.
+    local -a lynis_tools=(as cc clang g++ gcc)
+    local -a restriction_tools=(cc gcc g++ c++ clang clang++ cpp make as ld ld.bfd ld.gold)
+    local -a candidates=() lynis_paths=() owner_packages=() removals=()
+    local tool path real mode owner group owner_id group_id package simulation="" unsafe_reason="" protected_build_packages=""
+    local restricted_owner="${HARDEN_TEST_OWNER:-root}" restricted_group="${HARDEN_TEST_GROUP:-root}"
+    local restricted_uid restricted_gid
+    if [[ "$restricted_owner" =~ ^[0-9]+$ ]]; then restricted_uid="$restricted_owner"; else restricted_uid="$(id -u "$restricted_owner")"; fi
+    if [[ "$restricted_group" =~ ^[0-9]+$ ]]; then restricted_gid="$restricted_group"; else restricted_gid="$(getent group "$restricted_group" | awk -F: 'NR == 1 {print $3}')"; fi
+    local changed=0 nullglob_was_set=0 purge_completed=0
     declare -A seen_compilers=()
+    declare -A seen_packages=()
     if [[ "$MODE" == "apply" && -n "$BACKUP_DIR" ]] && command -v lynis >/dev/null 2>&1; then
         lynis show details HRDN-7222 > "$BACKUP_DIR/lynis-HRDN-7222-details.txt" 2>&1 || true
         chmod 0600 "$BACKUP_DIR/lynis-HRDN-7222-details.txt"
     fi
-    for tool in "${tools[@]}"; do
+    for tool in "${lynis_tools[@]}"; do
+        path="$(command -v "$tool" 2>/dev/null || true)"
+        [[ -z "$path" ]] || lynis_paths+=("$path")
+    done
+    for tool in "${restriction_tools[@]}"; do
         path="$(command -v "$tool" 2>/dev/null || true)"
         [[ -z "$path" ]] || candidates+=("$path")
     done
@@ -2933,6 +3153,82 @@ restrict_compilers() {
         /usr/local/bin/gcc* /usr/local/bin/g++* /usr/local/bin/clang* /usr/local/bin/cc /usr/local/bin/c++
     )
     [[ "$nullglob_was_set" -eq 1 ]] || shopt -u nullglob
+
+    if [[ "$MODE" == "apply" && -n "$BACKUP_DIR" ]]; then
+        : > "$BACKUP_DIR/compiler-toolchain-inventory.txt"
+        chmod 0600 "$BACKUP_DIR/compiler-toolchain-inventory.txt"
+    fi
+    for path in "${lynis_paths[@]}"; do
+        real="$(readlink -f "$path" 2>/dev/null || true)"
+        [[ -f "$real" ]] || continue
+        package="$(dpkg-query -S "$real" "$path" 2>/dev/null | awk -F: 'NR == 1 {print $1}' | sed 's/:.*$//' || true)"
+        if [[ "$MODE" == "apply" && -n "$BACKUP_DIR" ]]; then
+            printf 'lynis-binary=%s\treal=%s\tpackage=%s\n' "$path" "$real" "${package:-unmanaged}" >> "$BACKUP_DIR/compiler-toolchain-inventory.txt"
+        fi
+        if [[ -n "$package" && -z "${seen_packages[$package]+present}" ]]; then
+            seen_packages["$package"]=1
+            owner_packages+=("$package")
+        fi
+    done
+
+    if [[ "$AGGRESSIVE" -eq 1 && ${#owner_packages[@]} -gt 0 ]]; then
+        protected_build_packages="$(dpkg-query -W -f='${binary:Package}\n' 'dkms' '*-dkms' 'linux-headers-*' 2>/dev/null || true)"
+        if grep -Eq '(^dkms$|-dkms($|:)|^linux-headers-)' <<<"$protected_build_packages"; then
+            unsafe_reason="DKMS or installed kernel headers require a build toolchain for supported updates"
+        elif [[ "$MODE" == "dry-run" ]]; then
+            log INFO "Would simulate purge of Lynis-detected compiler owner packages: ${owner_packages[*]}"
+        elif simulation="$(apt-get -s purge "${owner_packages[@]}" 2>&1)"; then
+            mapfile -t removals < <(awk '$1 == "Remv" {print $2}' <<<"$simulation" | sort -u)
+            for package in "${removals[@]}"; do
+                case "$package" in
+                    gcc|gcc-[0-9]*|g++|g++-[0-9]*|clang|clang-[0-9]*|binutils|binutils-*|build-essential|cpp|cpp-[0-9]*) ;;
+                    linux-*|dkms|*-dkms|grub*|shim*|systemd*|openssh*|sudo*|tailscale*|nftables*|iptables*|netplan*|network-manager*|ifupdown*|cloud-init*|open-vm-tools*|qemu-guest-agent|ubuntu-*|debian-*)
+                        unsafe_reason="APT simulation includes protected package ${package}"
+                        break
+                        ;;
+                    *)
+                        unsafe_reason="APT simulation includes non-toolchain package ${package}"
+                        break
+                        ;;
+                esac
+            done
+            if [[ -z "$unsafe_reason" && ${#removals[@]} -gt 0 ]] \
+                && run_streamed env DEBIAN_FRONTEND=noninteractive apt-get purge -y "${owner_packages[@]}"; then
+                PACKAGES_REMOVED+=("${owner_packages[@]}")
+                purge_completed=1
+                if run_streamed apt-get check; then
+                    record_change "Removed safely dispensable Lynis-detected compiler packages after APT dependency simulation: ${owner_packages[*]}"
+                else
+                    unsafe_reason="toolchain packages were removed but post-purge APT validation failed"
+                fi
+            elif [[ -z "$unsafe_reason" ]]; then
+                unsafe_reason="simulated toolchain purge failed"
+            fi
+        else
+            unsafe_reason="APT simulation failed"
+        fi
+    fi
+    if [[ -n "$unsafe_reason" ]]; then
+        record_skip "HRDN-7220" "compiler packages retained: ${unsafe_reason}; binaries are restricted root-only and inventory is in ${BACKUP_DIR:-planned}/compiler-toolchain-inventory.txt"
+    fi
+
+    candidates=()
+    for tool in "${restriction_tools[@]}"; do
+        path="$(command -v "$tool" 2>/dev/null || true)"
+        [[ -z "$path" ]] || candidates+=("$path")
+    done
+    nullglob_was_set=0
+    shopt -q nullglob && nullglob_was_set=1
+    shopt -s nullglob
+    candidates+=(
+        /usr/bin/gcc-[0-9]* /usr/bin/g++-[0-9]* /usr/bin/cpp-[0-9]*
+        /usr/bin/clang-[0-9]* /usr/bin/clang++-[0-9]*
+        /usr/bin/*-linux-gnu-gcc /usr/bin/*-linux-gnu-gcc-[0-9]*
+        /usr/bin/*-linux-gnu-g++ /usr/bin/*-linux-gnu-g++-[0-9]*
+        /usr/bin/*-linux-gnu-as /usr/bin/*-linux-gnu-ld /usr/bin/*-linux-gnu-ld.*
+    )
+    [[ "$nullglob_was_set" -eq 1 ]] || shopt -u nullglob
+    seen_compilers=()
     for path in "${candidates[@]}"; do
         [[ -e "$path" || -L "$path" ]] || continue
         real="$(readlink -f "$path" 2>/dev/null || true)"
@@ -2940,13 +3236,15 @@ restrict_compilers() {
         [[ -z "${seen_compilers[$real]+present}" ]] || continue
         seen_compilers["$real"]=1
         if [[ "$AGGRESSIVE" -eq 1 ]]; then
-            run chown root:root "$real"
+            run chown "${restricted_owner}:${restricted_group}" "$real"
             run chmod 0750 "$real"
             if [[ "$MODE" == "apply" ]]; then
                 mode="$(stat -c '%a' "$real" 2>/dev/null || true)"
                 owner="$(stat -c '%U' "$real" 2>/dev/null || true)"
                 group="$(stat -c '%G' "$real" 2>/dev/null || true)"
-                if [[ "$mode" != "750" || "$owner" != "root" || "$group" != "root" ]]; then
+                owner_id="$(stat -c '%u' "$real" 2>/dev/null || true)"
+                group_id="$(stat -c '%g' "$real" 2>/dev/null || true)"
+                if [[ "$mode" != "750" || "$owner_id" != "$restricted_uid" || "$group_id" != "$restricted_gid" ]]; then
                     die "Compiler restriction verification failed for ${real}: ${owner:-?}:${group:-?} ${mode:-?}"
                 fi
                 printf '%s\t%s:%s\t%s\n' "$real" "$owner" "$group" "$mode" >> "$BACKUP_DIR/compiler-hardening.txt"
@@ -2957,7 +3255,7 @@ restrict_compilers() {
         fi
     done
     if [[ "$changed" -eq 1 ]]; then
-        record_change "Restricted all discovered compiler, assembler, linker, and make binaries to root:root 0750"
+        record_change "Restricted remaining compiler, assembler, linker, and make binaries to root:root 0750 (safe purge completed: ${purge_completed})"
     elif [[ "$AGGRESSIVE" -eq 1 ]]; then
         log INFO "No installed compiler/linker binaries were discovered"
     fi
@@ -3055,6 +3353,51 @@ validate_aide_service_context() {
     return 0
 }
 
+install_aide_primary_sha2_group() {
+    local runtime_config="$1" temporary mode owner group
+    if awk '
+        /^# BEGIN harden[.]sh SHA-2 group$/ {managed=1}
+        managed && /^HardenSHA2 = p\+ftype\+i\+l\+n\+u\+g\+s\+b\+m\+c\+sha256\+sha512$/ {valid=1}
+        /^# END harden[.]sh SHA-2 group$/ && managed {complete=1; managed=0}
+        END {exit !(valid && complete)}
+    ' "$runtime_config"; then
+        return 1
+    fi
+    temporary="$(mktemp)"
+    awk '
+        function print_group() {
+            print "# BEGIN harden.sh SHA-2 group"
+            print "# Kept in the primary runtime config because AIDE and Lynis 3.1.6 both evaluate this effective definition."
+            print "HardenSHA2 = p+ftype+i+l+n+u+g+s+b+m+c+sha256+sha512"
+            print "# END harden.sh SHA-2 group"
+            print ""
+            inserted=1
+        }
+        /^# BEGIN harden[.]sh SHA-2 group$/ {managed=1; next}
+        /^# END harden[.]sh SHA-2 group$/ {managed=0; next}
+        managed {next}
+        /^[[:space:]]*HardenSHA2[[:space:]]*=/ {next}
+        /^@@(x_)?include[[:space:]]+/ && !inserted {print_group()}
+        {print}
+        END {
+            if (!inserted) {
+                print ""
+                print_group()
+            }
+        }
+    ' "$runtime_config" > "$temporary"
+    if cmp -s "$temporary" "$runtime_config"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+    mode="$(stat -c '%a' "$runtime_config" 2>/dev/null || printf 0644)"
+    owner="$(stat -c '%U' "$runtime_config" 2>/dev/null || printf root)"
+    group="$(stat -c '%G' "$runtime_config" 2>/dev/null || printf root)"
+    install -o "$owner" -g "$group" -m "$mode" "$temporary" "$runtime_config"
+    rm -f -- "$temporary"
+    return 0
+}
+
 configure_aide() {
     if [[ "$MODE" == "dry-run" ]]; then
         log INFO "Would validate the distribution AIDE runtime, add SHA256+SHA512 policy, atomically activate a missing or policy-obsolete baseline, verify aide --check, and only then enable its timer"
@@ -3077,14 +3420,15 @@ configure_aide() {
     local database_path="" database_out_path="" aide_check_output="" aide_check_rc=0
     local aide_policy="${aide_etc_dir}/aide.conf.d/99_harden_sha2"
     local aide_policy_changed=0 aide_config_changed=0 baseline_required=0
-    local policy_content="" candidate="" version_output="" active_tmp=""
+    local policy_content="" candidate="" version_output="" active_tmp="" fint_evidence=""
     local database_owner="" database_group="" database_parent=""
     local policy_digest="" policy_stamp="" stamp_tmp=""
     aide_raw="$(command -v aide 2>/dev/null || true)"
-    for candidate in "${aide_etc_dir}/aide.conf" /etc/aide.conf /usr/local/etc/aide.conf; do
+    # Match Lynis 3.1.6 FINT-4315/FINT-4402 search order exactly: its last
+    # existing config wins (/etc, /etc/aide, then /usr/local/etc).
+    for candidate in /etc/aide.conf "${aide_etc_dir}/aide.conf" /usr/local/etc/aide.conf; do
         if [[ -s "$candidate" ]]; then
             aide_config="$candidate"
-            break
         fi
     done
     if [[ -z "$aide_raw" || -z "$aide_config" ]]; then
@@ -3095,8 +3439,7 @@ configure_aide() {
     fi
     run_streamed systemctl stop aide-check.timer dailyaidecheck.timer \
         aide-check.service dailyaidecheck.service || true
-    policy_content='# Managed by harden.sh: SHA-2 integrity policy v1.1.3
-HardenSHA2 = p+ftype+i+l+n+u+g+s+b+m+c+sha256+sha512
+    policy_content='# Managed by harden.sh: SHA-2 integrity paths v1.1.3
 =/etc/passwd HardenSHA2
 =/etc/group HardenSHA2
 =/etc/shadow HardenSHA2
@@ -3112,10 +3455,14 @@ HardenSHA2 = p+ftype+i+l+n+u+g+s+b+m+c+sha256+sha512
     transaction_copy "$aide_policy" aide-sha2-policy
     printf '%s\n' "$policy_content" | install_managed_file "$aide_policy" 0644 "$managed_owner" "$managed_group"
     runtime_config="$aide_config"
+    transaction_copy "$runtime_config" aide-runtime-config
+    if install_aide_primary_sha2_group "$runtime_config"; then
+        aide_config_changed=1
+        record_change "Installed the effective HardenSHA2 group in primary AIDE runtime config ${runtime_config}"
+    fi
     if ! awk -v directory="${aide_etc_dir}/aide.conf.d" \
         '$1 ~ /^@@(x_)?include$/ && $2 == directory {found=1} END {exit !found}' "$runtime_config" \
         && ! grep -Fqx "@@include ${aide_policy}" "$runtime_config"; then
-        transaction_copy "$runtime_config" aide-runtime-config
         printf '\n@@include %s\n' "$aide_policy" >> "$runtime_config"
         aide_config_changed=1
     fi
@@ -3134,6 +3481,20 @@ HardenSHA2 = p+ftype+i+l+n+u+g+s+b+m+c+sha256+sha512
         return 0
     fi
     chmod 0600 "$BACKUP_DIR/aide-config-check.txt"
+    fint_evidence="$BACKUP_DIR/aide-lynis-FINT-4402-evidence.txt"
+    {
+        printf 'Lynis 3.1.6 FINT-4402-compatible effective primary configuration evidence\n'
+        printf 'runtime_config=%s\n' "$runtime_config"
+        awk '!/^[[:space:]]*#/ && /= .*(sha256|sha512)/ {print}' "$runtime_config"
+        printf 'aide_config_check=success\n'
+    } > "$fint_evidence"
+    chmod 0600 "$fint_evidence"
+    if ! awk '!/^[[:space:]]*#/ && /= .*(sha256|sha512)/ {found=1} END {exit !found}' "$runtime_config"; then
+        AIDE_STATUS="FAILED"
+        systemctl disable --now aide-check.timer dailyaidecheck.timer >/dev/null 2>&1 || true
+        record_skip "FINT-4402" "effective primary config passed AIDE but did not expose its SHA-2 group to Lynis 3.1.6; see ${fint_evidence}"
+        return 0
+    fi
     database_path="$(aide_runtime_path "$runtime_config" database_in 2>/dev/null || true)"
     [[ -n "$database_path" ]] || database_path="$(aide_runtime_path "$runtime_config" database 2>/dev/null || true)"
     database_out_path="$(aide_runtime_path "$runtime_config" database_out 2>/dev/null || true)"
@@ -3147,7 +3508,7 @@ HardenSHA2 = p+ftype+i+l+n+u+g+s+b+m+c+sha256+sha512
         "${aide_state_dir}"/*:"${aide_state_dir}"/*) ;;
         *) log WARN "AIDE runtime uses distribution-defined database paths outside ${aide_state_dir}: ${database_path}, ${database_out_path}" ;;
     esac
-    policy_digest="$(sha256sum "$aide_policy" | awk '{print $1}')"
+    policy_digest="$(sha256sum "$runtime_config" "$aide_policy" | sha256sum | awk '{print $1}')"
     policy_stamp="${database_path}.harden-policy.sha256"
     if unit_file_exists dailyaidecheck.timer; then
         aide_timer=dailyaidecheck.timer
@@ -3341,12 +3702,15 @@ remediate_deleted_open_files() {
 }
 
 diagnose_iowait_processes() {
+    local stage="${1:-validation}"
     if [[ "$MODE" == "dry-run" ]]; then
-        log INFO "Would inventory uninterruptible IO-wait processes for PROC-3614 without terminating them"
+        log INFO "Would inventory PID/unit/stat/wchan/command for PROC-3614 (${stage}) without terminating processes"
         return 0
     fi
-    local report=/root/hardening-iowait-processes.txt ps_output="" rc=0 blocked=""
-    if ps_output="$(ps -eo pid=,ppid=,state=,comm=,wchan:32=,args= 2>&1)"; then
+    local report="${HARDEN_IOWAIT_REPORT:-/root/hardening-iowait-processes.txt}"
+    local ps_output="" rc=0 blocked="" pid stat wchan comm command unit classification
+    local current_pids="" persistent=0
+    if ps_output="$(ps -eo pid=,stat=,wchan:32=,comm=,args= 2>&1)"; then
         rc=0
     else
         rc=$?
@@ -3355,18 +3719,45 @@ diagnose_iowait_processes() {
         log WARN "ps failed while diagnosing PROC-3614 (exit ${rc})"
         return 0
     fi
-    blocked="$(awk '$3 ~ /^D/ {print}' <<<"$ps_output")"
+    blocked="$(awk '$2 ~ /^D/ {print}' <<<"$ps_output")"
+    current_pids="$(awk '$2 ~ /^D/ {print $1}' <<<"$ps_output")"
     {
-        printf 'IO-wait process inventory generated %s\n' "$(timestamp)"
-        printf '%s\n' 'PID PPID STATE COMMAND WCHAN ARGS'
-        if [[ -n "$blocked" ]]; then printf '%s\n' "$blocked"; else printf '%s\n' 'none'; fi
-    } > "$report"
+        printf '\n=== PROC-3614 snapshot: %s at %s ===\n' "$stage" "$(timestamp)"
+        printf '%s\n' 'PID UNIT STAT WCHAN COMMAND CLASSIFICATION'
+        if [[ -n "$blocked" ]]; then
+            while IFS=$' \t' read -r pid stat wchan comm command; do
+                [[ -n "$pid" ]] || continue
+                unit="$(systemd_unit_for_pid "$pid" 2>/dev/null || true)"
+                [[ -n "$unit" ]] || unit="none"
+                classification="new/transient-candidate"
+                if grep -Fxq "$pid" <<<"$IOWAIT_PREVIOUS_PIDS"; then
+                    classification="persistent-across-snapshots"
+                    persistent=1
+                fi
+                printf '%s\t%s\t%s\t%s\t%s %s\t%s\n' "$pid" "$unit" "$stat" "$wchan" "$comm" "$command" "$classification"
+                printf '%s\n' "-- /proc/${pid}/io --"
+                sed -n '1,20p' "/proc/${pid}/io" 2>/dev/null || true
+                printf '%s\n' "-- /proc/${pid}/fd targets (device/filesystem evidence) --"
+                find "/proc/${pid}/fd" -maxdepth 1 -type l -printf '%f -> %l\n' 2>/dev/null || true
+            done <<<"$blocked"
+        else
+            printf '%s\n' 'none'
+            if [[ -n "$IOWAIT_PREVIOUS_PIDS" ]]; then
+                printf 'classification=previous D-state PIDs resolved; transient IO wait\n'
+            fi
+        fi
+    } >> "$report"
     chmod 0600 "$report"
     if [[ -n "$blocked" ]]; then
-        record_skip "PROC-3614" "processes in uninterruptible IO wait were documented in ${report}; none were killed without a proven safe cause"
+        if [[ "$persistent" -eq 1 ]]; then
+            record_skip "PROC-3614" "persistent D-state processes were observed across snapshots; PID/unit/stat/wchan/command evidence is in ${report}; none were killed"
+        else
+            record_skip "PROC-3614" "new D-state processes were documented for recheck in ${report}; none were killed"
+        fi
     else
-        record_change "PROC-3614 check found no processes in uninterruptible IO wait"
+        record_change "PROC-3614 ${stage} check found no processes in uninterruptible IO wait"
     fi
+    IOWAIT_PREVIOUS_PIDS="$current_pids"
     return 0
 }
 
@@ -3515,11 +3906,14 @@ second_optimization_pass() {
 }
 
 extract_lynis_summary() {
-    local report=/root/lynis-after-hardening.txt
+    local report="${HARDEN_LYNIS_FINAL_REPORT:-/root/lynis-after-hardening.txt}"
+    local data="${HARDEN_LYNIS_FINAL_DATA:-/root/lynis-after-hardening-report.dat}"
+    local diagnostic="${HARDEN_LYNIS_PARSE_DIAGNOSTIC:-/root/lynis-summary-parse-diagnostics.txt}"
     if [[ "$MODE" == "dry-run" ]]; then
         LYNIS_AFTER="N/A (dry-run)"
         LYNIS_WARNINGS="N/A"
         LYNIS_SUGGESTIONS="N/A"
+        LYNIS_PARSE_STATUS="N/A"
         log INFO "Dry run: skipping Lynis summary extraction because no report is written"
         return 0
     fi
@@ -3527,16 +3921,48 @@ extract_lynis_summary() {
         LYNIS_AFTER="unknown"
         LYNIS_WARNINGS="unknown"
         LYNIS_SUGGESTIONS="unknown"
+        LYNIS_PARSE_STATUS="REPORT MISSING"
         log WARN "Final Lynis report is absent; summary values remain unknown"
         return 0
     fi
-    LYNIS_AFTER="$(awk '/Hardening index[[:space:]]*:/ {for (i=1; i<=NF; i++) if ($i ~ /^[0-9]+$/) value=$i} END {print value}' "$report")"
-    [[ -n "$LYNIS_AFTER" ]] || LYNIS_AFTER="unknown"
-    LYNIS_WARNINGS="$(awk '/Warnings \([0-9]+\)/ {line=$0; sub(/^.*Warnings \(/,"",line); sub(/\).*$/,"",line); value=line} END {print value}' "$report")"
+    LYNIS_AFTER="$(sed $'s/\033\\[[0-9;]*[[:alpha:]]//g' "$report" | awk '
+        /Hardening index[[:space:]]*:/ {
+            line=$0
+            sub(/^.*Hardening index[[:space:]]*:[[:space:]]*/, "", line)
+            if (match(line, /[0-9]+/)) value=substr(line, RSTART, RLENGTH)
+        }
+        END {print value}
+    ')"
+    [[ -n "$LYNIS_AFTER" || ! -s "$data" ]] || LYNIS_AFTER="$(awk -F= '$1 == "hardening_index" {value=$2} END {print value}' "$data")"
+    LYNIS_WARNINGS="$(sed $'s/\033\\[[0-9;]*[[:alpha:]]//g' "$report" | awk '
+        /Warnings[[:space:]]*\([0-9]+\)/ {line=$0; sub(/^.*Warnings[[:space:]]*\(/,"",line); sub(/\).*$/,"",line); value=line}
+        END {print value}
+    ')"
     if grep -q 'Great, no warnings' "$report"; then LYNIS_WARNINGS=0; fi
-    [[ -n "$LYNIS_WARNINGS" ]] || LYNIS_WARNINGS="unknown"
-    LYNIS_SUGGESTIONS="$(awk '/Suggestions \([0-9]+\)/ {line=$0; sub(/^.*Suggestions \(/,"",line); sub(/\).*$/,"",line); value=line} END {print value}' "$report")"
-    [[ -n "$LYNIS_SUGGESTIONS" ]] || LYNIS_SUGGESTIONS="unknown"
+    [[ -n "$LYNIS_WARNINGS" || ! -s "$data" ]] || LYNIS_WARNINGS="$(grep -c '^warning\[\]=' "$data" || true)"
+    LYNIS_SUGGESTIONS="$(sed $'s/\033\\[[0-9;]*[[:alpha:]]//g' "$report" | awk '
+        /Suggestions[[:space:]]*\([0-9]+\)/ {line=$0; sub(/^.*Suggestions[[:space:]]*\(/,"",line); sub(/\).*$/,"",line); value=line}
+        /Suggestions[[:space:]]*:[[:space:]]*[0-9]+/ {line=$0; sub(/^.*Suggestions[[:space:]]*:[[:space:]]*/,"",line); if (match(line, /^[0-9]+/)) value=substr(line,RSTART,RLENGTH)}
+        END {print value}
+    ')"
+    [[ -n "$LYNIS_SUGGESTIONS" || ! -s "$data" ]] || LYNIS_SUGGESTIONS="$(grep -c '^suggestion\[\]=' "$data" || true)"
+    if [[ "$LYNIS_AFTER" =~ ^[0-9]+$ && "$LYNIS_WARNINGS" =~ ^[0-9]+$ \
+        && "$LYNIS_SUGGESTIONS" =~ ^[0-9]+$ ]]; then
+        LYNIS_PARSE_STATUS="OK"
+        rm -f -- "$diagnostic"
+    else
+        [[ "$LYNIS_AFTER" =~ ^[0-9]+$ ]] || LYNIS_AFTER="PARSE ERROR"
+        [[ "$LYNIS_WARNINGS" =~ ^[0-9]+$ ]] || LYNIS_WARNINGS="PARSE ERROR"
+        [[ "$LYNIS_SUGGESTIONS" =~ ^[0-9]+$ ]] || LYNIS_SUGGESTIONS="PARSE ERROR"
+        LYNIS_PARSE_STATUS="FAILED"
+        {
+            printf 'Lynis summary parse failure at %s\n' "$(timestamp)"
+            grep -E 'Hardening index|Warnings|Suggestions|Great, no warnings' "$report" || true
+            [[ ! -s "$data" ]] || grep -E '^(hardening_index|warning\[\]|suggestion\[\])=' "$data" || true
+        } > "$diagnostic"
+        chmod 0600 "$diagnostic"
+        log WARN "Final Lynis summary parse failed; see ${diagnostic}"
+    fi
     return 0
 }
 
@@ -3671,6 +4097,7 @@ Lynis Score Before : ${SOURCE_LYNIS_INDEX}
 Lynis Score After  : ${LYNIS_AFTER}
 Warnings           : ${LYNIS_WARNINGS}
 Suggestions        : ${LYNIS_SUGGESTIONS}
+Lynis Parse Status : ${LYNIS_PARSE_STATUS}
 
 Packages installed : ${PACKAGES_INSTALLED[*]:-none}
 Packages removed   : ${PACKAGES_REMOVED[*]:-none}
@@ -3781,7 +4208,7 @@ main() {
 
     phase 13 18 "Validation"
     remediate_deleted_open_files
-    diagnose_iowait_processes
+    diagnose_iowait_processes "validation-baseline"
     run_validation
 
     phase 14 18 "Lynis Pass 1"
@@ -3797,9 +4224,16 @@ main() {
     fi
 
     phase 17 18 "Final Lockdown and Lynis"
+    diagnose_iowait_processes "pre-final-lynis"
     lock_kernel_modules_late
     run_lynis /root/lynis-after-hardening.txt "final pass"
     FINAL_LYNIS_COMPLETED=1
+    if grep -q '\[PROC-3614\]' /root/lynis-after-hardening.txt 2>/dev/null; then
+        log WARN "Final Lynis reported PROC-3614; waiting briefly for a second non-destructive D-state snapshot"
+        sleep 2
+        diagnose_iowait_processes "post-finding-recheck"
+    fi
+    verify_fail2ban_runtime 3 || true
     extract_lynis_summary
     write_open_findings_report
 

@@ -27,6 +27,37 @@ Schutzoptionen blind; teste den Dienstzweck und erstelle einen gezielten Fix.
 Eine Baseline liest viele Dateien und kann I/O-intensiv sein. Nicht abbrechen,
 ohne den Zustand von Datenbank, Timer und Backup zu prüfen.
 
+`FINT-4402` liest in Lynis 3.1.6 nur die erkannte primäre AIDE-Konfiguration;
+Lynis expandiert deren Include-Dateien für diesen Test nicht. Das Skript hält
+deshalb die tatsächlich wirksame `HardenSHA2`-Gruppendefinition in der primären
+Runtime-Konfiguration und die überwachten Pfade im Include. Prüfe bei einem
+Restbefund `aide-lynis-FINT-4402-evidence.txt` und `aide --config-check`; füge
+keine wirkungslose Kommentarzeile nur für den Score ein.
+
+## PackageKit, Compiler und binfmt
+
+Die Entscheidungsartefakte liegen im Lauf-Backup. Ein unsicherer PackageKit-
+oder Compiler-Purge wird abgebrochen, nicht erzwungen. Wiederherstellung eines
+bewusst entfernten Pakets erfolgt aus den konfigurierten Distributionsquellen
+mit `apt-get install PAKET`; anschließend APT und die zugehörigen Dienste
+validieren. Erhaltene Compiler werden nach Paketupdates erneut root-only
+gesetzt. `binfmt_misc` bleibt aktiv, sobald eine Registrierung, Definition oder
+ein qemu-/Wine-/JVM-Verbraucher erkannt wird.
+
+## Lynis-Summary oder Fail2ban widersprüchlich
+
+Prüfe `lynis-after-hardening-report.dat`,
+`lynis-summary-parse-diagnostics.txt` und das Backup-Artefakt
+`fail2ban-runtime.txt`. Der Fail2ban-Status setzt einen aktiven Dienst, eine
+erfolgreiche Server-Ping-Antwort und den live abfragbaren `sshd`-Jail voraus.
+
+## `PROC-3614`
+
+`/root/hardening-iowait-processes.txt` enthält wiederholte D-State-Snapshots
+mit Unit und Wait-Channel. Kurzlebige I/O-Waits sind erwartbar; wiederholt
+gleiche PIDs erfordern Storage-/Filesystem-Diagnose. D-State-Prozesse nicht
+blind killen oder Storage zurücksetzen.
+
 ## `kernel.modules_disabled=1`
 
 Diese aggressive Einstellung ist bis zum Reboot irreversibel. Teste benötigte

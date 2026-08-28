@@ -30,6 +30,27 @@ sudo cp /var/log/server-hardening.log ./hardening-apply.log
 sudo cp /root/lynis-after-hardening.txt ./lynis-after.log
 ```
 
+Für die Findings #4, #12, #17, #18, #19 und #20 zusätzlich prüfen:
+
+- `aide-lynis-FINT-4402-evidence.txt`, AIDE-Konfigurationsprüfung,
+  aktive Datenbank, erfolgreicher Check-Service und aktiver Timer;
+- PackageKit ist entweder sauber entfernt oder unmaskiert mit dokumentierter
+  APT-Abhängigkeitsausnahme; `apt-get check` und `unattended-upgrade --dry-run`
+  funktionieren;
+- `compiler-toolchain-inventory.txt` nennt Lynis-Binary und Paket; ein Purge
+  entfernt keine DKMS-, Kernel-, Guest-, SSH- oder Netzwerkkomponente;
+- `binfmt-misc-inventory.txt` erklärt jede erhaltene Registrierung oder belegt
+  die leere, deaktivierte Runtime;
+- Summary-Werte stimmen mit `lynis-after-hardening-report.dat` überein und
+  `fail2ban-client ping/status sshd` bestätigt den angezeigten Status;
+- `hardening-iowait-processes.txt` enthält Vorher-/Nachher-Snapshots. D-State-
+  Prozesse werden niemals automatisch beendet.
+
+Falls ein unmittelbar anschließender manueller Lynis-Lauf einen anderen Index
+liefert, beide Console-Reports und beide `lynis-report.dat`-Dateien sichern und
+die `suggestion[]`, `warning[]` sowie Test-Ergebnisse vergleichen. Ein bloßer
+Indexunterschied ist kein belastbarer Root-Cause-Nachweis.
+
 Der offizielle Apply-/Zielsystemtest wird direkt und ohne externe Pipe oder
 `tee` gestartet. Nur so bleibt die automatische TTY-Farberkennung aktiv; das
 Skript schreibt den vollständigen ANSI-freien Lauf selbst nach

@@ -49,6 +49,8 @@ Letzter realer Stand mit Version 1.1.2: Lynis Hardening Index **86**.
 - Paket-/Update-Hardening, gezielte Service-Deaktivierung und systemd-
   Sandboxing mit gemessener Exposure vor/nach der Änderung
 - zwei Lynis-Läufe, offene Findings und Abschlussberichte
+- nachvollziehbare AIDE-/PackageKit-/Compiler-/binfmt-Entscheidungsartefakte
+  sowie zeitlich wiederholte, rein diagnostische PROC-3614-Snapshots
 
 ## Installation per Git
 
@@ -149,6 +151,9 @@ Nach einem Apply-Lauf sind unter anderem folgende Dateien relevant:
 /root/systemd-hardening-report.txt
 /root/lynis-after-hardening-pass1.txt
 /root/lynis-after-hardening.txt
+/root/lynis-after-hardening-report.dat
+/root/lynis-summary-parse-diagnostics.txt (nur bei Parsefehler)
+/root/hardening-iowait-processes.txt
 /root/hardening-backup-YYYYMMDD-HHMMSS/
 ```
 

@@ -27,6 +27,27 @@ für 1.1.3 wird erst nach dem vollständigen Zielsystemtest erstellt.
   Installer in einem temporären Zielpfad.
 - `--install-path` bezeichnet jetzt die ausführbare Zieldatei statt eines
   Verzeichnisses.
+- AIDE writes its validated `HardenSHA2` group into the effective primary
+  runtime configuration. This matches what AIDE executes and what Lynis 3.1.6
+  actually inspects for `FINT-4402`; included path rules, database activation,
+  service-context validation, and the timer remain unchanged.
+- Headless PackageKit is unmasked and removed only when an APT purge simulation
+  contains no other package. APT and unattended-upgrades are validated before
+  and after; unsafe dependency graphs retain PackageKit unmasked.
+- Aggressive compiler handling inventories the exact Lynis 3.1.6 detector set
+  (`as`, `cc`, `clang`, `g++`, `gcc`) and owning packages. A simulated purge is
+  allowed only for a narrow toolchain set and is blocked by DKMS, kernel-header,
+  guest, boot, SSH, or network dependencies; the fallback remains root-only.
+- `binfmt_misc` registrations, persistent definitions, and qemu/Wine/JVM
+  consumers are inventoried. Only an empty, consumer-free aggressive host gets
+  the runtime facility and `systemd-binfmt` persistently disabled.
+- Final Lynis score/warning/suggestion parsing now accepts real 3.1.6 console
+  output and falls back to the saved structured report. Fail2ban status is
+  refreshed from service, server ping, and the live `sshd` jail after a bounded
+  readiness check.
+- `PROC-3614` now records repeated PID, unit, stat, wait-channel, command, IO,
+  and file-descriptor snapshots, classifies transient versus persistent waits,
+  and never kills a D-state process.
 
 ### Added
 
@@ -54,3 +75,9 @@ für 1.1.3 wird erst nach dem vollständigen Zielsystemtest erstellt.
 - Lokale Syntax-, statische und simulierte Regressionstests bestanden.
 - Ein vollständiger Ubuntu-26.04.1-Zielsystemtest und die Bestätigung des
   Zielwerts Hardening Index >= 90 stehen noch aus.
+- Der beobachtete interne Score 86 gegenüber einem späteren manuellen Score 87
+  ist aus den vorhandenen Konsolenauszügen nicht testgenau rekonstruierbar. Die
+  Scans waren zeitlich verschiedene Snapshots und der alte Summary-Parser
+  verlor strukturierte Werte. Künftige Retests bewahren Console und
+  `lynis-report.dat` je Pass auf; ein Punktunterschied darf erst anhand der
+  konkreten Test-ID-Differenz erklärt werden, nicht durch Profil-Skipping.

@@ -92,7 +92,11 @@ case " $* " in
         [[ -s "$config" ]]
         policy="$(awk '/^@@(x_)?include[[:space:]]+/ {print $2; exit}' "$config")/99_harden_sha2"
         [[ -s "$policy" ]]
-        grep -Fq 'sha256+sha512' "$policy"
+        grep -Fq 'HardenSHA2 = p+ftype+i+l+n+u+g+s+b+m+c+sha256+sha512' "$config"
+        grep -Fq '=/etc/passwd HardenSHA2' "$policy"
+        group_line="$(awk '/^HardenSHA2[[:space:]]*=/ {print NR; exit}' "$config")"
+        include_line="$(awk '/^@@(x_)?include[[:space:]]+/ {print NR; exit}' "$config")"
+        [[ -n "$group_line" && -n "$include_line" && "$group_line" -lt "$include_line" ]]
         ;;
     *' --init '*)
         database_out="$(awk -F= '$1 ~ /^[[:space:]]*database_out[[:space:]]*$/ {value=$2; gsub(/^[[:space:]]*file:|[[:space:]]*$/, "", value); print value; exit}' "$config")"
@@ -213,8 +217,10 @@ EOF
             grep -Fq "User=_aide" "$2/aide-service-context.txt"
             grep -Fq "CAP_DAC_READ_SEARCH CAP_AUDIT_WRITE" "$2/aide-service-context.txt"
             grep -Fq "Result=success" "$2/aide-service-context.txt"
+            grep -Fq "HardenSHA2 = p+ftype+i+l+n+u+g+s+b+m+c+sha256+sha512" "$6"
+            grep -Eq "= .*(sha256|sha512)" "$2/aide-lynis-FINT-4402-evidence.txt"
         ' _ "$repo_root" "$backup_dir" "$state_dir" "$count_file" \
-        "$service_run_file" \
+        "$service_run_file" "$config" \
         || fail "Ubuntu-layout AIDE missing-database or idempotent second-run test failed"
 
     rm -f -- "$count_file"
@@ -315,7 +321,342 @@ EOF
         ' _ "$repo_root" "$control" "$writes" "$case_root/changes.tsv" || fail "final kernel.modules_disabled gate or idempotent path failed"
 }
 
-run_logging_tests
-run_aide_tests
-run_kernel_gate_test
+run_lynis_summary_tests() {
+    local case_root="$test_root/lynis-summary"
+    local report="$case_root/final.txt" data="$case_root/final-report.dat" diagnostic="$case_root/diagnostic.txt"
+    install -d "$case_root"
+    cat > "$report" <<'EOF'
+  Lynis security scan details:
+  Hardening index : 86 [#################   ]
+  Great, no warnings
+  Suggestions (16):
+EOF
+    cat > "$data" <<'EOF'
+hardening_index=86
+suggestion[]=PROC-3614|Check process listing for processes waiting for IO requests|||
+EOF
+    env HARDEN_SOURCE_ONLY=1 HARDEN_LYNIS_FINAL_REPORT="$report" HARDEN_LYNIS_FINAL_DATA="$data" \
+        HARDEN_LYNIS_PARSE_DIAGNOSTIC="$diagnostic" bash -c '
+            source "$1/harden.sh"
+            trap - ERR EXIT
+            MODE=apply
+            extract_lynis_summary
+            [[ "$LYNIS_AFTER" == 86 && "$LYNIS_WARNINGS" == 0 && "$LYNIS_SUGGESTIONS" == 16 ]]
+            [[ "$LYNIS_PARSE_STATUS" == OK ]]
+        ' _ "$repo_root" || fail "Lynis 3.1.6 console-summary parsing failed"
+
+    cat > "$report" <<'EOF'
+  Summary line intentionally unavailable in console capture
+EOF
+    cat > "$data" <<'EOF'
+hardening_index=87
+suggestion[]=FINT-4402|Use SHA256 or SHA512|||
+suggestion[]=PROC-3614|Check process listing|||
+EOF
+    env HARDEN_SOURCE_ONLY=1 HARDEN_LYNIS_FINAL_REPORT="$report" HARDEN_LYNIS_FINAL_DATA="$data" \
+        HARDEN_LYNIS_PARSE_DIAGNOSTIC="$diagnostic" bash -c '
+            source "$1/harden.sh"
+            trap - ERR EXIT
+            MODE=apply
+            extract_lynis_summary
+            [[ "$LYNIS_AFTER" == 87 && "$LYNIS_WARNINGS" == 0 && "$LYNIS_SUGGESTIONS" == 2 ]]
+            [[ "$LYNIS_PARSE_STATUS" == OK ]]
+        ' _ "$repo_root" || fail "Lynis report.dat summary fallback failed"
+}
+
+run_fail2ban_tests() {
+    local case_root="$test_root/fail2ban" mock_bin="$test_root/fail2ban/bin"
+    local count="$case_root/count"
+    install -d "$mock_bin" "$case_root/backup"
+    cat > "$mock_bin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+[[ "${1:-}" == is-active && "${2:-}" == --quiet && "${3:-}" == fail2ban.service ]]
+EOF
+    cat > "$mock_bin/fail2ban-client" <<'EOF'
+#!/usr/bin/env bash
+count=0
+[[ ! -f "$FAIL2BAN_TEST_COUNT" ]] || count="$(< "$FAIL2BAN_TEST_COUNT")"
+count=$((count + 1))
+printf '%s\n' "$count" > "$FAIL2BAN_TEST_COUNT"
+if ((count < 3)); then
+    printf 'ERROR Unable to contact server\n' >&2
+    exit 1
+fi
+case "${1:-}" in
+    ping) printf 'Server replied: pong\n' ;;
+    status) printf 'Status for the jail: sshd\n|- Currently failed: 0\n' ;;
+    *) exit 1 ;;
+esac
+EOF
+    chmod +x "$mock_bin/systemctl" "$mock_bin/fail2ban-client"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 FAIL2BAN_TEST_COUNT="$count" bash -c '
+            source "$1/harden.sh"
+            trap - ERR EXIT
+            BACKUP_DIR="$2"
+            verify_fail2ban_runtime 4
+            [[ "$FAIL2BAN_STATUS" == OK ]]
+            grep -Fq "Server replied: pong" "$2/fail2ban-runtime.txt"
+            grep -Fq "Status for the jail: sshd" "$2/fail2ban-runtime.txt"
+        ' _ "$repo_root" "$case_root/backup" || fail "Fail2ban readiness/runtime verification failed"
+}
+
+run_packagekit_tests() {
+    local case_root="$test_root/packagekit" mock_bin="$test_root/packagekit/bin"
+    local apt_log="$test_root/packagekit/apt.log"
+    install -d "$mock_bin"
+    cat > "$mock_bin/apt-get" <<'EOF'
+#!/usr/bin/env bash
+if [[ " $* " == *' -s purge '* ]]; then
+    printf 'Remv packagekit [1.2.8]\nRemv packagekit-tools [1.2.8]\n'
+elif [[ "${1:-}" == check ]]; then
+    printf 'apt-check-ok\n'
+elif [[ " $* " == *' purge -y '* ]]; then
+    printf 'purge %s\n' "$*" >> "$PACKAGEKIT_APT_LOG"
+else
+    exit 1
+fi
+EOF
+    cat > "$mock_bin/unattended-upgrade" <<'EOF'
+#!/usr/bin/env bash
+printf 'unattended-ok\n'
+EOF
+    cat > "$mock_bin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$PACKAGEKIT_SYSTEMCTL_LOG"
+EOF
+    chmod +x "$mock_bin/apt-get" "$mock_bin/unattended-upgrade" "$mock_bin/systemctl"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 PACKAGEKIT_APT_LOG="$apt_log" \
+        PACKAGEKIT_SYSTEMCTL_LOG="$case_root/systemctl.log" bash -c '
+            source "$1/harden.sh"
+            trap - ERR EXIT
+            MODE=apply
+            OS_ID=ubuntu
+            CHANGE_LOG="$2/changes.tsv"
+            : > "$CHANGE_LOG"
+            package_installed() { [[ "$1" == packagekit || "$1" == packagekit-tools ]]; }
+            configure_headless_packagekit
+            grep -Fq "purge" "$2/apt.log"
+            grep -Fq "packagekit" "$2/apt.log"
+            grep -Fq "packagekit-tools" "$2/apt.log"
+            ! grep -Eq "^mask([[:space:]]|$)" "$2/systemctl.log"
+        ' _ "$repo_root" "$case_root" || fail "safe headless PackageKit removal regression failed"
+
+    : > "$apt_log"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 PACKAGEKIT_APT_LOG="$apt_log" \
+        PACKAGEKIT_SYSTEMCTL_LOG="$case_root/systemctl-debian.log" bash -c '
+            source "$1/harden.sh"
+            trap - ERR EXIT
+            MODE=apply
+            OS_ID=debian
+            CHANGE_LOG="$2/debian.tsv"
+            : > "$CHANGE_LOG"
+            package_installed() { [[ "$1" == packagekit || "$1" == packagekit-tools ]]; }
+            configure_headless_packagekit
+            grep -Fq "purge" "$2/apt.log"
+            grep -Fq "headless PackageKit" "$CHANGE_LOG"
+            grep -Fq "(debian)" "$CHANGE_LOG"
+        ' _ "$repo_root" "$case_root" || fail "Debian headless PackageKit policy regression failed"
+
+    : > "$apt_log"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 PACKAGEKIT_APT_LOG="$apt_log" \
+        PACKAGEKIT_SYSTEMCTL_LOG="$case_root/systemctl-unsafe.log" PACKAGEKIT_UNSAFE=1 bash -c '
+            source "$1/harden.sh"
+            trap - ERR EXIT
+            MODE=apply
+            OS_ID=ubuntu
+            CHANGE_LOG="$2/unsafe.tsv"
+            : > "$CHANGE_LOG"
+            package_installed() { [[ "$1" == packagekit || "$1" == packagekit-tools ]]; }
+            apt-get() {
+                if [[ "${1:-}" == -s && "${2:-}" == purge ]]; then
+                    printf "Remv packagekit [1.2.8]\nRemv ubuntu-server [1.0]\n"
+                elif [[ "${1:-}" == check ]]; then
+                    return 0
+                else
+                    printf "unexpected-purge\n" >> "$PACKAGEKIT_APT_LOG"
+                    return 1
+                fi
+            }
+            export -f apt-get
+            configure_headless_packagekit
+            [[ ! -s "$2/apt.log" ]]
+            grep -Fq "APT simulation would also remove ubuntu-server" "$CHANGE_LOG" || \
+                printf "%s\n" "${SKIPPED_FINDINGS[*]}" | grep -Fq "ubuntu-server"
+        ' _ "$repo_root" "$case_root" || fail "unsafe PackageKit dependency simulation was not blocked"
+}
+
+run_compiler_tests() {
+    local case_root="$test_root/compiler" mock_bin="$test_root/compiler/bin" apt_log="$test_root/compiler/apt.log"
+    install -d "$mock_bin" "$case_root/backup"
+    for binary in as gcc; do
+        printf '#!/usr/bin/env bash\nexit 0\n' > "$mock_bin/$binary"
+        chmod 0755 "$mock_bin/$binary"
+    done
+    cat > "$mock_bin/dpkg-query" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == -S ]]; then
+    target="${*: -1}"
+    case "$target" in
+        */as) printf 'binutils: %s\n' "$target" ;;
+        *) printf 'gcc: %s\n' "$target" ;;
+    esac
+elif [[ "${COMPILER_PROTECTED:-0}" -eq 1 ]]; then
+    printf 'dkms\nlinux-headers-generic\n'
+else
+    exit 1
+fi
+EOF
+    cat > "$mock_bin/apt-get" <<'EOF'
+#!/usr/bin/env bash
+if [[ " $* " == *' -s purge '* ]]; then
+    if [[ "${COMPILER_UNSAFE:-0}" -eq 1 ]]; then
+        printf 'Remv gcc [14]\nRemv ubuntu-server [1.0]\n'
+    else
+        printf 'Remv gcc [14]\nRemv binutils [2.43]\n'
+    fi
+elif [[ " $* " == *' purge -y '* ]]; then
+    printf '%s\n' "$*" >> "$COMPILER_APT_LOG"
+    rm -f "$COMPILER_BIN_DIR/as" "$COMPILER_BIN_DIR/gcc"
+elif [[ "${1:-}" == check ]]; then
+    printf 'apt-check-ok\n'
+else
+    exit 1
+fi
+EOF
+    chmod +x "$mock_bin/dpkg-query" "$mock_bin/apt-get"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 COMPILER_APT_LOG="$apt_log" \
+        COMPILER_BIN_DIR="$mock_bin" HARDEN_TEST_OWNER="$(id -u)" HARDEN_TEST_GROUP="$(id -g)" bash -c '
+            source "$1/harden.sh"
+            trap - ERR EXIT
+            MODE=apply
+            AGGRESSIVE=1
+            BACKUP_DIR="$2/backup"
+            CHANGE_LOG="$2/changes.tsv"
+            : > "$CHANGE_LOG"
+            restrict_compilers
+            grep -Fq "purge -y" "$2/apt.log"
+            [[ ! -e "$3/as" && ! -e "$3/gcc" ]]
+            grep -Fq "lynis-binary=" "$2/backup/compiler-toolchain-inventory.txt"
+        ' _ "$repo_root" "$case_root" "$mock_bin" || fail "safe compiler owner-package purge regression failed"
+
+    for binary in as gcc; do
+        printf '#!/usr/bin/env bash\nexit 0\n' > "$mock_bin/$binary"
+        chmod 0755 "$mock_bin/$binary"
+    done
+    : > "$apt_log"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 COMPILER_APT_LOG="$apt_log" \
+        COMPILER_BIN_DIR="$mock_bin" COMPILER_PROTECTED=1 HARDEN_TEST_OWNER="$(id -u)" \
+        HARDEN_TEST_GROUP="$(id -g)" bash -c '
+            source "$1/harden.sh"
+            trap - ERR EXIT
+            MODE=apply
+            AGGRESSIVE=1
+            BACKUP_DIR="$2/backup"
+            CHANGE_LOG="$2/protected.tsv"
+            : > "$CHANGE_LOG"
+            restrict_compilers
+            [[ ! -s "$2/apt.log" ]]
+            [[ "$(stat -c "%a" "$3/as")" == 750 ]]
+            [[ "$(stat -c "%a" "$3/gcc")" == 750 ]]
+            printf "%s\n" "${SKIPPED_FINDINGS[*]}" | grep -Fq "DKMS or installed kernel headers"
+        ' _ "$repo_root" "$case_root" "$mock_bin" || fail "protected compiler dependency/root-only fallback regression failed"
+}
+
+run_binfmt_tests() {
+    local case_root="$test_root/binfmt" root="$test_root/binfmt/proc" config="$test_root/binfmt/config"
+    install -d "$root" "$config" "$case_root/backup"
+    printf 'enabled\n' > "$root/status"
+    env HARDEN_SOURCE_ONLY=1 HARDEN_BINFMT_ROOT="$root" HARDEN_BINFMT_CONFIG_DIRS="$config" \
+        HARDEN_BINFMT_MODPROBE_FILE="$case_root/modprobe.conf" BINFMT_DISABLE_LOG="$case_root/disable.log" bash -c '
+            source "$1/harden.sh"
+            trap - ERR EXIT
+            MODE=apply
+            AGGRESSIVE=1
+            BACKUP_DIR="$2/backup"
+            CHANGE_LOG="$2/changes.tsv"
+            : > "$CHANGE_LOG"
+            package_installed() { return 1; }
+            dpkg-query() { return 1; }
+            unit_file_exists() { return 0; }
+            disable_service() { printf "%s %s\n" "$1" "$2" > "$BINFMT_DISABLE_LOG"; }
+            install_managed_file() { local target="$1"; shift; cp /dev/stdin "$target"; }
+            configure_binfmt_misc
+            [[ "$(tr -d "[:space:]" < "$3/status")" == 0 ]]
+            grep -Fq "blacklist binfmt_misc" "$2/modprobe.conf"
+            grep -Fq "registrations=none" "$2/backup/binfmt-misc-inventory.txt"
+        ' _ "$repo_root" "$case_root" "$root" || fail "unused binfmt_misc disable regression failed"
+
+    printf 'enabled\n' > "$root/status"
+    printf 'enabled\ninterpreter /usr/bin/qemu-aarch64-static\n' > "$root/qemu-aarch64"
+    env HARDEN_SOURCE_ONLY=1 HARDEN_BINFMT_ROOT="$root" HARDEN_BINFMT_CONFIG_DIRS="$config" bash -c '
+            source "$1/harden.sh"
+            trap - ERR EXIT
+            MODE=apply
+            AGGRESSIVE=1
+            BACKUP_DIR="$2/backup"
+            CHANGE_LOG="$2/preserve.tsv"
+            : > "$CHANGE_LOG"
+            package_installed() { return 1; }
+            dpkg-query() { return 1; }
+            disable_service() { exit 70; }
+            install_managed_file() { exit 71; }
+            configure_binfmt_misc
+            [[ "$(tr -d "[:space:]" < "$3/status")" == enabled ]]
+            grep -Fq "qemu-aarch64" "$2/backup/binfmt-misc-inventory.txt"
+        ' _ "$repo_root" "$case_root" "$root" || fail "active binfmt registration was not preserved"
+}
+
+run_iowait_tests() {
+    local case_root="$test_root/iowait" mock_bin="$test_root/iowait/bin" count="$test_root/iowait/count"
+    install -d "$mock_bin"
+    cat > "$mock_bin/ps" <<'EOF'
+#!/usr/bin/env bash
+count=0
+[[ ! -f "$IOWAIT_TEST_COUNT" ]] || count="$(< "$IOWAIT_TEST_COUNT")"
+count=$((count + 1))
+printf '%s\n' "$count" > "$IOWAIT_TEST_COUNT"
+if ((count <= 2)); then
+    printf '4242 D io_schedule aide aide --check\n'
+else
+    printf '4242 S - aide aide --check\n'
+fi
+EOF
+    chmod +x "$mock_bin/ps"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 IOWAIT_TEST_COUNT="$count" \
+        HARDEN_IOWAIT_REPORT="$case_root/report.txt" bash -c '
+            source "$1/harden.sh"
+            trap - ERR EXIT
+            MODE=apply
+            CHANGE_LOG="$2/changes.tsv"
+            : > "$CHANGE_LOG"
+            systemd_unit_for_pid() { printf "dailyaidecheck.service\n"; }
+            diagnose_iowait_processes baseline
+            diagnose_iowait_processes pre-final
+            diagnose_iowait_processes recheck
+            grep -Fq "4242" "$2/report.txt"
+            grep -Fq "dailyaidecheck.service" "$2/report.txt"
+            grep -Fq "persistent-across-snapshots" "$2/report.txt"
+            grep -Fq "transient IO wait" "$2/report.txt"
+            ! grep -Eq "(^|[[:space:]])kill([[:space:]]|$)" "$1/harden.sh"
+        ' _ "$repo_root" "$case_root" || fail "PROC-3614 classification/diagnostic regression failed"
+}
+
+if [[ "${HARDEN_REGRESSION_FILTER:-all}" == "new-findings" ]]; then
+    run_lynis_summary_tests
+    run_fail2ban_tests
+    run_packagekit_tests
+    run_compiler_tests
+    run_binfmt_tests
+    run_iowait_tests
+else
+    run_logging_tests
+    run_aide_tests
+    run_kernel_gate_test
+    run_lynis_summary_tests
+    run_fail2ban_tests
+    run_packagekit_tests
+    run_compiler_tests
+    run_binfmt_tests
+    run_iowait_tests
+fi
 printf 'Runtime regression tests passed.\n'
