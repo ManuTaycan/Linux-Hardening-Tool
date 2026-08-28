@@ -7,6 +7,22 @@ für 1.1.3 wird erst nach dem vollständigen Zielsystemtest erstellt.
 
 ### Changed
 
+- Unreleased real-test fix: synchronous dual logging replaces the asynchronous
+  process-substitution logger, keeps interactive colors, writes ANSI-free logs,
+  prevents logging FD inheritance or package-process job-control stalls, and
+  captures user-visible Apply commands such as `update-grub` without external
+  `tee`.
+- Phase 03 now warns about legitimate multi-minute package work and streams APT
+  progress without imposing artificial package timeouts.
+- AIDE now validates the distribution's active configuration directly, without
+  requiring `update-aide.conf`; it resolves `database_in`/`database_out`,
+  atomically activates a verified baseline, skips unnecessary second-run
+  rebuilds, checks the database, validates one real vendor/custom systemd
+  service run (including Ubuntu `_aide` capabilities), and enables the timer
+  only after success.
+- The irreversible `kernel.modules_disabled=1` write is guarded by the final
+  phase-17 network, firewall, AppArmor, validation, and AIDE prerequisites and
+  is verified after the write.
 - CI prüft den committed Base-to-Head-Diff auf Whitespace und testet den
   Installer in einem temporären Zielpfad.
 - `--install-path` bezeichnet jetzt die ausführbare Zieldatei statt eines
