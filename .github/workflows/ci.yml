@@ -34,7 +34,7 @@ jobs:
         run: |
           tmp_dir="$(mktemp -d)"
           trap 'rm -rf "$tmp_dir"' EXIT
-          sudo bash install.sh --ref main --install-path "$tmp_dir/linux-hardening-tool"
+          sudo bash install.sh --ref chore/bootstrap-repository-v1.1.3 --install-path "$tmp_dir/linux-hardening-tool"
           test -f "$tmp_dir/linux-hardening-tool"
           test -x "$tmp_dir/linux-hardening-tool"
           test ! -d "$tmp_dir/linux-hardening-tool"
