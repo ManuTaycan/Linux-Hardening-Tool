@@ -15,22 +15,36 @@ run_logging_tests() {
     local log_file="$test_root/logging/server-hardening.log"
     local terminal_output="$test_root/logging/terminal.txt"
     local no_color_output="$test_root/logging/no-color.txt"
-    install -d "$test_root/logging/backups"
+    local mock_bin="$test_root/logging/bin"
+    install -d "$test_root/logging/backups" "$mock_bin"
+    cat > "$mock_bin/pvs" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+for fd in 3 4; do
+    if [[ -e "/proc/$$/fd/$fd" ]] \
+        && [[ "$(readlink "/proc/$$/fd/$fd")" == *server-hardening.log* ]]; then
+        printf 'File descriptor %s leaked on pvs invocation\n' "$fd" >&2
+        exit 1
+    fi
+done
+printf 'mock-pvs-ok\n'
+EOF
+    chmod +x "$mock_bin/pvs"
 
-    timeout 10 env HARDEN_SOURCE_ONLY=1 NO_COLOR=1 HARDEN_LOG_FILE="$log_file" \
+    timeout 10 env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 NO_COLOR=1 HARDEN_LOG_FILE="$log_file" \
         HARDEN_BACKUP_ROOT="$test_root/logging/backups" bash -c '
             source "$1/harden.sh"
             trap - ERR EXIT
             MODE=apply
             init_logging
             run_streamed bash -c "for n in \$(seq 1 200); do printf \"package-progress-%s\\n\" \"\$n\"; done"
-            bash -c '\''for fd in 3 4; do
-                if [[ -e "/proc/$$/fd/$fd" ]] && [[ "$(readlink "/proc/$$/fd/$fd")" == *server-hardening.log* ]]; then
-                    exit 1
-                fi
-            done'\''
+            run_streamed pvs
         ' _ "$repo_root" || fail "synchronous logger hung or leaked its log descriptor"
     grep -Fq 'package-progress-200' "$log_file" || fail "streamed package output was not logged"
+    grep -Fq 'mock-pvs-ok' "$log_file" || fail "mock LVM output was not logged"
+    if grep -Fq 'File descriptor' "$log_file"; then
+        fail "mock LVM invocation inherited a logging descriptor"
+    fi
     grep -Eq 'exec[[:space:]]+[34]|LOG_CAPTURE_ACTIVE|exec[[:space:]]*>[[:space:]]*>\(' "$repo_root/harden.sh" \
         && fail "legacy asynchronous logging or persistent FD 3/4 remains"
 

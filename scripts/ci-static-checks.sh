@@ -57,6 +57,14 @@ for index in "${!phases[@]}"; do
     [[ -n "$main_line" && "$line" -gt "$main_line" ]] || report "phase ${number} is outside main()"
 done
 
+aide_call_line="$(awk '/^[[:space:]]+configure_aide[[:space:]]*$/ {print NR; exit}' harden.sh)"
+phase17_line="$(awk '/^[[:space:]]+phase[[:space:]]+17[[:space:]]+18[[:space:]]+/ {print NR; exit}' harden.sh)"
+module_lock_line="$(awk '/^[[:space:]]+lock_kernel_modules_late[[:space:]]*$/ {print NR; exit}' harden.sh)"
+if [[ -z "$aide_call_line" || -z "$phase17_line" || -z "$module_lock_line" \
+    || "$aide_call_line" -ge "$phase17_line" || "$phase17_line" -ge "$module_lock_line" ]]; then
+    report "kernel.modules_disabled final gate is not ordered after AIDE at phase 17"
+fi
+
 script_version="$(sed -nE 's/^readonly SCRIPT_VERSION="([^"]+)"$/\1/p' harden.sh)"
 version_file="$(tr -d '\r\n' < VERSION)"
 [[ -n "$script_version" && "$script_version" == "$version_file" ]] || report "VERSION does not match SCRIPT_VERSION"

@@ -1253,7 +1253,10 @@ WantedBy=multi-user.target
 EOF
     if systemctl daemon-reload; then
         if [[ "$(sysctl -n kernel.modules_disabled 2>/dev/null || true)" != "1" ]]; then
-            systemctl disable kernel-module-lockdown.service >/dev/null 2>&1 || true
+            if ! systemctl disable kernel-module-lockdown.service >/dev/null 2>&1; then
+                record_skip "kernel.modules_disabled" "could not disable the late lock unit before final prerequisite validation"
+                return 1
+            fi
         fi
         record_change "Prepared the late kernel module loading lock unit without enabling or starting it before the final gate"
     else
@@ -3035,7 +3038,8 @@ configure_aide() {
         record_skip "FINT-4315" "AIDE binary and a real non-empty configuration are both required; aide-common did not provide one"
         return 0
     fi
-    systemctl stop aide-check.timer dailyaidecheck.timer 2>/dev/null || true
+    systemctl stop aide-check.timer dailyaidecheck.timer \
+        aide-check.service dailyaidecheck.service 2>/dev/null || true
     policy_content='# Managed by harden.sh: SHA-2 integrity policy v1.1.3
 HardenSHA2 = p+ftype+i+l+n+u+g+s+b+m+c+sha256+sha512
 =/etc/passwd HardenSHA2
