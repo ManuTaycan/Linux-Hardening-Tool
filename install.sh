@@ -58,6 +58,7 @@ done
 [[ $EUID -eq 0 ]] || die "run this installer as root (for example: sudo bash install.sh --ref ${REF})"
 [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ && "$REF" != *..* ]] || die "unsafe ref"
 [[ "$INSTALL_PATH" == /* && "$INSTALL_PATH" != "/" ]] || die "install path must be an absolute non-root path"
+[[ ! -d "$INSTALL_PATH" ]] || die "install path must be a destination file, not a directory"
 command -v curl >/dev/null 2>&1 || die "curl is required"
 command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required"
 command -v install >/dev/null 2>&1 || die "install is required"
@@ -74,13 +75,14 @@ awk '$2 == "harden.sh" {print}' "$TEMP_DIR/SHA256SUMS" > "$TEMP_DIR/harden.sh.su
     sha256sum -c harden.sh.sum
 )
 
-install -d -o root -g root -m 0755 "$INSTALL_PATH"
-install -o root -g root -m 0755 "$TEMP_DIR/harden.sh" "$INSTALL_PATH/harden.sh"
+install -d -o root -g root -m 0755 "$(dirname -- "$INSTALL_PATH")"
+install -o root -g root -m 0755 "$TEMP_DIR/harden.sh" "$INSTALL_PATH"
 
-printf 'Installed verified harden.sh to %s/harden.sh\n' "$INSTALL_PATH"
+printf 'Installed verified harden.sh as %s\n' "$INSTALL_PATH"
 if [[ "$REF" == "main" ]]; then
     printf 'Note: main is the development branch. Prefer a reviewed release tag when one is available.\n'
 fi
-printf 'Next steps:\n'
-printf '  sha256sum %s/harden.sh\n' "$INSTALL_PATH"
-printf '  sudo %s/harden.sh --dry-run --aggressive\n' "$INSTALL_PATH"
+printf 'Next steps (the installer does not run hardening automatically):\n'
+printf '  %s --help\n' "$INSTALL_PATH"
+printf '  sha256sum %s\n' "$INSTALL_PATH"
+printf '  sudo %s --dry-run --aggressive\n' "$INSTALL_PATH"

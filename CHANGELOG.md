@@ -5,6 +5,13 @@ für 1.1.3 wird erst nach dem vollständigen Zielsystemtest erstellt.
 
 ## Unreleased — Repository-Aufnahme von 1.1.3
 
+### Changed
+
+- CI prüft den committed Base-to-Head-Diff auf Whitespace und testet den
+  Installer in einem temporären Zielpfad.
+- `--install-path` bezeichnet jetzt die ausführbare Zieldatei statt eines
+  Verzeichnisses.
+
 ### Added
 
 - Klassifizierte Rückgabecode-Behandlung für `pwck` und `grpck`; bekannte

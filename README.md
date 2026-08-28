@@ -93,7 +93,16 @@ sudo bash install.sh --ref main
 ```
 
 `main` ist der Entwicklungsstand. Für einen späteren geprüften Tag verwende
-beispielsweise `--ref v1.1.3`.
+`--ref <tag>`. `--install-path` bezeichnet immer die Zieldatei, nicht ein
+Verzeichnis; angelegt wird nur der übergeordnete Pfad. Für einen späteren
+geprüften Tag verwende beispielsweise `--ref v1.1.3`.
+
+```bash
+sudo bash install.sh --ref main \
+  --install-path /usr/local/sbin/linux-hardening-tool
+linux-hardening-tool --help
+sudo linux-hardening-tool --dry-run --aggressive
+```
 
 ## Nutzung
 

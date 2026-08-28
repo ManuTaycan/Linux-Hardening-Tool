@@ -14,12 +14,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
       - name: Install ShellCheck
         run: |
           sudo apt-get update
           sudo apt-get install --yes shellcheck
       - name: Check whitespace
-        run: git diff --check
+        run: ./scripts/ci-whitespace-check.sh
       - name: Run safe local checks
         run: make check
       - name: Verify help path
@@ -28,3 +30,12 @@ jobs:
         run: |
           test -x harden.sh
           sha256sum -c SHA256SUMS
+      - name: Test installer in temporary path
+        run: |
+          tmp_dir="$(mktemp -d)"
+          trap 'rm -rf "$tmp_dir"' EXIT
+          sudo bash install.sh --ref main --install-path "$tmp_dir/linux-hardening-tool"
+          test -f "$tmp_dir/linux-hardening-tool"
+          test -x "$tmp_dir/linux-hardening-tool"
+          test ! -d "$tmp_dir/linux-hardening-tool"
+          "$tmp_dir/linux-hardening-tool" --help >/dev/null
