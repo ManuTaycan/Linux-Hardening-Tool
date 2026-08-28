@@ -210,9 +210,9 @@ EOF
             [[ "$AIDE_STATUS" == OK ]]
             [[ "$(< "$4")" == 1 ]]
             [[ "$(wc -l < "$5")" == 2 ]]
-            grep -Fq 'User=_aide' "$2/aide-service-context.txt"
-            grep -Fq 'CAP_DAC_READ_SEARCH CAP_AUDIT_WRITE' "$2/aide-service-context.txt"
-            grep -Fq 'Result=success' "$2/aide-service-context.txt"
+            grep -Fq "User=_aide" "$2/aide-service-context.txt"
+            grep -Fq "CAP_DAC_READ_SEARCH CAP_AUDIT_WRITE" "$2/aide-service-context.txt"
+            grep -Fq "Result=success" "$2/aide-service-context.txt"
         ' _ "$repo_root" "$backup_dir" "$state_dir" "$count_file" \
         "$service_run_file" \
         || fail "Ubuntu-layout AIDE missing-database or idempotent second-run test failed"
