@@ -534,6 +534,7 @@ EOF
             BACKUP_DIR="$2/backup"
             CHANGE_LOG="$2/changes.tsv"
             : > "$CHANGE_LOG"
+            compiler_command_path() { if [[ -x "$COMPILER_BIN_DIR/$1" ]]; then printf "%s/%s\n" "$COMPILER_BIN_DIR" "$1"; fi; return 0; }
             restrict_compilers
             grep -Fq "purge -y" "$2/apt.log"
             [[ ! -e "$3/as" && ! -e "$3/gcc" ]]
@@ -556,6 +557,7 @@ EOF
             BACKUP_DIR="$2/backup"
             CHANGE_LOG="$2/protected.tsv"
             : > "$CHANGE_LOG"
+            compiler_command_path() { if [[ -x "$COMPILER_BIN_DIR/$1" ]]; then printf "%s/%s\n" "$COMPILER_BIN_DIR" "$1"; fi; return 0; }
             restrict_compilers
             [[ ! -s "$2/apt.log" ]]
             [[ "$(stat -c "%a" "$3/as")" == 750 ]]
@@ -643,22 +645,29 @@ EOF
         ' _ "$repo_root" "$case_root" || fail "PROC-3614 classification/diagnostic regression failed"
 }
 
-if [[ "${HARDEN_REGRESSION_FILTER:-all}" == "new-findings" ]]; then
-    run_lynis_summary_tests
-    run_fail2ban_tests
-    run_packagekit_tests
-    run_compiler_tests
-    run_binfmt_tests
-    run_iowait_tests
-else
-    run_logging_tests
-    run_aide_tests
-    run_kernel_gate_test
-    run_lynis_summary_tests
-    run_fail2ban_tests
-    run_packagekit_tests
-    run_compiler_tests
-    run_binfmt_tests
-    run_iowait_tests
-fi
+case "${HARDEN_REGRESSION_FILTER:-all}" in
+    compiler)
+        run_compiler_tests
+        ;;
+    new-findings)
+        run_lynis_summary_tests
+        run_fail2ban_tests
+        run_packagekit_tests
+        run_compiler_tests
+        run_binfmt_tests
+        run_iowait_tests
+        ;;
+    all)
+        run_logging_tests
+        run_aide_tests
+        run_kernel_gate_test
+        run_lynis_summary_tests
+        run_fail2ban_tests
+        run_packagekit_tests
+        run_compiler_tests
+        run_binfmt_tests
+        run_iowait_tests
+        ;;
+    *) fail "unknown HARDEN_REGRESSION_FILTER value" ;;
+esac
 printf 'Runtime regression tests passed.\n'

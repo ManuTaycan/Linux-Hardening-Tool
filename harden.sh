@@ -3117,6 +3117,10 @@ EOF
     fi
 }
 
+compiler_command_path() {
+    command -v "$1" 2>/dev/null || true
+}
+
 restrict_compilers() {
     # Lynis 3.1.6 sets COMPILER_INSTALLED only for these five binary names.
     local -a lynis_tools=(as cc clang g++ gcc)
@@ -3137,11 +3141,11 @@ restrict_compilers() {
         chmod 0600 "$BACKUP_DIR/lynis-HRDN-7222-details.txt"
     fi
     for tool in "${lynis_tools[@]}"; do
-        path="$(command -v "$tool" 2>/dev/null || true)"
+        path="$(compiler_command_path "$tool")"
         [[ -z "$path" ]] || lynis_paths+=("$path")
     done
     for tool in "${restriction_tools[@]}"; do
-        path="$(command -v "$tool" 2>/dev/null || true)"
+        path="$(compiler_command_path "$tool")"
         [[ -z "$path" ]] || candidates+=("$path")
     done
     shopt -q nullglob && nullglob_was_set=1
@@ -3217,7 +3221,7 @@ restrict_compilers() {
 
     candidates=()
     for tool in "${restriction_tools[@]}"; do
-        path="$(command -v "$tool" 2>/dev/null || true)"
+        path="$(compiler_command_path "$tool")"
         [[ -z "$path" ]] || candidates+=("$path")
     done
     nullglob_was_set=0
