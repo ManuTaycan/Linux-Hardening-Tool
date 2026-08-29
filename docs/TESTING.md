@@ -100,6 +100,31 @@ nicht blind auf `1` umstellen, sondern muss WARN/SKIP mit Grund und effektiven
 Werten reporten. Wiederhole den Apply: Die persistente sysctl-Datei und das
 gezielte Reload dürfen dann unverändert bleiben.
 
+### Ubuntu-26.04.1-Retest deleted-open files (#13)
+
+Nach einem Apply prüfe den vollständigen, ANSI-freien Inventarbericht. Er darf
+nie automatisch rebooten, Prozesse beenden oder SSH/Tailscale/Netzwerkdienste
+restartieren:
+
+```bash
+sudo ./harden.sh --apply --aggressive
+sudo cat /root/deleted-open-files-report.txt
+sudo lsof -nP +L1
+sudo ./harden.sh --apply --aggressive
+```
+
+Ein leerer Inventarbestand ist ein No-op. Für verbleibende Einträge müssen PID,
+Prozess, Unit, Datei und Default-deny-Entscheidung nachvollziehbar sein. Nur
+explizit erlaubte aktive Dienste dürfen höchstens einmal neu starten; der
+nachfolgende `lsof +L1`-Scan muss den Erfolg belegen. Prüfe insbesondere, dass
+SSH, Tailscale, Netzwerk, Firewall und systemd/dbus nicht neu gestartet wurden.
+
+Ein Eintrag wie `/memfd:systemd-udevd (deleted)` mit Link-Count `0` ist eine
+anonyme, volatile RAM-Datei und kein verwaister persistenter Dateisystem-Inode.
+Sie bleibt vollständig sichtbar, wird als `anonymous-memfd` reportet und löst
+weder Restart noch Reboot aus. Normale `/var/... (deleted)`-Einträge bleiben
+dagegen weiterhin actionable bzw. manual-review-required.
+
 Für die Findings #4, #12, #17, #18, #19 und #20 zusätzlich prüfen:
 
 - `aide-lynis-FINT-4402-evidence.txt`, AIDE-Konfigurationsprüfung,

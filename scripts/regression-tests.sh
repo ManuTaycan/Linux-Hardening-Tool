@@ -1356,7 +1356,7 @@ EOF
         grep -Fq "INITRAMFS_POLICY_CHANGED" <<<"$kernel_section"
         grep -Fq "Managed module policy is unchanged" <<<"$kernel_section"
         grep -Fq "grub_config_changed" <<<"$grub_section"
-        [[ "$(grep -Fc "REBOOT_REQUIRED=1" "$1/harden.sh")" == 3 ]]
+        [[ "$(grep -Fc "REBOOT_REQUIRED=1" "$1/harden.sh")" == 4 ]]
     ' _ "$repo_root" || fail "initramfs/GRUB/reboot-required change gating regressed"
 }
 
@@ -1393,6 +1393,123 @@ EOF
             grep -Fq "transient IO wait" "$2/report.txt"
             ! grep -Eq "(^|[[:space:]])kill([[:space:]]|$)" "$1/harden.sh"
         ' _ "$repo_root" "$case_root" || fail "PROC-3614 classification/diagnostic regression failed"
+}
+
+run_deleted_open_tests() {
+    local case_root="$test_root/deleted-open" mock_bin="$test_root/deleted-open/bin"
+    install -d "$mock_bin"
+    cat > "$mock_bin/lsof" <<'EOF'
+#!/usr/bin/env bash
+case "${DO_TEST_STATE:-empty}" in
+ empty) exit 0 ;;
+ safe-before) { [[ "${DO_TEST_RESTART:-1}" == 1 && "${DO_TEST_HEALTH:-1}" == 1 ]] && grep -Fq 'restart rsyslog.service' "${DO_TEST_LOG:-/dev/null}" 2>/dev/null; } || printf 'p4242\ncworker\nu100\nf5\ntREG\nk0\nn/var/log/test (deleted)\n' ;;
+ protected) printf 'p22\ncsshd\nu0\nf3\ntREG\nk0\nn/tmp/key (deleted)\n' ;;
+ protected-clears) if [[ ! -e "${DO_TEST_MARKER:?}" ]]; then touch "$DO_TEST_MARKER"; printf 'p22\ncsshd\nu0\nf3\ntREG\nk0\nn/tmp/key (deleted)\n'; fi ;;
+ memfd-systemd) printf 'p1\ncsystemd\nu0\nf9\ntREG\nk0\nn/memfd:systemd-udevd (deleted)\n' ;;
+ memfd-other) printf 'p900\nctest-worker\nu1000\nf9\ntREG\nk0\nn/memfd:test (deleted)\n' ;;
+ memfd-protected) printf 'p1\ncsystemd\nu0\nf9\ntREG\nk0\nn/memfd:systemd-udevd (deleted)\np22\ncsshd\nu0\nf3\ntREG\nk0\nn/tmp/key (deleted)\n' ;;
+ memfd-safe) printf 'p1\ncsystemd\nu0\nf9\ntREG\nk0\nn/memfd:systemd-udevd (deleted)\n'; { [[ "${DO_TEST_RESTART:-1}" == 1 && "${DO_TEST_HEALTH:-1}" == 1 ]] && grep -Fq 'restart rsyslog.service' "${DO_TEST_LOG:-/dev/null}" 2>/dev/null; } || printf 'p4242\ncworker\nu100\nf5\ntREG\nk0\nn/var/log/test (deleted)\n' ;;
+ unknown) printf 'p77\ncmystery\nu1000\nf4\ntREG\nk0\nn/tmp/x (deleted)\n' ;;
+ multi) printf 'p4242\ncworker\nu100\nf5\ntREG\nk0\nn/tmp/a (deleted)\nf6\ntREG\nk0\nn/tmp/b (deleted)\n' ;;
+esac
+EOF
+    cat > "$mock_bin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${DO_TEST_LOG:?}"
+case "$1 $2" in
+ 'is-active --quiet') [[ "${DO_TEST_HEALTH:-1}" == 1 ]] ;;
+ restart\ *) [[ "${DO_TEST_RESTART:-1}" == 1 ]] ;;
+ *) exit 0 ;;
+esac
+EOF
+    chmod +x "$mock_bin/lsof" "$mock_bin/systemctl"
+    local one="$case_root/one"; install -d "$one"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_DELETED_OPEN_REPORT="$one/report" \
+        DO_TEST_STATE=empty DO_TEST_LOG="$one/log" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT; MODE=apply; BACKUP_DIR="$2"; CHANGE_LOG="$2/changes"; : > "$2/log"; : > "$CHANGE_LOG"; REBOOT_REQUIRED=0
+            remediate_deleted_open_files
+            [[ "$DELETED_OPEN_FILES_STATUS" == "OK: no deleted open files" && ! -s "$2/log" ]]
+        ' _ "$repo_root" "$one" || fail "empty deleted-open inventory was not a no-op"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_DELETED_OPEN_REPORT="$one/report" \
+        DO_TEST_STATE=safe-before DO_TEST_LOG="$one/log" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT; MODE=apply; BACKUP_DIR="$2"; CHANGE_LOG="$2/changes"; : > "$CHANGE_LOG"; : > "$DO_TEST_LOG"; REBOOT_REQUIRED=0
+            systemd_unit_for_pid() { printf "rsyslog.service\n"; }
+            remediate_deleted_open_files
+            grep -Fq "restart rsyslog.service" "$DO_TEST_LOG"
+            [[ "$DELETED_OPEN_FILES_STATUS" == "OK: inventory clear after targeted remediation" ]]
+        ' _ "$repo_root" "$one" || fail "safe deleted-open service was not restarted"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_DELETED_OPEN_REPORT="$one/report" \
+        DO_TEST_STATE=safe-before DO_TEST_RESTART=0 DO_TEST_LOG="$one/log" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT; MODE=apply; BACKUP_DIR="$2"; CHANGE_LOG="$2/changes"; : > "$CHANGE_LOG"; : > "$DO_TEST_LOG"; REBOOT_REQUIRED=0
+            systemd_unit_for_pid() { printf "rsyslog.service\n"; }
+            remediate_deleted_open_files
+            grep -Fq "service-health=failed" "$HARDEN_DELETED_OPEN_REPORT"
+            grep -Fq "deleted-file-released=no" "$HARDEN_DELETED_OPEN_REPORT"
+        ' _ "$repo_root" "$one" || fail "failed safe restart was reported as successful"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_DELETED_OPEN_REPORT="$one/report" \
+        DO_TEST_STATE=protected DO_TEST_LOG="$one/log" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT; MODE=apply; BACKUP_DIR="$2"; CHANGE_LOG="$2/changes"; : > "$CHANGE_LOG"; : > "$DO_TEST_LOG"; REBOOT_REQUIRED=0
+            systemd_unit_for_pid() { printf "sshd.service\n"; }
+            remediate_deleted_open_files
+            ! grep -Fq "restart" "$DO_TEST_LOG"; [[ "$REBOOT_REQUIRED" == 1 ]]
+        ' _ "$repo_root" "$one" || fail "protected deleted-open owner was restarted or did not request controlled reboot"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_DELETED_OPEN_REPORT="$one/report" \
+        DO_TEST_STATE=protected DO_TEST_LOG="$one/log" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT; MODE=apply; BACKUP_DIR="$2"; CHANGE_LOG="$2/changes"; : > "$CHANGE_LOG"; : > "$DO_TEST_LOG"; REBOOT_REQUIRED=0
+            systemd_unit_for_pid() { printf "tailscaled.service\n"; }
+            remediate_deleted_open_files
+            ! grep -Fq "restart" "$DO_TEST_LOG"; [[ "$REBOOT_REQUIRED" == 1 ]]
+        ' _ "$repo_root" "$one" || fail "tailscaled deleted-open owner was restarted"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_DELETED_OPEN_REPORT="$one/report" \
+        DO_TEST_STATE=protected DO_TEST_LOG="$one/log" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT; MODE=apply; BACKUP_DIR="$2"; CHANGE_LOG="$2/changes"; : > "$CHANGE_LOG"; : > "$DO_TEST_LOG"; REBOOT_REQUIRED=0
+            systemd_unit_for_pid() { printf "networkd-dispatcher.service\n"; }
+            remediate_deleted_open_files
+            ! grep -Fq "restart" "$DO_TEST_LOG"; [[ "$REBOOT_REQUIRED" == 1 ]]
+        ' _ "$repo_root" "$one" || fail "networkd-dispatcher deleted-open owner was restarted"
+    : > "$one/marker"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_DELETED_OPEN_REPORT="$one/report" \
+        DO_TEST_STATE=protected-clears DO_TEST_MARKER="$one/marker" DO_TEST_LOG="$one/log" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT; MODE=apply; BACKUP_DIR="$2"; CHANGE_LOG="$2/changes"; : > "$CHANGE_LOG"; : > "$DO_TEST_LOG"; REBOOT_REQUIRED=0
+            rm -f "$DO_TEST_MARKER"; systemd_unit_for_pid() { printf "sshd.service\n"; }; remediate_deleted_open_files
+            [[ "$REBOOT_REQUIRED" == 0 ]]
+        ' _ "$repo_root" "$one" || fail "disappeared protected Before finding requested an unnecessary reboot"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_DELETED_OPEN_REPORT="$one/report" \
+        DO_TEST_STATE=multi DO_TEST_LOG="$one/log" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT; MODE=apply; BACKUP_DIR="$2"; CHANGE_LOG="$2/changes"; : > "$CHANGE_LOG"; : > "$DO_TEST_LOG"; REBOOT_REQUIRED=0
+            systemd_unit_for_pid() { printf "rsyslog.service\n"; }; remediate_deleted_open_files
+            [[ "$(grep -c "restart rsyslog.service" "$DO_TEST_LOG")" == 1 ]]
+        ' _ "$repo_root" "$one" || fail "same-unit deleted-open files triggered more than one restart"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_DELETED_OPEN_REPORT="$one/report" \
+        DO_TEST_STATE=memfd-systemd DO_TEST_LOG="$one/log" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT; MODE=apply; BACKUP_DIR="$2"; CHANGE_LOG="$2/changes"; : > "$CHANGE_LOG"; : > "$DO_TEST_LOG"; REBOOT_REQUIRED=0
+            systemd_unit_for_pid() { printf "systemd.service\n"; }; remediate_deleted_open_files
+            [[ "$DELETED_OPEN_FILES_STATUS" == "ACCEPTED: only anonymous memfd entries remain" && "$REBOOT_REQUIRED" == 0 ]]
+            ! grep -Fq "restart" "$DO_TEST_LOG"; grep -Fq "classification=anonymous-memfd" "$HARDEN_DELETED_OPEN_REPORT"
+        ' _ "$repo_root" "$one" || fail "systemd anonymous memfd was treated as an actionable deleted file"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_DELETED_OPEN_REPORT="$one/report" \
+        DO_TEST_STATE=memfd-other DO_TEST_LOG="$one/log" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT; MODE=apply; BACKUP_DIR="$2"; CHANGE_LOG="$2/changes"; : > "$CHANGE_LOG"; : > "$DO_TEST_LOG"; REBOOT_REQUIRED=0
+            remediate_deleted_open_files
+            [[ "$REBOOT_REQUIRED" == 0 ]]; ! grep -Fq "restart" "$DO_TEST_LOG"; grep -Fq "process=test-worker" "$HARDEN_DELETED_OPEN_REPORT"
+        ' _ "$repo_root" "$one" || fail "non-systemd anonymous memfd was hidden or remediated"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_DELETED_OPEN_REPORT="$one/report" \
+        DO_TEST_STATE=memfd-protected DO_TEST_LOG="$one/log" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT; MODE=apply; BACKUP_DIR="$2"; CHANGE_LOG="$2/changes"; : > "$CHANGE_LOG"; : > "$DO_TEST_LOG"; REBOOT_REQUIRED=0
+            systemd_unit_for_pid() { [[ "$1" == 22 ]] && printf "sshd.service\n" || printf "systemd.service\n"; }; remediate_deleted_open_files
+            [[ "$REBOOT_REQUIRED" == 1 ]]; grep -Fq "anonymous-memfd-exceptions=1" "$HARDEN_DELETED_OPEN_REPORT"
+        ' _ "$repo_root" "$one" || fail "protected deleted file was masked by a memfd exception"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_DELETED_OPEN_REPORT="$one/report" \
+        DO_TEST_STATE=memfd-safe DO_TEST_LOG="$one/log" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT; MODE=apply; BACKUP_DIR="$2"; CHANGE_LOG="$2/changes"; : > "$CHANGE_LOG"; : > "$DO_TEST_LOG"; REBOOT_REQUIRED=0
+            systemd_unit_for_pid() { [[ "$1" == 4242 ]] && printf "rsyslog.service\n" || printf "systemd.service\n"; }; remediate_deleted_open_files
+            grep -Fq "restart rsyslog.service" "$DO_TEST_LOG"; [[ "$DELETED_OPEN_FILES_STATUS" == "ACCEPTED: only anonymous memfd entries remain" ]]
+        ' _ "$repo_root" "$one" || fail "safe deleted file was not remediated alongside a memfd exception"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_DELETED_OPEN_REPORT="$one/dry-report" DO_TEST_STATE=unknown DO_TEST_LOG="$one/log" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT; MODE=dry-run; BACKUP_DIR="$2"; : > "$DO_TEST_LOG"; REBOOT_REQUIRED=0
+            remediate_deleted_open_files
+            [[ ! -e "${HARDEN_DELETED_OPEN_REPORT:-/root/deleted-open-files-report.txt}" && ! -s "$DO_TEST_LOG" ]]
+        ' _ "$repo_root" "$one" || fail "deleted-open dry-run wrote state or restarted a service"
 }
 
 run_rp_filter_tests() {
@@ -1683,6 +1800,9 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
     compiler)
         run_compiler_tests
         ;;
+    deleted-open)
+        run_deleted_open_tests
+        ;;
     new-findings)
         run_lynis_summary_tests
         run_fail2ban_tests
@@ -1691,6 +1811,7 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
         run_binfmt_tests
         run_systemd_idempotency_tests
         run_runtime_noop_tests
+        run_deleted_open_tests
         run_rp_filter_tests
         run_iowait_tests
         ;;
@@ -1705,6 +1826,7 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
         run_binfmt_tests
         run_systemd_idempotency_tests
         run_runtime_noop_tests
+        run_deleted_open_tests
         run_rp_filter_tests
         run_iowait_tests
         ;;
