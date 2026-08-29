@@ -166,6 +166,36 @@ müssen unverändert bleiben. Das Projekt verwendet ausschließlich metadata-onl
 capture; ein btmp-Inhalts-Restore oder -Rollback findet nicht statt. SSH-Remote-Kommandos dürfen weiterhin nicht durch
 `TMOUT` beeinflusst werden.
 
+### Ubuntu-26.04.1-Retest UEFI Memory Overwrite Request (#8)
+
+Der MOR-Pfad ist bewusst rein lesend. Die TCG-Spezifikation definiert
+`MemoryOverwriteRequestControl` und dessen Lock als von der Firmware
+bereitgestellte Variablen; Linux `efivarfs` erlaubt grundsätzlich auch
+Änderungen. Deshalb erzeugt, löscht oder überschreibt dieses Tool keine
+EFI-Variable. Starte den Apply direkt, ohne externe Pipe, und prüfe nur den
+Inspektionsbericht:
+
+Technische Grundlage: [TCG PC Client Platform Reset Attack Mitigation
+Specification](https://trustedcomputinggroup.org/wp-content/uploads/TCG-PC-Client-Platform-Reset-Attack-Mitigation-Specification-Version-1.2-Revision-10_1April24.pdf)
+und die [Linux-efivarfs-Dokumentation](https://docs.kernel.org/filesystems/efivarfs.html).
+
+```bash
+sudo ./harden.sh --apply --aggressive
+sudo cat /root/uefi-mor-report.txt
+test -d /sys/firmware/efi && stat -f -c '%T' /sys/firmware/efi/efivars || true
+sudo ./harden.sh --apply --aggressive
+```
+
+Auf dem aktuellen Ubuntu-26.04.1-Zielsystem darf `UEFI MOR` als
+`UNSUPPORTED` erscheinen, wenn Lynis weiterhin `MOR variable not found [ WEAK ]`
+meldet. Das ist ein Firmware-/Plattformlimit, kein Skriptfehler und wird nicht
+zur Score-Manipulation verborgen. Sichere bei UEFI-Systemen den Bericht sowie
+die unveränderten vorhandenen Variablen-Listings; führe keinerlei manuelle
+`echo`, `dd` oder Dateischreiboperation unter `efivars` aus. Wenn die Firmware
+MOR bereitstellt, muss der Bericht `SUPPORTED_ACTIVE`, `SUPPORTED_INACTIVE`
+oder bei dokumentiertem Lock `LOCKED/firmware-controlled` ausweisen; der
+Zweitlauf bleibt dabei ein No-op.
+
 Für die Findings #4, #12, #17, #18, #19 und #20 zusätzlich prüfen:
 
 - `aide-lynis-FINT-4402-evidence.txt`, AIDE-Konfigurationsprüfung,
