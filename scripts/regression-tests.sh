@@ -1548,8 +1548,10 @@ EOF
     local uncertain="$case_root/inactive-policy"
     install -d "$uncertain/proc/sys/net/ipv4/conf/all" "$uncertain/proc/sys/net/ipv4/conf/default" \
         "$uncertain/proc/sys/net/ipv4/conf/eth0" "$uncertain/proc/sys/net/ipv4/conf/tailscale0"
-    for path in "$uncertain/proc/sys/net/ipv4/conf/all/rp_filter" "$uncertain/proc/sys/net/ipv4/conf/default/rp_filter" \
-        "$uncertain/proc/sys/net/ipv4/conf/eth0/rp_filter" "$uncertain/proc/sys/net/ipv4/conf/tailscale0/rp_filter"; do printf '2\n' > "$path"; done
+    printf '0\n' > "$uncertain/proc/sys/net/ipv4/conf/all/rp_filter"
+    printf '1\n' > "$uncertain/proc/sys/net/ipv4/conf/default/rp_filter"
+    printf '2\n' > "$uncertain/proc/sys/net/ipv4/conf/eth0/rp_filter"
+    printf '2\n' > "$uncertain/proc/sys/net/ipv4/conf/tailscale0/rp_filter"
     printf 'net.ipv4.conf.all.rp_filter = 2\nnet.ipv4.conf.default.rp_filter = 2\n' > "$uncertain/99-security-hardening.conf"
     : > "$uncertain/commands.log"
     env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_PROC_SYS_ROOT="$uncertain/proc/sys" \
@@ -1563,10 +1565,82 @@ EOF
             install_managed_file() { local destination="$1" mode="$2" temporary; MANAGED_FILE_CHANGED=0; temporary="$(mktemp)"; cat > "$temporary"; cmp -s "$temporary" "$destination" && { rm -f "$temporary"; return 0; }; cp "$temporary" "$destination"; chmod "$mode" "$destination"; rm -f "$temporary"; MANAGED_FILE_CHANGED=1; }
             configure_sysctl
             [[ "$RP_FILTER_POLICY" == preserved-uncertain-routing ]]
-            [[ "$(sysctl -n net.ipv4.conf.all.rp_filter)" == 2 ]]
-            ! grep -Fq rp_filter "$HARDEN_SYSCTL_CONFIG"
-            grep -Fq 'routing-situation=asymmetric-policy-routing' "$HARDEN_RP_FILTER_REPORT"
+            [[ "$(sysctl -n net.ipv4.conf.all.rp_filter)" == 0 ]]
+            [[ "$(sysctl -n net.ipv4.conf.default.rp_filter)" == 1 ]]
+            [[ "$(sysctl -n net.ipv4.conf.eth0.rp_filter)" == 2 ]]
+            grep -Fq "net.ipv4.conf.all.rp_filter = 0" "$HARDEN_SYSCTL_CONFIG"
+            grep -Fq "net.ipv4.conf.default.rp_filter = 1" "$HARDEN_SYSCTL_CONFIG"
+            grep -Fq "net.ipv4.conf.eth0.rp_filter = 2" "$HARDEN_SYSCTL_CONFIG"
+            grep -Fq "routing-situation=asymmetric-policy-routing" "$HARDEN_RP_FILTER_REPORT"
+            grep -Fq "persisted-current-values=yes" "$HARDEN_RP_FILTER_REPORT"
         ' _ "$repo_root" "$uncertain" || fail "policy-routing host had rp_filter forced to strict mode"
+    printf '2\n' > "$uncertain/proc/sys/net/ipv4/conf/all/rp_filter"
+    printf '2\n' > "$uncertain/proc/sys/net/ipv4/conf/default/rp_filter"
+    printf '0\n' > "$uncertain/proc/sys/net/ipv4/conf/eth0/rp_filter"
+    HARDEN_PROC_SYS_ROOT="$uncertain/proc/sys" RP_TEST_COMMAND_LOG="$uncertain/commands.log" \
+        "$mock_bin/sysctl" -p "$uncertain/99-security-hardening.conf"
+    [[ "$(cat "$uncertain/proc/sys/net/ipv4/conf/all/rp_filter")" == 0 \
+        && "$(cat "$uncertain/proc/sys/net/ipv4/conf/default/rp_filter")" == 1 \
+        && "$(cat "$uncertain/proc/sys/net/ipv4/conf/eth0/rp_filter")" == 2 ]] \
+        || fail "uncertain routing values were not restored by the managed sysctl policy"
+    : > "$uncertain/commands.log"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_PROC_SYS_ROOT="$uncertain/proc/sys" \
+        HARDEN_SYSCTL_CONFIG="$uncertain/99-security-hardening.conf" HARDEN_RP_FILTER_REPORT="$uncertain/rp-filter-report.txt" \
+        RP_TEST_TAILSCALE_ACTIVE=0 RP_TEST_DEFAULT_ROUTES='default via 192.0.2.1 dev eth0' \
+        RP_TEST_RULES='100: from 198.51.100.0/24 lookup 100' RP_TEST_COMMAND_LOG="$uncertain/commands.log" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            sysctl_candidates() { printf "%s\\n" "net.ipv4.conf.all.rp_filter=1" "net.ipv4.conf.default.rp_filter=1"; }
+            MODE=apply; BACKUP_DIR="$2/backup"; CHANGE_LOG="$2/changes.tsv"; : > "$CHANGE_LOG"
+            transaction_copy() { :; }; transaction_restore() { :; }
+            install_managed_file() { MANAGED_FILE_CHANGED=0; cat >/dev/null; }
+            configure_sysctl
+        ' _ "$repo_root" "$uncertain" || fail "converged uncertain-routing run failed"
+    [[ ! -s "$uncertain/commands.log" ]] || fail "converged uncertain-routing policy reloaded sysctls unnecessarily"
+
+    local multipath="$case_root/inactive-multipath"
+    install -d "$multipath/proc/sys/net/ipv4/conf/all" "$multipath/proc/sys/net/ipv4/conf/default" "$multipath/proc/sys/net/ipv4/conf/eth0"
+    printf '2\n' > "$multipath/proc/sys/net/ipv4/conf/all/rp_filter"
+    printf '0\n' > "$multipath/proc/sys/net/ipv4/conf/default/rp_filter"
+    printf '1\n' > "$multipath/proc/sys/net/ipv4/conf/eth0/rp_filter"
+    : > "$multipath/commands.log"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_PROC_SYS_ROOT="$multipath/proc/sys" \
+        HARDEN_SYSCTL_CONFIG="$multipath/99-security-hardening.conf" HARDEN_RP_FILTER_REPORT="$multipath/rp-filter-report.txt" \
+        RP_TEST_TAILSCALE_ACTIVE=0 RP_TEST_DEFAULT_ROUTES=$'default via 192.0.2.1 dev eth0\ndefault via 198.51.100.1 dev eth1' \
+        RP_TEST_COMMAND_LOG="$multipath/commands.log" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            sysctl_candidates() { printf "%s\\n" "net.ipv4.conf.all.rp_filter=1" "net.ipv4.conf.default.rp_filter=1"; }
+            MODE=apply; BACKUP_DIR="$2/backup"; CHANGE_LOG="$2/changes.tsv"; : > "$CHANGE_LOG"
+            transaction_copy() { :; }; transaction_restore() { :; }
+            install_managed_file() { local destination="$1" mode="$2" temporary; MANAGED_FILE_CHANGED=0; temporary="$(mktemp)"; cat > "$temporary"; mkdir -p -- "$(dirname -- "$destination")"; cp "$temporary" "$destination"; chmod "$mode" "$destination"; rm -f "$temporary"; MANAGED_FILE_CHANGED=1; }
+            configure_sysctl
+            [[ "$RP_FILTER_POLICY" == preserved-uncertain-routing ]]
+            [[ "$(sysctl -n net.ipv4.conf.all.rp_filter)" == 2 ]]
+            [[ "$(sysctl -n net.ipv4.conf.default.rp_filter)" == 0 ]]
+            [[ "$(sysctl -n net.ipv4.conf.eth0.rp_filter)" == 1 ]]
+            grep -Fq "net.ipv4.conf.default.rp_filter = 0" "$HARDEN_SYSCTL_CONFIG"
+            grep -Fq "routing-situation=asymmetric-multiple-default-routes" "$HARDEN_RP_FILTER_REPORT"
+        ' _ "$repo_root" "$multipath" || fail "multiple-default routing had rp_filter forced to strict mode"
+
+    local unreadable="$case_root/uncertain-invalid-values"
+    install -d "$unreadable/proc/sys/net/ipv4/conf/all" "$unreadable/proc/sys/net/ipv4/conf/default" "$unreadable/proc/sys/net/ipv4/conf/eth0"
+    printf '3\n' > "$unreadable/proc/sys/net/ipv4/conf/all/rp_filter"
+    printf '1\n' > "$unreadable/proc/sys/net/ipv4/conf/default/rp_filter"
+    printf 'bogus\n' > "$unreadable/proc/sys/net/ipv4/conf/eth0/rp_filter"
+    : > "$unreadable/commands.log"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_PROC_SYS_ROOT="$unreadable/proc/sys" \
+        HARDEN_SYSCTL_CONFIG="$unreadable/99-security-hardening.conf" HARDEN_RP_FILTER_REPORT="$unreadable/rp-filter-report.txt" \
+        RP_TEST_TAILSCALE_ACTIVE=0 RP_TEST_DEFAULT_ROUTES='default via 192.0.2.1 dev eth0' \
+        RP_TEST_RULES='100: from 198.51.100.0/24 lookup 100' RP_TEST_COMMAND_LOG="$unreadable/commands.log" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            sysctl_candidates() { printf "%s\\n" "net.ipv4.conf.all.rp_filter=1" "net.ipv4.conf.default.rp_filter=1"; }
+            MODE=apply; BACKUP_DIR="$2/backup"; CHANGE_LOG="$2/changes.tsv"; : > "$CHANGE_LOG"
+            transaction_copy() { :; }; transaction_restore() { :; }
+            install_managed_file() { local destination="$1" mode="$2" temporary; MANAGED_FILE_CHANGED=0; temporary="$(mktemp)"; cat > "$temporary"; mkdir -p -- "$(dirname -- "$destination")"; cp "$temporary" "$destination"; chmod "$mode" "$destination"; rm -f "$temporary"; MANAGED_FILE_CHANGED=1; }
+            configure_sysctl
+            grep -Fq "net.ipv4.conf.default.rp_filter = 1" "$HARDEN_SYSCTL_CONFIG"
+            ! grep -Fq "net.ipv4.conf.all.rp_filter" "$HARDEN_SYSCTL_CONFIG"
+            ! grep -Fq "net.ipv4.conf.eth0.rp_filter" "$HARDEN_SYSCTL_CONFIG"
+        ' _ "$repo_root" "$unreadable" || fail "uncertain routing invented an unreadable or invalid rp_filter value"
 
     run_rp_filter_case harmless-health 1 'default via 192.0.2.1 dev eth0' '' harmless 1 2
     grep -Fq 'tailscale-runtime=OK: Tailscale backend Running; router/netfilter health clear' "$case_root/harmless-health/rp-filter-report.txt" \

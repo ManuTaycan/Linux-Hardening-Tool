@@ -78,6 +78,7 @@ RP_FILTER_ROUTING_SITUATION="not assessed"
 RP_FILTER_POLICY="not assessed"
 RP_FILTER_REASON="not assessed"
 RP_FILTER_RUNTIME_STATUS="NOT RUN"
+RP_FILTER_PERSISTED_CURRENT_VALUES="no"
 
 readonly COLOR_RESET=$'\033[0m'
 readonly COLOR_DIM=$'\033[2m'
@@ -1177,6 +1178,7 @@ write_rp_filter_report() {
         printf 'tailscale-state=%s\n' "$RP_FILTER_TAILSCALE_STATE"
         printf 'routing-situation=%s\n' "$RP_FILTER_ROUTING_SITUATION"
         printf 'policy=%s\n' "$RP_FILTER_POLICY"
+        printf 'persisted-current-values=%s\n' "$RP_FILTER_PERSISTED_CURRENT_VALUES"
         printf 'reason=%s\n' "$RP_FILTER_REASON"
         printf 'network-route-proof=%s\n' "$route_proof"
         printf 'tailscale-runtime=%s\n' "$RP_FILTER_RUNTIME_STATUS"
@@ -1194,6 +1196,29 @@ write_rp_filter_report() {
     } > "$temporary"
     install -m 0600 "$temporary" "$report"
     rm -f -- "$temporary"
+}
+
+valid_rp_filter_value() {
+    [[ "$1" =~ ^[012]$ ]]
+}
+
+preserve_current_rp_filter_values() {
+    local key interface value persisted=0
+    for key in net.ipv4.conf.all.rp_filter net.ipv4.conf.default.rp_filter; do
+        value="$(sysctl -n "$key" 2>/dev/null || true)"
+        valid_rp_filter_value "$value" || continue
+        printf '%s = %s\n' "$key" "$value"
+        persisted=1
+    done
+    while IFS= read -r interface; do
+        [[ -n "$interface" ]] || continue
+        key="net.ipv4.conf.${interface}.rp_filter"
+        value="$(sysctl -n "$key" 2>/dev/null || true)"
+        valid_rp_filter_value "$value" || continue
+        printf '%s = %s\n' "$key" "$value"
+        persisted=1
+    done < <(rp_filter_active_interfaces)
+    [[ "$persisted" -eq 1 ]] && RP_FILTER_PERSISTED_CURRENT_VALUES=yes
 }
 
 managed_sysctl_runtime_needs_reload() {
@@ -1268,6 +1293,8 @@ configure_sysctl() {
                 [[ -n "$interface" ]] || continue
                 printf 'net.ipv4.conf.%s.rp_filter = %s\n' "$interface" "$desired_rp_filter"
             done < <(rp_filter_active_interfaces)
+        elif [[ "$RP_FILTER_POLICY" == preserved-uncertain-routing ]]; then
+            preserve_current_rp_filter_values
         fi
     } > "$temporary"
     if [[ ! -f "$config" ]] || ! cmp -s "$temporary" "$config"; then
