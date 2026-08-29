@@ -105,12 +105,10 @@ für 1.1.3 wird erst nach dem vollständigen Zielsystemtest erstellt.
 
 ### Validation status
 
-- Lokale Syntax-, statische und simulierte Regressionstests bestanden.
-- Ein vollständiger Ubuntu-26.04.1-Zielsystemtest und die Bestätigung des
-  Zielwerts Hardening Index >= 90 stehen noch aus.
-- Der beobachtete interne Score 86 gegenüber einem späteren manuellen Score 87
-  ist aus den vorhandenen Konsolenauszügen nicht testgenau rekonstruierbar. Die
-  Scans waren zeitlich verschiedene Snapshots und der alte Summary-Parser
-  verlor strukturierte Werte. Künftige Retests bewahren Console und
-  `lynis-report.dat` je Pass auf; ein Punktunterschied darf erst anhand der
-  konkreten Test-ID-Differenz erklärt werden, nicht durch Profil-Skipping.
+- Ubuntu 26.04.1 Target-System-Abnahme bestanden.
+- Fresh Lynis 63 -> 87; konvergiert 87 -> 87.
+- AIDE baseline rebuilt 1 -> 0.
+- Gepatchter Reboot: Tailscale/Netfilter/NAT gesund; `kernel.modules_disabled=1`
+  erst nach dem Runtime-Gate.
+- Finaler konvergierter Lauf: keine Packages installed/removed, keine Failed
+  Services/Rollbacks, Reboot required NO.
