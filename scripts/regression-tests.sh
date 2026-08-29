@@ -1800,7 +1800,7 @@ EOF
         MODE=apply; AGGRESSIVE=1; OS_ID=debian; configure_motd_presentation
         [[ "$MOTD_STATUS" == "N/A (no Ubuntu presentation hooks)" ]]
     ' _ "$repo_root" || fail "Debian MOTD no-op failed"
-    ! rg -q 'apt(-get)?[[:space:]]+(purge|remove).*motd|apt(-get)?[[:space:]]+(purge|remove).*ubuntu-pro' "$repo_root/harden.sh" \
+    ! grep -Eq 'apt(-get)?[[:space:]]+(purge|remove).*motd|apt(-get)?[[:space:]]+(purge|remove).*ubuntu-pro' "$repo_root/harden.sh" \
         || fail "MOTD policy removes a package"
 }
 

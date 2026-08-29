@@ -1404,6 +1404,7 @@ ipv6_policy_candidates() {
 write_ipv6_report() {
     local report="${HARDEN_IPV6_REPORT:-/root/ipv6-policy-report.txt}" key value interface
     [[ "$MODE" == apply ]] || return 0
+    [[ "$IPV6_POLICY" != NOT_APPLICABLE ]] || return 0
     install -d -m 0700 "$(dirname -- "$report")"
     {
         printf 'IPv6 policy diagnostic\n'
@@ -5759,7 +5760,7 @@ IPv6 Policy        : ${IPV6_POLICY}
 IPv6 Reason        : ${IPV6_REASON}
 IPv6 Runtime       : ${IPV6_RUNTIME_STATUS}
 IPv6 Persistence   : ${IPV6_PERSISTENCE_STATUS}
-IPv6 Report        : $([[ "$MODE" == "apply" ]] && printf '%s' "$IPV6_REPORT" || printf 'not written in dry-run')
+IPv6 Report        : $([[ "$MODE" == "apply" && "$IPV6_POLICY" != NOT_APPLICABLE ]] && printf '%s' "$IPV6_REPORT" || printf 'not written / not applicable')
 
 Lynis Score Before : ${LYNIS_BEFORE}
 Lynis Score After  : ${LYNIS_AFTER}
