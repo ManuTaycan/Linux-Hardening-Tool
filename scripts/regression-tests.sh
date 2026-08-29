@@ -1360,6 +1360,102 @@ EOF
     ' _ "$repo_root" || fail "initramfs/GRUB/reboot-required change gating regressed"
 }
 
+run_login_timeout_tests() {
+    local case_root="$test_root/login-timeout"
+    local mock_bin="$case_root/bin"
+    install -d "$mock_bin" "$case_root/profile.d" "$case_root/log"
+    cat > "$mock_bin/getent" <<'EOF'
+#!/usr/bin/env bash
+[[ "${1:-}" == group && "${2:-}" == utmp ]] && { printf 'utmp:x:43:\n'; exit 0; }
+exit 2
+EOF
+    cat > "$mock_bin/lastb" <<'EOF'
+#!/usr/bin/env bash
+[[ "${1:-}" == -f && -f "${2:-}" ]]
+EOF
+    cat > "$mock_bin/chown" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+    cat > "$mock_bin/stat" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == -c && "${2:-}" == '%U:%G' && "${3:-}" == *btmp ]]; then printf 'root:utmp\n'; exit 0; fi
+if [[ "${1:-}" == -c && "${2:-}" == '%a' && "${3:-}" == *btmp ]]; then printf '660\n'; exit 0; fi
+exec /usr/bin/stat "$@"
+EOF
+    cat > "$mock_bin/install" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+mode="" directory=0
+while (($#)); do
+    case "$1" in
+        -d) directory=1; shift ;;
+        -m) mode="$2"; shift 2 ;;
+        -o|-g) shift 2 ;;
+        --) shift; break ;;
+        -*) shift ;;
+        *) break ;;
+    esac
+done
+if ((directory)); then
+    mkdir -p -- "$@"
+    [[ -z "$mode" ]] || chmod "$mode" "$@"
+else
+    [[ $# -eq 2 ]] || exit 64
+    cp -- "$1" "$2"
+    [[ -z "$mode" ]] || chmod "$mode" "$2"
+fi
+EOF
+    chmod +x "$mock_bin/getent" "$mock_bin/lastb" "$mock_bin/chown" "$mock_bin/stat" "$mock_bin/install"
+
+    printf 'PASS_MAX_DAYS 90\nFAILLOG_ENAB yes\n' > "$case_root/login.defs"
+    printf 'existing failed-login record\n' > "$case_root/log/btmp"
+    chmod 0660 "$case_root/log/btmp"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_LOGIN_DEFS="$case_root/login.defs" \
+        HARDEN_BTMP_PATH="$case_root/log/btmp" HARDEN_SHELL_TIMEOUT_PROFILE="$case_root/profile.d/99-security-shell-timeout.sh" \
+        bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; BACKUP_DIR="$2/backup"; CHANGE_LOG="$2/changes.tsv"; : > "$CHANGE_LOG"
+            log() { :; }; record_change() { :; }; record_skip() { :; }; transaction_copy() { :; }
+            configure_failed_login_logging
+            [[ "$FAILED_LOGIN_STATUS" == OK* ]]
+            grep -Fxq "existing failed-login record" "$HARDEN_BTMP_PATH"
+            configure_interactive_shell_timeout
+            [[ "$SHELL_TIMEOUT_STATUS" == "OK (interactive default 900s; override preserved)" ]]
+            before_login="$(sha256sum "$HARDEN_LOGIN_DEFS")"; before_profile="$(sha256sum "$HARDEN_SHELL_TIMEOUT_PROFILE")"
+            configure_failed_login_logging; configure_interactive_shell_timeout
+            [[ "$before_login" == "$(sha256sum "$HARDEN_LOGIN_DEFS")" ]]
+            [[ "$before_profile" == "$(sha256sum "$HARDEN_SHELL_TIMEOUT_PROFILE")" ]]
+        ' _ "$repo_root" "$case_root" || fail "failed-login logging or interactive timeout did not converge"
+    grep -Fq 'FAILLOG_ENAB yes' "$case_root/login.defs" || fail "failed-login logging was not persisted in login.defs"
+    grep -Fq 'case "$-" in' "$case_root/profile.d/99-security-shell-timeout.sh" \
+        || fail "timeout profile is not limited to interactive shells"
+
+    local missing="$case_root/missing-btmp"
+    rm -f -- "$missing"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_LOGIN_DEFS="$case_root/login.defs" \
+        HARDEN_BTMP_PATH="$missing" HARDEN_SHELL_TIMEOUT_PROFILE="$case_root/profile.d/99-security-shell-timeout.sh" \
+        bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; BACKUP_DIR="$2/backup"; CHANGE_LOG="$2/changes.tsv"; : > "$CHANGE_LOG"
+            log() { :; }; record_change() { :; }; record_skip() { :; }; transaction_copy() { :; }
+            configure_failed_login_logging
+            [[ -f "$HARDEN_BTMP_PATH" && "$(stat -c "%a" "$HARDEN_BTMP_PATH")" == 660 ]]
+        ' _ "$repo_root" "$case_root" || fail "missing btmp was not safely created"
+
+    local dry_login="$case_root/dry-login.defs" dry_btmp="$case_root/dry-btmp" dry_profile="$case_root/dry-profile.sh"
+    printf 'FAILLOG_ENAB no\n' > "$dry_login"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_LOGIN_DEFS="$dry_login" HARDEN_BTMP_PATH="$dry_btmp" \
+        HARDEN_SHELL_TIMEOUT_PROFILE="$dry_profile" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=dry-run; log() { :; }; record_change() { :; }; record_skip() { :; }
+            configure_failed_login_logging; configure_interactive_shell_timeout
+            [[ "$FAILED_LOGIN_STATUS" == "N/A (dry-run)" && "$SHELL_TIMEOUT_STATUS" == "N/A (dry-run)" ]]
+        ' _ "$repo_root" || fail "login timeout dry-run failed"
+    grep -Fxq 'FAILLOG_ENAB no' "$dry_login" || fail "failed-login dry-run wrote login.defs"
+    [[ ! -e "$dry_btmp" && ! -e "$dry_profile" ]] || fail "login timeout dry-run wrote managed state"
+}
+
 run_iowait_tests() {
     local case_root="$test_root/iowait" mock_bin="$test_root/iowait/bin" count="$test_root/iowait/count"
     install -d "$mock_bin"
@@ -1803,6 +1899,9 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
     deleted-open)
         run_deleted_open_tests
         ;;
+    login-timeout)
+        run_login_timeout_tests
+        ;;
     new-findings)
         run_lynis_summary_tests
         run_fail2ban_tests
@@ -1812,6 +1911,7 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
         run_systemd_idempotency_tests
         run_runtime_noop_tests
         run_deleted_open_tests
+        run_login_timeout_tests
         run_rp_filter_tests
         run_iowait_tests
         ;;
@@ -1827,6 +1927,7 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
         run_systemd_idempotency_tests
         run_runtime_noop_tests
         run_deleted_open_tests
+        run_login_timeout_tests
         run_rp_filter_tests
         run_iowait_tests
         ;;

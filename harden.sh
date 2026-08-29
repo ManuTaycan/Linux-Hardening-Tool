@@ -52,6 +52,8 @@ LYNIS_PARSE_STATUS="NOT RUN"
 FIREWALL_STATUS="NOT RUN"
 SSH_STATUS="NOT RUN"
 PAM_STATUS="NOT RUN"
+FAILED_LOGIN_STATUS="NOT RUN"
+SHELL_TIMEOUT_STATUS="NOT RUN"
 AUDIT_STATUS="NOT RUN"
 APPARMOR_STATUS="NOT RUN"
 AIDE_STATUS="NOT RUN"
@@ -449,7 +451,8 @@ backup_config() {
         /etc/ssh /etc/pam.d /etc/security /etc/sysctl.conf /etc/sysctl.d
         /etc/systemd /etc/audit /etc/rsyslog.conf /etc/rsyslog.d
         /etc/nftables.conf /etc/nftables.d /etc/fail2ban /etc/sudoers
-        /etc/sudoers.d /etc/login.defs /etc/modprobe.d /etc/fstab /etc/apt
+        /etc/sudoers.d /etc/login.defs /etc/profile.d /etc/modprobe.d /etc/fstab /etc/apt
+        /var/log/btmp
         /etc/default/grub /etc/default/grub.d /etc/grub.d /etc/issue /etc/issue.net
     )
     local -a present=()
@@ -2590,27 +2593,166 @@ EOF
     fi
 }
 
+validate_failed_login_logging() {
+    local login_defs="${HARDEN_LOGIN_DEFS:-/etc/login.defs}"
+    local btmp_path="${HARDEN_BTMP_PATH:-/var/log/btmp}"
+    local faillog_enabled="" lastb_status="unavailable"
+
+    if [[ "$MODE" == "dry-run" ]]; then
+        FAILED_LOGIN_STATUS="N/A (dry-run)"
+        log INFO "Would validate FAILLOG_ENAB and the distro btmp/lastb failed-login accounting path"
+        return 0
+    fi
+
+    faillog_enabled="$(awk '$1 == "FAILLOG_ENAB" { value=$2 } END { print value }' "$login_defs" 2>/dev/null || true)"
+    if command -v lastb >/dev/null 2>&1 && lastb -f "$btmp_path" >/dev/null 2>&1; then
+        lastb_status="readable"
+    fi
+    if [[ "$faillog_enabled" == "yes" && -f "$btmp_path" && ! -L "$btmp_path" && "$lastb_status" == "readable" ]]; then
+        FAILED_LOGIN_STATUS="OK (FAILLOG_ENAB=yes; btmp/lastb readable)"
+        log OK "Failed-login logging is enabled through login.defs and validated via ${btmp_path}"
+    else
+        FAILED_LOGIN_STATUS="FAILED (FAILLOG_ENAB=${faillog_enabled:-missing}; btmp=${btmp_path}; lastb=${lastb_status})"
+        record_skip "failed-login logging" "login.defs/btmp validation did not prove usable failed-login accounting"
+        log WARN "Failed-login logging validation is incomplete: ${FAILED_LOGIN_STATUS}"
+    fi
+}
+
+configure_failed_login_logging() {
+    local login_defs="${HARDEN_LOGIN_DEFS:-/etc/login.defs}"
+    local btmp_path="${HARDEN_BTMP_PATH:-/var/log/btmp}"
+    local btmp_parent btmp_group
+    btmp_parent="$(dirname -- "$btmp_path")"
+
+    if [[ ! -f "$login_defs" ]]; then
+        FAILED_LOGIN_STATUS="SKIPPED (login.defs unavailable)"
+        record_skip "failed-login logging" "${login_defs} is unavailable; no alternate lockout policy was added"
+        return 0
+    fi
+    replace_setting "$login_defs" FAILLOG_ENAB yes
+
+    if [[ "$MODE" == "dry-run" ]]; then
+        FAILED_LOGIN_STATUS="PLANNED"
+        log INFO "Would preserve or create ${btmp_path} as root:utmp 0660 without deleting its accounting contents"
+        validate_failed_login_logging
+        return 0
+    fi
+    if [[ -e "$btmp_path" && ( ! -f "$btmp_path" || -L "$btmp_path" ) ]]; then
+        FAILED_LOGIN_STATUS="FAILED (unsafe btmp path)"
+        record_skip "failed-login logging" "${btmp_path} is not a regular non-symlink file"
+        return 0
+    fi
+    if ! getent group utmp >/dev/null 2>&1; then
+        FAILED_LOGIN_STATUS="FAILED (utmp group unavailable)"
+        record_skip "failed-login logging" "the distribution utmp group is unavailable; ${btmp_path} ownership was not guessed"
+        return 0
+    fi
+    btmp_group="utmp"
+    transaction_copy "$btmp_path" failed-login-btmp
+    if [[ ! -d "$btmp_parent" ]]; then
+        install -d -o root -g root -m 0755 "$btmp_parent" || return 1
+    fi
+    # These operations preserve existing records and are skipped when metadata is
+    # already distro-correct, so a converged run does not touch btmp at all.
+    local btmp_changed=0
+    if [[ ! -e "$btmp_path" ]]; then
+        touch "$btmp_path" || return 1
+        btmp_changed=1
+    fi
+    if [[ "$(stat -c '%U:%G' "$btmp_path")" != "root:${btmp_group}" ]]; then
+        chown root:"$btmp_group" "$btmp_path" || return 1
+        btmp_changed=1
+    fi
+    if [[ "$(stat -c '%a' "$btmp_path")" != 660 ]]; then
+        chmod 0660 "$btmp_path" || return 1
+        btmp_changed=1
+    fi
+    if [[ "$btmp_changed" -eq 1 ]]; then
+        record_change "Validated failed-login accounting file ${btmp_path} as root:${btmp_group} 0660 without truncation"
+    else
+        log INFO "Failed-login accounting file already current: ${btmp_path}"
+    fi
+    validate_failed_login_logging
+}
+
+validate_interactive_shell_timeout() {
+    local profile_path="${HARDEN_SHELL_TIMEOUT_PROFILE:-/etc/profile.d/99-security-shell-timeout.sh}"
+    local expected_timeout="${HARDEN_SHELL_TIMEOUT_SECONDS:-900}"
+    local interactive_timeout non_interactive_timeout overridden_timeout configured_timeout
+
+    if [[ "$MODE" == "dry-run" ]]; then
+        SHELL_TIMEOUT_STATUS="N/A (dry-run)"
+        log INFO "Would validate interactive-only TMOUT behavior from ${profile_path}"
+        return 0
+    fi
+    if ! command -v bash >/dev/null 2>&1 || [[ ! -f "$profile_path" ]]; then
+        SHELL_TIMEOUT_STATUS="FAILED (bash or managed profile unavailable)"
+        return 0
+    fi
+    interactive_timeout="$(env -i PATH="$PATH" bash --noprofile --norc -ic ". \"$profile_path\"; printf '%s' \"\${TMOUT-}\"" 2>/dev/null || true)"
+    non_interactive_timeout="$(env -i PATH="$PATH" bash --noprofile --norc -c ". \"$profile_path\"; printf '%s' \"\${TMOUT-}\"" 2>/dev/null || true)"
+    overridden_timeout="$(env -i PATH="$PATH" TMOUT=321 bash --noprofile --norc -ic ". \"$profile_path\"; printf '%s' \"\${TMOUT-}\"" 2>/dev/null || true)"
+    configured_timeout="$(env -i PATH="$PATH" HARDEN_SHELL_TMOUT=600 bash --noprofile --norc -ic ". \"$profile_path\"; printf '%s' \"\${TMOUT-}\"" 2>/dev/null || true)"
+    if [[ "$interactive_timeout" == "$expected_timeout" && -z "$non_interactive_timeout" \
+        && "$overridden_timeout" == 321 && "$configured_timeout" == 600 ]]; then
+        SHELL_TIMEOUT_STATUS="OK (interactive default ${expected_timeout}s; override preserved)"
+        log OK "Interactive shell timeout is active without affecting non-interactive commands"
+    else
+        SHELL_TIMEOUT_STATUS="FAILED (interactive=${interactive_timeout:-unset}; non-interactive=${non_interactive_timeout:-unset}; override=${overridden_timeout:-unset}; configured=${configured_timeout:-unset})"
+        record_skip "interactive shell timeout" "managed profile did not validate as interactive-only and override-safe"
+        log WARN "Interactive shell timeout validation is incomplete: ${SHELL_TIMEOUT_STATUS}"
+    fi
+}
+
+configure_interactive_shell_timeout() {
+    local timeout="${HARDEN_SHELL_TIMEOUT_SECONDS:-900}"
+    local profile_path="${HARDEN_SHELL_TIMEOUT_PROFILE:-/etc/profile.d/99-security-shell-timeout.sh}"
+    if [[ ! "$timeout" =~ ^[1-9][0-9]{0,4}$ || "$timeout" -gt 86400 ]]; then
+        SHELL_TIMEOUT_STATUS="SKIPPED (invalid timeout)"
+        record_skip "interactive shell timeout" "HARDEN_SHELL_TIMEOUT_SECONDS must be an integer from 1 through 86400"
+        return 0
+    fi
+    {
+        cat <<'EOF'
+# Managed by harden.sh: apply an idle timeout only to interactive POSIX shells.
+# An administrator may retain a session-specific TMOUT or set HARDEN_SHELL_TMOUT.
+case "$-" in
+    *i*)
+        if [ -z "${TMOUT+x}" ]; then
+EOF
+        printf '            TMOUT="${HARDEN_SHELL_TMOUT:-%s}"\n' "$timeout"
+        cat <<'EOF'
+            export TMOUT
+        fi
+        ;;
+esac
+EOF
+    } | install_managed_file "$profile_path" 0644
+    validate_interactive_shell_timeout
+}
+
 configure_password_policy() {
-    [[ -f /etc/login.defs ]] || return 0
-    replace_setting /etc/login.defs PASS_MAX_DAYS 90
-    replace_setting /etc/login.defs PASS_MIN_DAYS 1
-    replace_setting /etc/login.defs PASS_WARN_AGE 14
-    replace_setting /etc/login.defs UMASK 027
-    replace_setting /etc/login.defs LOGIN_RETRIES 5
-    replace_setting /etc/login.defs LOGIN_TIMEOUT 60
+    local login_defs="${HARDEN_LOGIN_DEFS:-/etc/login.defs}"
+    [[ -f "$login_defs" ]] || return 0
+    replace_setting "$login_defs" PASS_MAX_DAYS 90
+    replace_setting "$login_defs" PASS_MIN_DAYS 1
+    replace_setting "$login_defs" PASS_WARN_AGE 14
+    replace_setting "$login_defs" UMASK 027
+    replace_setting "$login_defs" LOGIN_RETRIES 5
+    replace_setting "$login_defs" LOGIN_TIMEOUT 60
     local chpasswd_help=""
     if command -v chpasswd >/dev/null 2>&1; then
         chpasswd_help="$(chpasswd --help 2>&1 || true)"
     fi
     if grep -F 'YESCRYPT' <<<"$chpasswd_help" >/dev/null; then
-        replace_setting /etc/login.defs ENCRYPT_METHOD YESCRYPT
-        remove_setting /etc/login.defs SHA_CRYPT_MIN_ROUNDS
-        remove_setting /etc/login.defs SHA_CRYPT_MAX_ROUNDS
+        replace_setting "$login_defs" ENCRYPT_METHOD YESCRYPT
+        remove_setting "$login_defs" SHA_CRYPT_MIN_ROUNDS
+        remove_setting "$login_defs" SHA_CRYPT_MAX_ROUNDS
         record_skip "AUTH-9230" "Lynis 3.1.6 asks for SHA_CRYPT rounds even with YESCRYPT; meaningless SHA settings were intentionally not score-gamed"
     else
-        replace_setting /etc/login.defs ENCRYPT_METHOD SHA512
-        replace_setting /etc/login.defs SHA_CRYPT_MIN_ROUNDS 100000
-        replace_setting /etc/login.defs SHA_CRYPT_MAX_ROUNDS 200000
+        replace_setting "$login_defs" ENCRYPT_METHOD SHA512
+        replace_setting "$login_defs" SHA_CRYPT_MIN_ROUNDS 100000
+        replace_setting "$login_defs" SHA_CRYPT_MAX_ROUNDS 200000
     fi
 
     install_managed_file /etc/profile.d/99-security-umask.sh 0644 <<'EOF'
@@ -2646,6 +2788,8 @@ silent
 local_users_only
 EOF
     fi
+    configure_failed_login_logging
+    configure_interactive_shell_timeout
 }
 
 insert_pam_before_unix() {
@@ -5148,6 +5292,8 @@ Aggressive         : ${aggressive_label}
 SSH                : ${SSH_STATUS}
 Firewall           : ${FIREWALL_STATUS}
 PAM                : ${PAM_STATUS}
+Failed-login log   : ${FAILED_LOGIN_STATUS}
+Shell timeout      : ${SHELL_TIMEOUT_STATUS}
 Audit              : ${AUDIT_STATUS}
 AppArmor           : ${APPARMOR_STATUS}
 AIDE               : ${AIDE_STATUS}

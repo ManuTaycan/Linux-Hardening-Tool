@@ -125,6 +125,33 @@ Sie bleibt vollständig sichtbar, wird als `anonymous-memfd` reportet und löst
 weder Restart noch Reboot aus. Normale `/var/... (deleted)`-Einträge bleiben
 dagegen weiterhin actionable bzw. manual-review-required.
 
+### Ubuntu-26.04.1-Retest failed-login audit und Shell-Timeout (#14)
+
+Führe den Apply aus einer zweiten, bestätigten SSH-/Recovery-Sitzung direkt
+ohne externe Pipe aus. Dabei werden keine absichtlichen Fehlversuche gegen den
+Remote-Admin-Account durchgeführt:
+
+```bash
+sudo ./harden.sh --apply --aggressive
+grep -E '^[[:space:]]*FAILLOG_ENAB' /etc/login.defs
+sudo stat -c '%U:%G %a %s %n' /var/log/btmp
+sudo lastb -f /var/log/btmp | head
+sudo grep -n . /etc/profile.d/99-security-shell-timeout.sh
+env -i PATH="$PATH" bash --noprofile --norc -ic \
+  '. /etc/profile.d/99-security-shell-timeout.sh; printf "TMOUT=%s\\n" "$TMOUT"'
+env -i PATH="$PATH" bash --noprofile --norc -c \
+  '. /etc/profile.d/99-security-shell-timeout.sh; printf "TMOUT=%s\\n" "${TMOUT-}"'
+```
+
+Der erste interaktive Befehl muss `TMOUT=900` ausgeben (oder einen bewusst
+gesetzten Admin-Override), der nichtinteraktive Befehl keinen neuen Wert. Prüfe
+eine echte fehlgeschlagene Anmeldung ausschließlich auf einer lokalen,
+entbehrlichen Test-VM oder einem ausdrücklich freigegebenen Testkonto; dabei
+muss die bestehende `pam_faillock`-Schwelle eingehalten werden. Anschließend
+`lastb -f /var/log/btmp` erneut prüfen. Wiederhole den Apply: `btmp`-Inhalt und
+Metadaten sowie die Timeout-Datei müssen unverändert bleiben, SSH-Remote-
+Kommandos dürfen weiterhin nicht durch `TMOUT` beeinflusst werden.
+
 Für die Findings #4, #12, #17, #18, #19 und #20 zusätzlich prüfen:
 
 - `aide-lynis-FINT-4402-evidence.txt`, AIDE-Konfigurationsprüfung,

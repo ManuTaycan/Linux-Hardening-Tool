@@ -143,6 +143,12 @@ sudo ./harden.sh \
 - Es wird kein GRUB-Passwort eingerichtet.
 - `/home` und `/var` werden nicht automatisch live repartitioniert.
 - Für den Admin-Account wird kein festes Ablaufdatum erzwungen.
+- Fehlgeschlagene Anmeldungen bleiben über die Ubuntu-/Debian-Mechanismen
+  `login.defs`/`btmp`/`lastb` nachvollziehbar; die bestehende `pam_faillock`-
+  Policy wird dabei nicht durch eine zweite Lockout-Policy ersetzt.
+- Interaktive Login-Shells erhalten standardmäßig `TMOUT=900`. Nichtinteraktive
+  SSH-Kommandos, scp/sftp, Cron, systemd und Skripte werden nicht beeinflusst;
+  ein bereits gesetztes `TMOUT` oder `HARDEN_SHELL_TMOUT` bleibt maßgeblich.
 - Kein Lynis-Test wird deaktiviert; es gibt keine kosmetische Score-Manipulation.
 
 ## Ergebnisdateien
