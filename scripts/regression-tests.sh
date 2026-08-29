@@ -1689,6 +1689,14 @@ root="${HARDEN_PROC_SYS_ROOT:?}"
 set_value() {
     local key="$1" value="$2" path="$root/${key//./\/}"
     [[ -e "$path" ]] || return 1
+    if [[ "$key" == net.ipv6.conf.all.disable_ipv6 ]]; then
+        # Match Linux: writing conf/all/disable_ipv6 propagates to default and
+        # every per-interface value before a deterministic restore rewrites them.
+        while IFS= read -r path; do
+            printf '%s\n' "$value" > "$path"
+        done < <(find "$root/net/ipv6/conf" -mindepth 2 -maxdepth 2 -type f -name disable_ipv6 -print | sort)
+        return 0
+    fi
     printf '%s\n' "$value" > "$path"
 }
 case "${1:-}" in
@@ -1704,6 +1712,7 @@ case "${1:-}" in
             [[ -n "$key" && "$key" != \#* ]] || continue
             count=$((count + 1))
             set_value "$key" "$value"
+            [[ "${IPV6_TEST_FAIL_SYSCTL_KEY:-}" != "$key" ]] || exit 1
             [[ "${IPV6_TEST_FAIL_SYSCTL_AFTER:-0}" -eq 0 || "$count" -lt "${IPV6_TEST_FAIL_SYSCTL_AFTER}" ]] || exit 1
         done < "$2"
         ;;
@@ -1714,7 +1723,7 @@ EOF
 
     make_ipv6_tree() {
         local root="$1" interface key
-        for interface in all default lo eth0 tailscale0; do
+        for interface in all default lo eth0 tailscale0 down0; do
             install -d "$root/net/ipv6/conf/$interface"
             for key in disable_ipv6 accept_redirects accept_source_route forwarding; do printf '0\n' > "$root/net/ipv6/conf/$interface/$key"; done
         done
@@ -1736,6 +1745,7 @@ EOF
                     grep -Fxq "net.ipv6.conf.eth0.disable_ipv6=1" <<<"$candidates" || { printf "candidates=%s\n" "$candidates" >&2; exit 1; }
                     grep -Fxq "net.ipv6.conf.lo.disable_ipv6=1" <<<"$candidates"
                     grep -Fxq "net.ipv6.conf.tailscale0.disable_ipv6=1" <<<"$candidates"
+                    grep -Fxq "net.ipv6.conf.down0.disable_ipv6=1" <<<"$candidates"
                 else
                     ! ipv6_policy_candidates | grep -q disable_ipv6
                 fi
@@ -1766,10 +1776,10 @@ EOF
         ' _ "$repo_root" || fail "IPv6 dry-run wrote managed state or did not plan explicit disable"
 
     run_ipv6_apply() {
-        local root="$1" disable="$2" fail_after="${3:-0}"
+        local root="$1" disable="$2" fail_after="${3:-0}" fail_key="${4:-}"
         env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_PROC_SYS_ROOT="$root/proc/sys" \
             HARDEN_SYSCTL_CONFIG="$root/99-security-hardening.conf" HARDEN_IPV6_REPORT="$root/ipv6-report.txt" \
-            HARDEN_RP_FILTER_REPORT="$root/rp-filter-report.txt" IPV6_TEST_FAIL_SYSCTL_AFTER="$fail_after" IPV6_TEST_EXPECT_FAILURE="$([[ "$fail_after" -gt 0 ]] && printf 1 || printf 0)" bash -c '
+            HARDEN_RP_FILTER_REPORT="$root/rp-filter-report.txt" IPV6_TEST_FAIL_SYSCTL_AFTER="$fail_after" IPV6_TEST_FAIL_SYSCTL_KEY="$fail_key" IPV6_TEST_EXPECT_FAILURE="$([[ "$fail_after" -gt 0 || -n "$fail_key" ]] && printf 1 || printf 0)" bash -c '
                 source "$1/harden.sh"; trap - ERR EXIT
                 MODE=apply; AGGRESSIVE=1; DISABLE_IPV6="$3"; BACKUP_DIR="$2/backup"; CHANGE_LOG="$2/changes.tsv"
                 mkdir -p "$BACKUP_DIR"; : > "$CHANGE_LOG"
@@ -1799,7 +1809,7 @@ EOF
         || fail "normal non-forwarding host did not persist source-route=-1 and forwarding=0"
 
     run_ipv6_apply "$ipv6_apply" 1 || fail "explicit IPv6 disable failed"
-    for key in all default lo eth0 tailscale0; do
+    for key in all default lo eth0 tailscale0 down0; do
         [[ "$(cat "$ipv6_apply/proc/sys/net/ipv6/conf/$key/disable_ipv6")" == 1 ]] \
             || fail "explicit IPv6 disable did not set ${key}"
     done
@@ -1808,7 +1818,7 @@ EOF
     run_ipv6_apply "$ipv6_apply" 0 || fail "preserved IPv6 disable follow-up failed"
     grep -Fq 'previous explicit tool-managed IPv6 disable is retained' "$ipv6_apply/ipv6-report.txt" \
         || fail "normal follow-up did not report preserved IPv6 disable"
-    for key in all default lo eth0 tailscale0; do
+    for key in all default lo eth0 tailscale0 down0; do
         [[ "$(cat "$ipv6_apply/proc/sys/net/ipv6/conf/$key/disable_ipv6")" == 1 ]] \
             || fail "normal follow-up unexpectedly re-enabled ${key}"
     done
@@ -1825,6 +1835,32 @@ EOF
             [[ "$IPV6_POLICY" == enabled-safety-blocked && "$IPV6_REASON" == *ipv6-forwarding-active* ]]
         ' _ "$repo_root" || fail "active interface IPv6 forwarding did not block disable"
 
+    local ipv6_down_forwarding="$case_root/down-interface-forwarding"
+    make_ipv6_tree "$ipv6_down_forwarding/proc/sys"
+    printf '1\n' > "$ipv6_down_forwarding/proc/sys/net/ipv6/conf/down0/forwarding"
+    : > "$ipv6_down_forwarding/99-security-hardening.conf"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_PROC_SYS_ROOT="$ipv6_down_forwarding/proc/sys" \
+        HARDEN_SYSCTL_CONFIG="$ipv6_down_forwarding/99-security-hardening.conf" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; AGGRESSIVE=1; DISABLE_IPV6=1; log() { :; }; record_skip() { :; }
+            detect_ipv6_policy "$HARDEN_SYSCTL_CONFIG"
+            [[ "$IPV6_POLICY" == enabled-safety-blocked && "$IPV6_REASON" == *ipv6-forwarding-active* ]]
+        ' _ "$repo_root" || fail "DOWN interface IPv6 forwarding did not block disable"
+
+    local ipv6_force_forwarding="$case_root/down-interface-force-forwarding"
+    make_ipv6_tree "$ipv6_force_forwarding/proc/sys"
+    printf '0\n' > "$ipv6_force_forwarding/proc/sys/net/ipv6/conf/all/force_forwarding"
+    printf '0\n' > "$ipv6_force_forwarding/proc/sys/net/ipv6/conf/default/force_forwarding"
+    printf '1\n' > "$ipv6_force_forwarding/proc/sys/net/ipv6/conf/down0/force_forwarding"
+    : > "$ipv6_force_forwarding/99-security-hardening.conf"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_PROC_SYS_ROOT="$ipv6_force_forwarding/proc/sys" \
+        HARDEN_SYSCTL_CONFIG="$ipv6_force_forwarding/99-security-hardening.conf" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; AGGRESSIVE=1; DISABLE_IPV6=1; log() { :; }; record_skip() { :; }
+            detect_ipv6_policy "$HARDEN_SYSCTL_CONFIG"
+            [[ "$IPV6_POLICY" == enabled-safety-blocked && "$IPV6_REASON" == *ipv6-forwarding-active* ]]
+        ' _ "$repo_root" || fail "DOWN interface IPv6 force_forwarding did not block disable"
+
     local ipv6_rollback="$case_root/rollback"
     make_ipv6_tree "$ipv6_rollback/proc/sys"
     printf '0\n' > "$ipv6_rollback/proc/sys/net/ipv6/conf/all/disable_ipv6"
@@ -1832,16 +1868,44 @@ EOF
     printf '0\n' > "$ipv6_rollback/proc/sys/net/ipv6/conf/lo/disable_ipv6"
     printf '1\n' > "$ipv6_rollback/proc/sys/net/ipv6/conf/eth0/disable_ipv6"
     printf '0\n' > "$ipv6_rollback/proc/sys/net/ipv6/conf/tailscale0/disable_ipv6"
+    printf '1\n' > "$ipv6_rollback/proc/sys/net/ipv6/conf/down0/disable_ipv6"
     printf 'old-config\n' > "$ipv6_rollback/99-security-hardening.conf"
-    run_ipv6_apply "$ipv6_rollback" 1 2 && fail "partial IPv6 sysctl reload unexpectedly succeeded"
+    run_ipv6_apply "$ipv6_rollback" 1 0 net.ipv6.conf.all.disable_ipv6 && fail "partial IPv6 sysctl reload unexpectedly succeeded"
     [[ "$(cat "$ipv6_rollback/proc/sys/net/ipv6/conf/all/disable_ipv6")" == 0 \
         && "$(cat "$ipv6_rollback/proc/sys/net/ipv6/conf/default/disable_ipv6")" == 1 \
         && "$(cat "$ipv6_rollback/proc/sys/net/ipv6/conf/lo/disable_ipv6")" == 0 \
         && "$(cat "$ipv6_rollback/proc/sys/net/ipv6/conf/eth0/disable_ipv6")" == 1 \
-        && "$(cat "$ipv6_rollback/proc/sys/net/ipv6/conf/tailscale0/disable_ipv6")" == 0 ]] \
+        && "$(cat "$ipv6_rollback/proc/sys/net/ipv6/conf/tailscale0/disable_ipv6")" == 0 \
+        && "$(cat "$ipv6_rollback/proc/sys/net/ipv6/conf/down0/disable_ipv6")" == 1 ]] \
         || fail "partial IPv6 sysctl reload did not restore exact runtime values"
     grep -Fxq old-config "$ipv6_rollback/99-security-hardening.conf" \
         || fail "partial IPv6 sysctl reload did not restore previous config"
+
+    local ipv6_preserved_failure="$case_root/preserved-disable-failure"
+    make_ipv6_tree "$ipv6_preserved_failure/proc/sys"
+    cat > "$ipv6_preserved_failure/99-security-hardening.conf" <<'EOF'
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+net.ipv6.conf.eth0.disable_ipv6 = 1
+net.ipv6.conf.tailscale0.disable_ipv6 = 1
+net.ipv6.conf.down0.disable_ipv6 = 1
+EOF
+    printf '0\n' > "$ipv6_preserved_failure/proc/sys/net/ipv6/conf/all/disable_ipv6"
+    printf '1\n' > "$ipv6_preserved_failure/proc/sys/net/ipv6/conf/default/disable_ipv6"
+    printf '0\n' > "$ipv6_preserved_failure/proc/sys/net/ipv6/conf/lo/disable_ipv6"
+    printf '1\n' > "$ipv6_preserved_failure/proc/sys/net/ipv6/conf/eth0/disable_ipv6"
+    printf '0\n' > "$ipv6_preserved_failure/proc/sys/net/ipv6/conf/tailscale0/disable_ipv6"
+    printf '1\n' > "$ipv6_preserved_failure/proc/sys/net/ipv6/conf/down0/disable_ipv6"
+    run_ipv6_apply "$ipv6_preserved_failure" 0 0 net.ipv6.conf.all.disable_ipv6 \
+        && fail "preserved IPv6 disable reload failure unexpectedly succeeded"
+    [[ "$(cat "$ipv6_preserved_failure/proc/sys/net/ipv6/conf/all/disable_ipv6")" == 0 \
+        && "$(cat "$ipv6_preserved_failure/proc/sys/net/ipv6/conf/default/disable_ipv6")" == 1 \
+        && "$(cat "$ipv6_preserved_failure/proc/sys/net/ipv6/conf/lo/disable_ipv6")" == 0 \
+        && "$(cat "$ipv6_preserved_failure/proc/sys/net/ipv6/conf/eth0/disable_ipv6")" == 1 \
+        && "$(cat "$ipv6_preserved_failure/proc/sys/net/ipv6/conf/tailscale0/disable_ipv6")" == 0 \
+        && "$(cat "$ipv6_preserved_failure/proc/sys/net/ipv6/conf/down0/disable_ipv6")" == 1 ]] \
+        || fail "preserved IPv6 disable reload failure did not restore exact pre-run runtime values"
 
     local banner_root="$case_root/banner" issue issue_net
     issue="$banner_root/issue"
