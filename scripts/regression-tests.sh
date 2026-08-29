@@ -1552,6 +1552,110 @@ EOF
     [[ ! -e "$dry_btmp" && ! -e "$dry_profile" ]] || fail "login timeout dry-run wrote managed state"
 }
 
+run_uefi_mor_tests() {
+    local case_root="$test_root/uefi-mor"
+    install -d "$case_root"
+    run_mor_case() {
+        local name="$1" expected="$2" efi_dir vars_dir
+        efi_dir="$case_root/$name/efi"
+        vars_dir="$case_root/$name/efivars"
+        install -d "$(dirname -- "$efi_dir")"
+        env HARDEN_SOURCE_ONLY=1 HARDEN_EFI_SYSFS="$efi_dir" HARDEN_EFIVARS_DIR="$vars_dir" \
+            HARDEN_EFIVARS_FSTYPE=efivarfs HARDEN_UEFI_MOR_REPORT="$case_root/$name/report.txt" bash -c '
+                source "$1/harden.sh"; trap - ERR EXIT
+                MODE=apply; log() { :; }; record_change() { :; }; record_skip() { :; }
+                inspect_uefi_mor
+                [[ "$UEFI_MOR_STATUS" == "$2"* ]]
+                grep -Fq "write-behavior=detection-only" "$HARDEN_UEFI_MOR_REPORT"
+            ' _ "$repo_root" "$expected" || fail "UEFI MOR ${name} classification failed"
+    }
+
+    run_mor_case legacy-bios 'NOT_APPLICABLE (no UEFI runtime)'
+    install -d "$case_root/uefi-no-efivarfs/efi"
+    env HARDEN_SOURCE_ONLY=1 HARDEN_EFI_SYSFS="$case_root/uefi-no-efivarfs/efi" \
+        HARDEN_EFIVARS_DIR="$case_root/uefi-no-efivarfs/efivars" HARDEN_EFIVARS_FSTYPE=tmpfs \
+        HARDEN_UEFI_MOR_REPORT="$case_root/uefi-no-efivarfs/report.txt" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; log() { :; }; record_change() { :; }; record_skip() { :; }
+            inspect_uefi_mor
+            [[ "$UEFI_MOR_STATUS" == "FAILED-TO-INSPECT (UEFI runtime variable access unavailable)" ]]
+            grep -Fq "MOR support cannot be determined" "$HARDEN_UEFI_MOR_REPORT"
+        ' _ "$repo_root" || fail "UEFI without efivarfs was not classified as unavailable runtime access"
+
+    install -d "$case_root/mor-absent/efi" "$case_root/mor-absent/efivars"
+    run_mor_case mor-absent 'UNSUPPORTED (firmware does not expose MOR variables)'
+
+    local mor_name='MemoryOverwriteRequestControl-e20939be-32d4-41be-a150-897f85d49829'
+    local lock_name='MemoryOverwriteRequestControlLock-bb983ccf-151d-40e1-a07b-4a17be168292'
+    install -d "$case_root/mor-inactive/efi" "$case_root/mor-inactive/efivars"
+    printf '\007\000\000\000\000' > "$case_root/mor-inactive/efivars/$mor_name"
+    run_mor_case mor-inactive 'SUPPORTED_INACTIVE (MOR=0; lock=absent)'
+    grep -Fxq 'mor-attributes=0x00000007' "$case_root/mor-inactive/report.txt" \
+        || fail "valid MOR control attributes were not reported"
+    install -d "$case_root/mor-active/efi" "$case_root/mor-active/efivars"
+    printf '\007\000\000\000\001' > "$case_root/mor-active/efivars/$mor_name"
+    run_mor_case mor-active 'SUPPORTED_ACTIVE (MOR=1; lock=absent)'
+    install -d "$case_root/mor-inactive-autodetect-disabled/efi" "$case_root/mor-inactive-autodetect-disabled/efivars"
+    printf '\007\000\000\000\020' > "$case_root/mor-inactive-autodetect-disabled/efivars/$mor_name"
+    run_mor_case mor-inactive-autodetect-disabled 'SUPPORTED_INACTIVE (MOR=16; lock=absent)'
+    install -d "$case_root/mor-active-autodetect-disabled/efi" "$case_root/mor-active-autodetect-disabled/efivars"
+    printf '\007\000\000\000\021' > "$case_root/mor-active-autodetect-disabled/efivars/$mor_name"
+    run_mor_case mor-active-autodetect-disabled 'SUPPORTED_ACTIVE (MOR=17; lock=absent)'
+    install -d "$case_root/mor-locked/efi" "$case_root/mor-locked/efivars"
+    printf '\007\000\000\000\001' > "$case_root/mor-locked/efivars/$mor_name"
+    printf '\007\000\000\000\001' > "$case_root/mor-locked/efivars/$lock_name"
+    run_mor_case mor-locked 'LOCKED/firmware-controlled (MOR=1; lock=1)'
+    grep -Fxq 'mor-lock-attributes=0x00000007' "$case_root/mor-locked/report.txt" \
+        || fail "valid MOR lock attributes were not reported"
+    install -d "$case_root/mor-malformed/efi" "$case_root/mor-malformed/efivars"
+    printf '\007\000\000\000' > "$case_root/mor-malformed/efivars/$mor_name"
+    run_mor_case mor-malformed 'FAILED-TO-INSPECT (malformed or unreadable MOR control attributes)'
+    install -d "$case_root/mor-invalid-control-attributes/efi" "$case_root/mor-invalid-control-attributes/efivars"
+    printf '\006\000\000\000\001' > "$case_root/mor-invalid-control-attributes/efivars/$mor_name"
+    run_mor_case mor-invalid-control-attributes 'FAILED-TO-INSPECT (unexpected MOR control attributes 0x00000006)'
+    install -d "$case_root/mor-invalid-lock-attributes/efi" "$case_root/mor-invalid-lock-attributes/efivars"
+    printf '\007\000\000\000\000' > "$case_root/mor-invalid-lock-attributes/efivars/$mor_name"
+    printf '\006\000\000\000\001' > "$case_root/mor-invalid-lock-attributes/efivars/$lock_name"
+    run_mor_case mor-invalid-lock-attributes 'FAILED-TO-INSPECT (unexpected MOR lock attributes 0x00000006)'
+    install -d "$case_root/mor-reserved-bits/efi" "$case_root/mor-reserved-bits/efivars"
+    printf '\007\000\000\000\002' > "$case_root/mor-reserved-bits/efivars/$mor_name"
+    run_mor_case mor-reserved-bits 'FAILED-TO-INSPECT (MOR control uses reserved bits)'
+    install -d "$case_root/mor-invalid-lock/efi" "$case_root/mor-invalid-lock/efivars"
+    printf '\007\000\000\000\000' > "$case_root/mor-invalid-lock/efivars/$mor_name"
+    printf '\007\000\000\000\003' > "$case_root/mor-invalid-lock/efivars/$lock_name"
+    run_mor_case mor-invalid-lock 'FAILED-TO-INSPECT (MOR lock has an unknown value)'
+    install -d "$case_root/mor-unreadable/efi" "$case_root/mor-unreadable/efivars"
+    printf '\007\000\000\000\001' > "$case_root/mor-unreadable/efivars/$mor_name"
+    env HARDEN_SOURCE_ONLY=1 HARDEN_EFI_SYSFS="$case_root/mor-unreadable/efi" \
+        HARDEN_EFIVARS_DIR="$case_root/mor-unreadable/efivars" HARDEN_EFIVARS_FSTYPE=efivarfs \
+        HARDEN_UEFI_MOR_REPORT="$case_root/mor-unreadable/report.txt" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; log() { :; }; record_change() { :; }; record_skip() { :; }
+            read_efivar_attributes() { return 1; }
+            inspect_uefi_mor
+            [[ "$UEFI_MOR_STATUS" == "FAILED-TO-INSPECT (malformed or unreadable MOR control attributes)" ]]
+        ' _ "$repo_root" || fail "UEFI MOR unreadable control attributes were not handled safely"
+
+    local dry_root="$case_root/dry-run"
+    install -d "$dry_root/efi" "$dry_root/efivars"
+    printf '\007\000\000\000\001' > "$dry_root/efivars/$mor_name"
+    local before_hash
+    before_hash="$(sha256sum "$dry_root/efivars/$mor_name")"
+    env HARDEN_SOURCE_ONLY=1 HARDEN_EFI_SYSFS="$dry_root/efi" HARDEN_EFIVARS_DIR="$dry_root/efivars" \
+        HARDEN_EFIVARS_FSTYPE=efivarfs HARDEN_UEFI_MOR_REPORT="$dry_root/report.txt" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=dry-run; log() { :; }; record_change() { :; }; record_skip() { :; }
+            inspect_uefi_mor; [[ "$UEFI_MOR_STATUS" == "SUPPORTED_ACTIVE"* ]]
+            [[ ! -e "$HARDEN_UEFI_MOR_REPORT" ]]
+        ' _ "$repo_root" || fail "UEFI MOR dry-run wrote a report or changed classification"
+    [[ "$before_hash" == "$(sha256sum "$dry_root/efivars/$mor_name")" ]] \
+        || fail "UEFI MOR dry-run wrote an EFI variable"
+    ! grep -Eq '(>|>>)[[:space:]]*"?\$?(mor_path|lock_path|efivars_dir)' "$repo_root/harden.sh" \
+        || fail "UEFI MOR implementation redirects output to an EFI variable path"
+    ! grep -Eq '\b(rm|dd|tee|install|cp|mv)\b.*\$?(mor_path|lock_path|efivars_dir)' "$repo_root/harden.sh" \
+        || fail "UEFI MOR implementation contains an EFI-variable mutation command"
+}
+
 run_iowait_tests() {
     local case_root="$test_root/iowait" mock_bin="$test_root/iowait/bin" count="$test_root/iowait/count"
     install -d "$mock_bin"
@@ -1998,6 +2102,9 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
     login-timeout)
         run_login_timeout_tests
         ;;
+    uefi-mor)
+        run_uefi_mor_tests
+        ;;
     new-findings)
         run_lynis_summary_tests
         run_fail2ban_tests
@@ -2008,6 +2115,7 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
         run_runtime_noop_tests
         run_deleted_open_tests
         run_login_timeout_tests
+        run_uefi_mor_tests
         run_rp_filter_tests
         run_iowait_tests
         ;;
@@ -2024,6 +2132,7 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
         run_runtime_noop_tests
         run_deleted_open_tests
         run_login_timeout_tests
+        run_uefi_mor_tests
         run_rp_filter_tests
         run_iowait_tests
         ;;

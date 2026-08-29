@@ -166,6 +166,41 @@ müssen unverändert bleiben. Das Projekt verwendet ausschließlich metadata-onl
 capture; ein btmp-Inhalts-Restore oder -Rollback findet nicht statt. SSH-Remote-Kommandos dürfen weiterhin nicht durch
 `TMOUT` beeinflusst werden.
 
+### Ubuntu-26.04.1-Retest UEFI Memory Overwrite Request (#8)
+
+Der MOR-Pfad ist bewusst rein lesend. Die TCG-Spezifikation definiert
+`MemoryOverwriteRequestControl` und dessen Lock als von der Firmware
+bereitgestellte Variablen; Linux `efivarfs` erlaubt grundsätzlich auch
+Änderungen. Deshalb erzeugt, löscht oder überschreibt dieses Tool keine
+EFI-Variable. Starte den Apply direkt, ohne externe Pipe, und prüfe nur den
+Inspektionsbericht:
+
+Technische Grundlage: [TCG PC Client Platform Reset Attack Mitigation
+Specification](https://trustedcomputinggroup.org/wp-content/uploads/TCG-PC-Client-Platform-Reset-Attack-Mitigation-Specification-Version-1.2-Revision-10_1April24.pdf)
+und die [Linux-efivarfs-Dokumentation](https://docs.kernel.org/filesystems/efivarfs.html).
+
+```bash
+sudo ./harden.sh --apply --aggressive
+sudo cat /root/uefi-mor-report.txt
+test -d /sys/firmware/efi && stat -f -c '%T' /sys/firmware/efi/efivars || true
+sudo ./harden.sh --apply --aggressive
+```
+
+Auf dem aktuellen Ubuntu-26.04.1-Zielsystem darf `UEFI MOR` nur dann als
+`UNSUPPORTED` erscheinen, wenn `efivarfs` verfügbar ist und weder die
+standardisierte Control- noch die Lock-Variable exponiert wird. Meldet Lynis
+weiterhin `MOR variable not found [ WEAK ]`, ist dies dann ein Firmware-/
+Plattformlimit, kein Skriptfehler und wird nicht zur Score-Manipulation
+verborgen. Bei vorhandenem UEFI ohne verfügbare `efivarfs`-Runtime muss der
+Bericht stattdessen `FAILED-TO-INSPECT` mit dem Hinweis ausgeben, dass der MOR-
+Support nicht bestimmt werden kann. Control und Lock müssen jeweils die
+Attribute `0x00000007` ausweisen. Sichere bei UEFI-Systemen den Bericht sowie
+die unveränderten vorhandenen Variablen-Listings; führe keinerlei manuelle
+`echo`, `dd` oder Dateischreiboperation unter `efivars` aus. Wenn die Firmware
+MOR bereitstellt, muss der Bericht `SUPPORTED_ACTIVE`, `SUPPORTED_INACTIVE`
+oder bei dokumentiertem Lock `LOCKED/firmware-controlled` ausweisen; der
+Zweitlauf bleibt dabei ein No-op.
+
 Für die Findings #4, #12, #17, #18, #19 und #20 zusätzlich prüfen:
 
 - `aide-lynis-FINT-4402-evidence.txt`, AIDE-Konfigurationsprüfung,

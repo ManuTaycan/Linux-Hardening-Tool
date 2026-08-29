@@ -89,6 +89,8 @@ RP_FILTER_RUNTIME_STATUS="NOT RUN"
 RP_FILTER_PERSISTED_CURRENT_VALUES="no"
 DELETED_OPEN_FILES_STATUS="NOT RUN"
 DELETED_OPEN_FILES_REPORT="/root/deleted-open-files-report.txt"
+UEFI_MOR_STATUS="NOT RUN"
+UEFI_MOR_REPORT="${HARDEN_UEFI_MOR_REPORT:-/root/uefi-mor-report.txt}"
 
 readonly COLOR_RESET=$'\033[0m'
 readonly COLOR_DIM=$'\033[2m'
@@ -4250,6 +4252,124 @@ EOF
     fi
 }
 
+efivarfs_is_available() {
+    local efivars_dir="$1" filesystem_type="${HARDEN_EFIVARS_FSTYPE:-}"
+    [[ -d "$efivars_dir" ]] || return 1
+    if [[ -z "$filesystem_type" ]]; then
+        filesystem_type="$(stat -f -c '%T' "$efivars_dir" 2>/dev/null || true)"
+    fi
+    [[ "$filesystem_type" == efivarfs ]]
+}
+
+efivar_file_is_readable_u8() {
+    local variable_path="$1" size
+    [[ -f "$variable_path" && ! -L "$variable_path" && -r "$variable_path" ]] || return 1
+    size="$(stat -c '%s' "$variable_path" 2>/dev/null || true)"
+    [[ "$size" == 5 ]] || return 1
+}
+
+read_efivar_attributes() {
+    local variable_path="$1" bytes byte0 byte1 byte2 byte3 attributes IFS=$' \t\n'
+    efivar_file_is_readable_u8 "$variable_path" || return 1
+    bytes="$(od -An -v -t u1 -N 4 "$variable_path" 2>/dev/null || true)"
+    read -r byte0 byte1 byte2 byte3 <<< "$bytes"
+    [[ "$byte0" =~ ^[0-9]+$ && "$byte1" =~ ^[0-9]+$ && "$byte2" =~ ^[0-9]+$ && "$byte3" =~ ^[0-9]+$ ]] || return 1
+    (( byte0 <= 255 && byte1 <= 255 && byte2 <= 255 && byte3 <= 255 )) || return 1
+    attributes=$((byte0 | (byte1 << 8) | (byte2 << 16) | (byte3 << 24)))
+    printf '0x%08x\n' "$attributes"
+}
+
+read_efivar_u8() {
+    local variable_path="$1" value
+    efivar_file_is_readable_u8 "$variable_path" || return 1
+    value="$(od -An -v -t u1 -j 4 -N 1 "$variable_path" 2>/dev/null | tr -d '[:space:]')"
+    [[ "$value" =~ ^[0-9]+$ && "$value" -le 255 ]] || return 1
+    printf '%s\n' "$value"
+}
+
+inspect_uefi_mor() {
+    local efi_sysfs="${HARDEN_EFI_SYSFS:-/sys/firmware/efi}"
+    local efivars_dir="${HARDEN_EFIVARS_DIR:-/sys/firmware/efi/efivars}"
+    local mor_name='MemoryOverwriteRequestControl-e20939be-32d4-41be-a150-897f85d49829'
+    local lock_name='MemoryOverwriteRequestControlLock-bb983ccf-151d-40e1-a07b-4a17be168292'
+    local mor_path="${efivars_dir}/${mor_name}" lock_path="${efivars_dir}/${lock_name}"
+    local mor_value="" lock_value="" mor_attributes="" lock_attributes="" detail=""
+
+    if [[ ! -d "$efi_sysfs" ]]; then
+        UEFI_MOR_STATUS="NOT_APPLICABLE (no UEFI runtime)"
+        detail="No /sys/firmware/efi runtime interface is present."
+    elif ! efivarfs_is_available "$efivars_dir"; then
+        UEFI_MOR_STATUS="FAILED-TO-INSPECT (UEFI runtime variable access unavailable)"
+        detail="UEFI is present but efivarfs is unavailable or not mounted; MOR support cannot be determined."
+    elif [[ ! -e "$mor_path" && ! -e "$lock_path" ]]; then
+        UEFI_MOR_STATUS="UNSUPPORTED (firmware does not expose MOR variables)"
+        detail="Neither standardized MOR control nor MOR lock variable is exposed by firmware."
+    elif [[ ! -e "$mor_path" ]]; then
+        UEFI_MOR_STATUS="FAILED-TO-INSPECT (MOR control missing while related state exists)"
+        detail="Firmware exposes incomplete MOR state; no variable was created or changed."
+    elif ! mor_attributes="$(read_efivar_attributes "$mor_path")"; then
+        UEFI_MOR_STATUS="FAILED-TO-INSPECT (malformed or unreadable MOR control attributes)"
+        detail="The existing MOR control did not have a readable five-byte efivarfs header."
+    elif [[ "$mor_attributes" != "0x00000007" ]]; then
+        UEFI_MOR_STATUS="FAILED-TO-INSPECT (unexpected MOR control attributes ${mor_attributes})"
+        detail="TCG requires NON_VOLATILE|BOOTSERVICE_ACCESS|RUNTIME_ACCESS (0x00000007)."
+    elif ! mor_value="$(read_efivar_u8 "$mor_path")"; then
+        UEFI_MOR_STATUS="FAILED-TO-INSPECT (malformed or unreadable MOR control)"
+        detail="The existing MOR control variable was not a readable five-byte efivarfs value."
+    elif (( mor_value & 0xee )); then
+        UEFI_MOR_STATUS="FAILED-TO-INSPECT (MOR control uses reserved bits)"
+        detail="The existing MOR control value is outside the TCG-defined bit layout; no variable was changed."
+    elif [[ -e "$lock_path" ]] && ! lock_attributes="$(read_efivar_attributes "$lock_path")"; then
+        UEFI_MOR_STATUS="FAILED-TO-INSPECT (malformed or unreadable MOR lock attributes)"
+        detail="The existing MOR lock did not have a readable five-byte efivarfs header."
+    elif [[ -e "$lock_path" && "$lock_attributes" != "0x00000007" ]]; then
+        UEFI_MOR_STATUS="FAILED-TO-INSPECT (unexpected MOR lock attributes ${lock_attributes})"
+        detail="TCG requires NON_VOLATILE|BOOTSERVICE_ACCESS|RUNTIME_ACCESS (0x00000007)."
+    elif [[ -e "$lock_path" ]] && ! lock_value="$(read_efivar_u8 "$lock_path")"; then
+        UEFI_MOR_STATUS="FAILED-TO-INSPECT (malformed or unreadable MOR lock)"
+        detail="The existing MOR lock variable could not be safely classified."
+    elif [[ -n "$lock_value" && "$lock_value" != 0 && "$lock_value" != 1 && "$lock_value" != 2 ]]; then
+        UEFI_MOR_STATUS="FAILED-TO-INSPECT (MOR lock has an unknown value)"
+        detail="The existing MOR lock value is outside the TCG-defined states; no variable was changed."
+    elif [[ "$lock_value" == 1 || "$lock_value" == 2 ]]; then
+        UEFI_MOR_STATUS="LOCKED/firmware-controlled (MOR=${mor_value}; lock=${lock_value})"
+        detail="Firmware reports MOR control locked; detection only, with no OS-side write."
+    elif (( mor_value & 1 )); then
+        UEFI_MOR_STATUS="SUPPORTED_ACTIVE (MOR=${mor_value}; lock=${lock_value:-absent})"
+        detail="Firmware exposes an active MOR request. It is not made persistent or changed by harden.sh."
+    else
+        UEFI_MOR_STATUS="SUPPORTED_INACTIVE (MOR=${mor_value}; lock=${lock_value:-absent})"
+        detail="Firmware exposes an inactive MOR request. No raw efivarfs write is safe or needed here."
+    fi
+
+    if [[ "$MODE" == "apply" ]]; then
+        {
+            printf 'UEFI Memory Overwrite Request inspection at %s\n\n' "$(timestamp)"
+            printf 'status=%s\n' "$UEFI_MOR_STATUS"
+            printf 'efi-runtime=%s\n' "$efi_sysfs"
+            printf 'efivarfs=%s\n' "$efivars_dir"
+            printf 'mor-variable=%s\n' "$mor_path"
+            printf 'mor-attributes=%s\n' "${mor_attributes:-not-read}"
+            printf 'mor-value=%s\n' "${mor_value:-not-read}"
+            printf 'mor-lock-variable=%s\n' "$lock_path"
+            printf 'mor-lock-attributes=%s\n' "${lock_attributes:-absent-or-not-read}"
+            printf 'mor-lock-value=%s\n' "${lock_value:-absent-or-not-read}"
+            printf 'write-behavior=detection-only; no EFI variable was created, modified, or deleted\n'
+            printf 'detail=%s\n' "$detail"
+        } > "$UEFI_MOR_REPORT"
+        chmod 0600 "$UEFI_MOR_REPORT"
+    else
+        log INFO "Would inspect UEFI MOR/MOR-Lock support read-only; no EFI variable would be written"
+    fi
+    if [[ "$UEFI_MOR_STATUS" == UNSUPPORTED* || "$UEFI_MOR_STATUS" == NOT_APPLICABLE* ]]; then
+        record_skip "MOR" "${UEFI_MOR_STATUS}; platform/firmware limitation, not a hardening failure"
+    elif [[ "$UEFI_MOR_STATUS" == FAILED-TO-INSPECT* ]]; then
+        record_skip "MOR" "${UEFI_MOR_STATUS}; no raw efivarfs write was attempted"
+    else
+        log INFO "UEFI MOR inspection completed detection-only: ${UEFI_MOR_STATUS}"
+    fi
+}
+
 compiler_command_path() {
     command -v "$1" 2>/dev/null || true
 }
@@ -5334,6 +5454,14 @@ write_open_findings_report() {
     fi
     local lynis_report=/root/lynis-after-hardening.txt
     local output=/root/hardening-open-findings.txt
+    local mor_finding
+    if [[ "$UEFI_MOR_STATUS" == UNSUPPORTED* ]]; then
+        mor_finding="- UEFI MOR: ${UEFI_MOR_STATUS}. This is a firmware/platform limitation; harden.sh does not create or raw-write EFI variables."
+    elif [[ "$UEFI_MOR_STATUS" == FAILED-TO-INSPECT* ]]; then
+        mor_finding="- UEFI MOR: ${UEFI_MOR_STATUS}. MOR support cannot be determined because the existing runtime-variable state was not safely inspectable; no EFI variable was changed."
+    else
+        mor_finding="- UEFI MOR: ${UEFI_MOR_STATUS}. harden.sh performs detection only and does not create or raw-write EFI variables."
+    fi
     {
         printf 'Remaining Lynis findings after hardening\n'
         printf 'Generated: %s\n' "$(timestamp)"
@@ -5372,7 +5500,8 @@ write_open_findings_report() {
             '- DEB-0810: apt-listbugs is Debian-oriented and is not forced onto Ubuntu.' \
             '- AUTH-9230: legacy SHA rounds are not added when YESCRYPT is the effective password hash method.' \
             '- NAME-4028: an organization/domain-dependent DNS identity is not invented.' \
-            '- AUTH-9282: no fixed account expiration is imposed without an explicit owner decision.'
+            '- AUTH-9282: no fixed account expiration is imposed without an explicit owner decision.' \
+            "$mor_finding"
         if systemctl is-active --quiet tailscaled.service 2>/dev/null; then
             printf '%s\n' "- KRNL-6000/rp_filter: ${RP_FILTER_POLICY}; ${RP_FILTER_REASON}. This is an accepted routing policy, not a Lynis score change."
         elif [[ "$RP_FILTER_POLICY" == preserved-uncertain-routing ]]; then
@@ -5427,6 +5556,8 @@ rp_filter Runtime  : ${RP_FILTER_RUNTIME_STATUS}
 rp_filter Report   : $([[ "$MODE" == "apply" ]] && printf '%s' "${HARDEN_RP_FILTER_REPORT:-/root/tailscale-rp-filter-report.txt}" || printf 'not written in dry-run')
 Deleted open files : ${DELETED_OPEN_FILES_STATUS}
 Deleted-file report: $([[ "$MODE" == "apply" ]] && printf '%s' "${HARDEN_DELETED_OPEN_REPORT:-$DELETED_OPEN_FILES_REPORT}" || printf 'not written in dry-run')
+UEFI MOR           : ${UEFI_MOR_STATUS}
+UEFI MOR report    : $([[ "$MODE" == "apply" ]] && printf '%s' "$UEFI_MOR_REPORT" || printf 'not written in dry-run')
 
 Lynis Score Before : ${LYNIS_BEFORE}
 Lynis Score After  : ${LYNIS_AFTER}
@@ -5532,6 +5663,7 @@ main() {
     configure_time_sync
     disable_unneeded_services
     configure_bootloader
+    inspect_uefi_mor
     restrict_compilers
     configure_malware_scanner
     harden_systemd_services
