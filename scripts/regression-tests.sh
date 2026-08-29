@@ -1577,8 +1577,10 @@ run_uefi_mor_tests() {
         HARDEN_UEFI_MOR_REPORT="$case_root/uefi-no-efivarfs/report.txt" bash -c '
             source "$1/harden.sh"; trap - ERR EXIT
             MODE=apply; log() { :; }; record_change() { :; }; record_skip() { :; }
-            inspect_uefi_mor; [[ "$UEFI_MOR_STATUS" == "NOT_APPLICABLE (UEFI without efivarfs)" ]]
-        ' _ "$repo_root" || fail "UEFI without efivarfs was not classified NOT_APPLICABLE"
+            inspect_uefi_mor
+            [[ "$UEFI_MOR_STATUS" == "FAILED-TO-INSPECT (UEFI runtime variable access unavailable)" ]]
+            grep -Fq "MOR support cannot be determined" "$HARDEN_UEFI_MOR_REPORT"
+        ' _ "$repo_root" || fail "UEFI without efivarfs was not classified as unavailable runtime access"
 
     install -d "$case_root/mor-absent/efi" "$case_root/mor-absent/efivars"
     run_mor_case mor-absent 'UNSUPPORTED (firmware does not expose MOR variables)'
@@ -1588,16 +1590,33 @@ run_uefi_mor_tests() {
     install -d "$case_root/mor-inactive/efi" "$case_root/mor-inactive/efivars"
     printf '\007\000\000\000\000' > "$case_root/mor-inactive/efivars/$mor_name"
     run_mor_case mor-inactive 'SUPPORTED_INACTIVE (MOR=0; lock=absent)'
+    grep -Fxq 'mor-attributes=0x00000007' "$case_root/mor-inactive/report.txt" \
+        || fail "valid MOR control attributes were not reported"
     install -d "$case_root/mor-active/efi" "$case_root/mor-active/efivars"
     printf '\007\000\000\000\001' > "$case_root/mor-active/efivars/$mor_name"
     run_mor_case mor-active 'SUPPORTED_ACTIVE (MOR=1; lock=absent)'
+    install -d "$case_root/mor-inactive-autodetect-disabled/efi" "$case_root/mor-inactive-autodetect-disabled/efivars"
+    printf '\007\000\000\000\020' > "$case_root/mor-inactive-autodetect-disabled/efivars/$mor_name"
+    run_mor_case mor-inactive-autodetect-disabled 'SUPPORTED_INACTIVE (MOR=16; lock=absent)'
+    install -d "$case_root/mor-active-autodetect-disabled/efi" "$case_root/mor-active-autodetect-disabled/efivars"
+    printf '\007\000\000\000\021' > "$case_root/mor-active-autodetect-disabled/efivars/$mor_name"
+    run_mor_case mor-active-autodetect-disabled 'SUPPORTED_ACTIVE (MOR=17; lock=absent)'
     install -d "$case_root/mor-locked/efi" "$case_root/mor-locked/efivars"
     printf '\007\000\000\000\001' > "$case_root/mor-locked/efivars/$mor_name"
     printf '\007\000\000\000\001' > "$case_root/mor-locked/efivars/$lock_name"
     run_mor_case mor-locked 'LOCKED/firmware-controlled (MOR=1; lock=1)'
+    grep -Fxq 'mor-lock-attributes=0x00000007' "$case_root/mor-locked/report.txt" \
+        || fail "valid MOR lock attributes were not reported"
     install -d "$case_root/mor-malformed/efi" "$case_root/mor-malformed/efivars"
     printf '\007\000\000\000' > "$case_root/mor-malformed/efivars/$mor_name"
-    run_mor_case mor-malformed 'FAILED-TO-INSPECT (malformed or unreadable MOR control)'
+    run_mor_case mor-malformed 'FAILED-TO-INSPECT (malformed or unreadable MOR control attributes)'
+    install -d "$case_root/mor-invalid-control-attributes/efi" "$case_root/mor-invalid-control-attributes/efivars"
+    printf '\006\000\000\000\001' > "$case_root/mor-invalid-control-attributes/efivars/$mor_name"
+    run_mor_case mor-invalid-control-attributes 'FAILED-TO-INSPECT (unexpected MOR control attributes 0x00000006)'
+    install -d "$case_root/mor-invalid-lock-attributes/efi" "$case_root/mor-invalid-lock-attributes/efivars"
+    printf '\007\000\000\000\000' > "$case_root/mor-invalid-lock-attributes/efivars/$mor_name"
+    printf '\006\000\000\000\001' > "$case_root/mor-invalid-lock-attributes/efivars/$lock_name"
+    run_mor_case mor-invalid-lock-attributes 'FAILED-TO-INSPECT (unexpected MOR lock attributes 0x00000006)'
     install -d "$case_root/mor-reserved-bits/efi" "$case_root/mor-reserved-bits/efivars"
     printf '\007\000\000\000\002' > "$case_root/mor-reserved-bits/efivars/$mor_name"
     run_mor_case mor-reserved-bits 'FAILED-TO-INSPECT (MOR control uses reserved bits)'
@@ -1612,10 +1631,10 @@ run_uefi_mor_tests() {
         HARDEN_UEFI_MOR_REPORT="$case_root/mor-unreadable/report.txt" bash -c '
             source "$1/harden.sh"; trap - ERR EXIT
             MODE=apply; log() { :; }; record_change() { :; }; record_skip() { :; }
-            read_efivar_u8() { return 1; }
+            read_efivar_attributes() { return 1; }
             inspect_uefi_mor
-            [[ "$UEFI_MOR_STATUS" == "FAILED-TO-INSPECT (malformed or unreadable MOR control)" ]]
-        ' _ "$repo_root" || fail "UEFI MOR unreadable control was not handled safely"
+            [[ "$UEFI_MOR_STATUS" == "FAILED-TO-INSPECT (malformed or unreadable MOR control attributes)" ]]
+        ' _ "$repo_root" || fail "UEFI MOR unreadable control attributes were not handled safely"
 
     local dry_root="$case_root/dry-run"
     install -d "$dry_root/efi" "$dry_root/efivars"

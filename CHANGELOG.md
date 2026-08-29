@@ -89,9 +89,10 @@ für 1.1.3 wird erst nach dem vollständigen Zielsystemtest erstellt.
   and never kills a D-state process.
 - Deleted-open-file handling now writes a normalized PID/process/user/FD/type/link-count/path inventory with systemd-unit attribution. Only a small explicit service allowlist is restarted once; SSH, Tailscale, networking, firewall, system, dbus, and unknown owners are default-denied and remain visible in the report.
 - UEFI Memory Overwrite Request (MOR) is now inspected conservatively against
-  the standard control and lock variables. The implementation is detection-only:
-  it never creates, changes, or deletes an EFI variable, because support and
-  safe lifecycle semantics are firmware-owned.
+  the standard control and lock variables, including the required `0x00000007`
+  UEFI attributes. The implementation is detection-only: it never creates,
+  changes, or deletes an EFI variable, because support and safe lifecycle
+  semantics are firmware-owned.
 - Failed-login auditing now reports the separate Shadow/Lynis `FAILLOG_ENAB` /
   optional `faillog` and utmp `btmp`/`lastb` mechanisms without conflating
   them. It preserves `btmp` records, stores metadata only (never its content),

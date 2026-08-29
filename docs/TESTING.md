@@ -186,10 +186,15 @@ test -d /sys/firmware/efi && stat -f -c '%T' /sys/firmware/efi/efivars || true
 sudo ./harden.sh --apply --aggressive
 ```
 
-Auf dem aktuellen Ubuntu-26.04.1-Zielsystem darf `UEFI MOR` als
-`UNSUPPORTED` erscheinen, wenn Lynis weiterhin `MOR variable not found [ WEAK ]`
-meldet. Das ist ein Firmware-/Plattformlimit, kein Skriptfehler und wird nicht
-zur Score-Manipulation verborgen. Sichere bei UEFI-Systemen den Bericht sowie
+Auf dem aktuellen Ubuntu-26.04.1-Zielsystem darf `UEFI MOR` nur dann als
+`UNSUPPORTED` erscheinen, wenn `efivarfs` verfügbar ist und weder die
+standardisierte Control- noch die Lock-Variable exponiert wird. Meldet Lynis
+weiterhin `MOR variable not found [ WEAK ]`, ist dies dann ein Firmware-/
+Plattformlimit, kein Skriptfehler und wird nicht zur Score-Manipulation
+verborgen. Bei vorhandenem UEFI ohne verfügbare `efivarfs`-Runtime muss der
+Bericht stattdessen `FAILED-TO-INSPECT` mit dem Hinweis ausgeben, dass der MOR-
+Support nicht bestimmt werden kann. Control und Lock müssen jeweils die
+Attribute `0x00000007` ausweisen. Sichere bei UEFI-Systemen den Bericht sowie
 die unveränderten vorhandenen Variablen-Listings; führe keinerlei manuelle
 `echo`, `dd` oder Dateischreiboperation unter `efivars` aus. Wenn die Firmware
 MOR bereitstellt, muss der Bericht `SUPPORTED_ACTIVE`, `SUPPORTED_INACTIVE`
