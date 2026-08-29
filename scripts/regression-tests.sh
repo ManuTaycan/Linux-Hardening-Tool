@@ -600,7 +600,7 @@ EOF
         HARDEN_MODULE_LOCK_UNIT="$unit" HARDEN_MODULE_LOCK_HELPER="$helper" \
         HARDEN_KERNEL_CONFIG="$kernel_config" HARDEN_SYS_MODULE_ROOT="$sys_modules" \
         HARDEN_KERNEL_LOCK_REPORT="$report" HARDEN_KERNEL_GATE_ATTEMPTS=1 KERNEL_WRITE_COUNT="$writes" \
-        KERNEL_MODPROBE_LOG="$module_log" KERNEL_COMMAND_LOG="$command_log" KERNEL_TAILSCALE_ACTIVE=0 bash -c '
+        KERNEL_MODPROBE_LOG="$module_log" KERNEL_COMMAND_LOG="$command_log" bash -c '
             source "$1/harden.sh"
             trap - ERR EXIT
             MODE=apply
@@ -619,9 +619,23 @@ EOF
             AIDE_STATUS=OK
             lock_kernel_modules_late
             [[ "$(< "$2")" == 1 ]]
+            REBOOT_REQUIRED=0
+            : > "$6"
             lock_kernel_modules_late
             [[ "$(wc -l < "$3")" == 1 ]]
-        ' _ "$repo_root" "$control" "$writes" "$case_root/changes.tsv" "$case_root/backup" \
+            [[ "$REBOOT_REQUIRED" == 0 ]]
+            [[ ! -s "$6" ]]
+            grep -Fq "already-locked-runtime-check=OK" "$HARDEN_KERNEL_LOCK_REPORT"
+            export KERNEL_MISSING_POSTROUTING=1
+            REBOOT_REQUIRED=0
+            : > "$6"
+            lock_kernel_modules_late
+            [[ "$(< "$2")" == 1 ]]
+            [[ "$REBOOT_REQUIRED" == 1 ]]
+            [[ ! -s "$6" ]]
+            grep -Fq "already-locked-runtime-check=FAILED; reboot-repair-required" "$HARDEN_KERNEL_LOCK_REPORT"
+            grep -Fq "gate-result=already-locked-idempotent" "$HARDEN_KERNEL_LOCK_REPORT"
+        ' _ "$repo_root" "$control" "$writes" "$case_root/changes.tsv" "$case_root/backup" "$module_log" \
         || fail "final phase-17 kernel.modules_disabled gate or idempotent path failed"
 
     local prep_root="$case_root/prepare" prep_backup="$case_root/prepare-backup"
@@ -1342,7 +1356,7 @@ EOF
         grep -Fq "INITRAMFS_POLICY_CHANGED" <<<"$kernel_section"
         grep -Fq "Managed module policy is unchanged" <<<"$kernel_section"
         grep -Fq "grub_config_changed" <<<"$grub_section"
-        [[ "$(grep -Fc "REBOOT_REQUIRED=1" "$1/harden.sh")" == 2 ]]
+        [[ "$(grep -Fc "REBOOT_REQUIRED=1" "$1/harden.sh")" == 3 ]]
     ' _ "$repo_root" || fail "initramfs/GRUB/reboot-required change gating regressed"
 }
 

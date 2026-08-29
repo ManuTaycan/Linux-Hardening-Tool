@@ -1968,7 +1968,12 @@ lock_kernel_modules_late() {
         return 1
     fi
     if grep -Fq 'gate-result=already-locked-idempotent' "$report" 2>/dev/null; then
-        log INFO "Kernel module loading was already locked; verified runtime value 1 without modprobe and retained the late-boot unit"
+        if grep -Fq 'already-locked-runtime-check=FAILED; reboot-repair-required' "$report"; then
+            REBOOT_REQUIRED=1
+            log WARN "Kernel module loading is already locked but its Tailscale/Netfilter runtime needs repair; corrected boot units are installed and a controlled reboot is required without attempting modprobe"
+        else
+            log INFO "Kernel module loading was already locked; verified runtime value 1 without modprobe and retained the late-boot unit"
+        fi
     else
         record_change "Preloaded running-kernel Tailscale NAT prerequisites, validated dual-stack netfilter health, then set and verified kernel.modules_disabled=1"
     fi
