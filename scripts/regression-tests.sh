@@ -1377,6 +1377,24 @@ EOF
 #!/usr/bin/env bash
 [[ "${1:-}" == -a ]]
 EOF
+    cat > "$mock_bin/journalctl" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+    cat > "$mock_bin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == is-active && "${2:-}" == --quiet && "${3:-}" == systemd-journald.service ]]; then
+    [[ "${LOGIN_TEST_JOURNALD_ACTIVE:-1}" == 1 ]]
+    exit
+fi
+exit 1
+EOF
+    cat > "$mock_bin/sshd" <<'EOF'
+#!/usr/bin/env bash
+[[ "${1:-}" == -T ]] || exit 1
+printf 'loglevel %s\n' "${LOGIN_TEST_LOGLEVEL:-VERBOSE}"
+printf 'syslogfacility %s\n' "${LOGIN_TEST_SYSLOG_FACILITY:-AUTHPRIV}"
+EOF
     cat > "$mock_bin/chown" <<'EOF'
 #!/usr/bin/env bash
 exit 0
@@ -1410,7 +1428,7 @@ else
     [[ -z "$mode" ]] || chmod "$mode" "$2"
 fi
 EOF
-    chmod +x "$mock_bin/getent" "$mock_bin/lastb" "$mock_bin/faillog" "$mock_bin/chown" "$mock_bin/stat" "$mock_bin/install"
+    chmod +x "$mock_bin/getent" "$mock_bin/lastb" "$mock_bin/faillog" "$mock_bin/journalctl" "$mock_bin/systemctl" "$mock_bin/sshd" "$mock_bin/chown" "$mock_bin/stat" "$mock_bin/install"
 
     printf 'PASS_MAX_DAYS 90\nFAILLOG_ENAB yes\n# FTMP_FILE /wrong/path\n' > "$case_root/login.defs"
     printf 'existing failed-login record\n' > "$case_root/log/btmp"
@@ -1429,7 +1447,7 @@ EOF
             [[ "$FAILED_LOGIN_SHADOW_STATUS" == OK* && "$FAILED_LOGIN_BTMP_STATUS" == OK* && "$FAILED_LOGIN_FTMP_STATUS" == OK* ]]
             grep -Fxq "existing failed-login record" "$HARDEN_BTMP_PATH"
             grep -Fq "Lynis/shadow indicator:" "$HARDEN_FAILED_LOGIN_REPORT"
-            grep -Fq "btmp history:" "$HARDEN_FAILED_LOGIN_REPORT"
+            grep -Fq "legacy btmp/lastb history:" "$HARDEN_FAILED_LOGIN_REPORT"
             grep -Fq "FTMP_FILE $HARDEN_BTMP_PATH" "$HARDEN_LOGIN_DEFS"
             grep -Fq "exists=yes" "$BACKUP_DIR/failed-login-btmp-metadata-before.txt"
             grep -Fq "content-rollback=never" "$BACKUP_DIR/failed-login-btmp-metadata-before.txt"
@@ -1468,6 +1486,41 @@ EOF
             validate_failed_login_logging
             [[ "$FAILED_LOGIN_STATUS" == FAILED* && "$FAILED_LOGIN_SHADOW_STATUS" == FAILED* ]]
         ' _ "$repo_root" || fail "usable btmp incorrectly validated missing FAILLOG_ENAB"
+
+    local modern_login="$case_root/modern-login.defs"
+    printf 'FAILLOG_ENAB yes\n' > "$modern_login"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_LOGIN_DEFS="$modern_login" \
+        HARDEN_BTMP_PATH="$case_root/absent-modern-btmp" HARDEN_FAILLOG_PATH="$case_root/absent-faillog" \
+        HARDEN_FAILED_LOGIN_REPORT="$case_root/modern-report.txt" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; log() { :; }; record_change() { :; }; record_skip() { :; }
+            failed_login_lastb_available() { return 1; }
+            validate_failed_login_logging
+            [[ "$FAILED_LOGIN_STATUS" == OK* ]]
+            [[ "$FAILED_LOGIN_BTMP_STATUS" == "N/A (lastb removed/unavailable; journal/syslog path used)" ]]
+            [[ "$FAILED_LOGIN_MODERN_STATUS" == OK* ]]
+            [[ "$FAILED_LOGIN_FAILLOG_STATUS" == "N/A (tool/path unavailable)" ]]
+            [[ "$FAILED_LOGIN_FTMP_STATUS" == "N/A (FTMP_FILE unsupported by this login.defs)" ]]
+            grep -Fq "modern journal/syslog SSH auth path: OK" "$HARDEN_FAILED_LOGIN_REPORT"
+        ' _ "$repo_root" || fail "modern no-lastb journal/syslog path was not accepted"
+    env PATH="$mock_bin:$PATH" LOGIN_TEST_JOURNALD_ACTIVE=0 HARDEN_SOURCE_ONLY=1 HARDEN_LOGIN_DEFS="$modern_login" \
+        HARDEN_BTMP_PATH="$case_root/absent-modern-btmp" HARDEN_FAILLOG_PATH="$case_root/absent-faillog" \
+        HARDEN_FAILED_LOGIN_REPORT="$case_root/no-journal-report.txt" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; log() { :; }; record_change() { :; }; record_skip() { :; }
+            failed_login_lastb_available() { return 1; }
+            validate_failed_login_logging
+            [[ "$FAILED_LOGIN_STATUS" == FAILED* && "$FAILED_LOGIN_MODERN_STATUS" == FAILED* ]]
+        ' _ "$repo_root" || fail "modern no-lastb host accepted an inactive journald path"
+    env PATH="$mock_bin:$PATH" LOGIN_TEST_LOGLEVEL=ERROR HARDEN_SOURCE_ONLY=1 HARDEN_LOGIN_DEFS="$modern_login" \
+        HARDEN_BTMP_PATH="$case_root/absent-modern-btmp" HARDEN_FAILLOG_PATH="$case_root/absent-faillog" \
+        HARDEN_FAILED_LOGIN_REPORT="$case_root/restrictive-sshd-report.txt" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; log() { :; }; record_change() { :; }; record_skip() { :; }
+            failed_login_lastb_available() { return 1; }
+            validate_failed_login_logging
+            [[ "$FAILED_LOGIN_STATUS" == FAILED* && "$FAILED_LOGIN_MODERN_STATUS" == *"LogLevel=error"* ]]
+        ' _ "$repo_root" || fail "restrictive SSH LogLevel was accepted for modern failed-login logging"
     printf 'new audit record after metadata capture\n' >> "$case_root/log/btmp"
     grep -Fq 'existing failed-login record' "$case_root/log/btmp" \
         && grep -Fq 'new audit record after metadata capture' "$case_root/log/btmp" \

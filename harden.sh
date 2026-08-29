@@ -56,6 +56,7 @@ FAILED_LOGIN_STATUS="NOT RUN"
 FAILED_LOGIN_SHADOW_STATUS="NOT RUN"
 FAILED_LOGIN_FAILLOG_STATUS="NOT RUN"
 FAILED_LOGIN_BTMP_STATUS="NOT RUN"
+FAILED_LOGIN_MODERN_STATUS="NOT RUN"
 FAILED_LOGIN_FTMP_STATUS="N/A"
 FAILED_LOGIN_REPORT="${HARDEN_FAILED_LOGIN_REPORT:-/root/failed-login-logging-report.txt}"
 SHELL_TIMEOUT_STATUS="NOT RUN"
@@ -2597,17 +2598,54 @@ EOF
     fi
 }
 
+failed_login_lastb_available() {
+    command -v lastb >/dev/null 2>&1
+}
+
+validate_modern_failed_login_path() {
+    local sshd_effective="" log_level="" syslog_facility="" journald_status="" ssh_status=""
+    if ! command -v journalctl >/dev/null 2>&1 \
+        || ! systemctl is-active --quiet systemd-journald.service 2>/dev/null; then
+        journald_status="FAILED (systemd-journald unavailable or inactive)"
+    else
+        journald_status="OK (systemd-journald active)"
+    fi
+    if [[ -z "$SSHD_BIN" || ! -x "$SSHD_BIN" ]] && command -v sshd >/dev/null 2>&1; then
+        SSHD_BIN="$(command -v sshd)"
+    fi
+    if [[ -n "$SSHD_BIN" ]] && sshd_effective="$("$SSHD_BIN" -T 2>/dev/null)"; then
+        log_level="$(awk '$1 == "loglevel" {print tolower($2); exit}' <<<"$sshd_effective")"
+        syslog_facility="$(awk '$1 == "syslogfacility" {print $2; exit}' <<<"$sshd_effective")"
+        case "$log_level" in
+            info|verbose|debug|debug1|debug2|debug3)
+                ssh_status="OK (LogLevel=${log_level}; SyslogFacility=${syslog_facility:-unspecified})"
+                ;;
+            *)
+                ssh_status="FAILED (LogLevel=${log_level:-missing}; SyslogFacility=${syslog_facility:-unspecified})"
+                ;;
+        esac
+    else
+        ssh_status="FAILED (sshd -T effective configuration unavailable)"
+    fi
+    if [[ "$journald_status" == OK* && "$ssh_status" == OK* ]]; then
+        FAILED_LOGIN_MODERN_STATUS="OK (journal/syslog SSH auth path configured; ${journald_status}; ${ssh_status})"
+    else
+        FAILED_LOGIN_MODERN_STATUS="FAILED (${journald_status}; ${ssh_status})"
+    fi
+}
+
 validate_failed_login_logging() {
     local login_defs="${HARDEN_LOGIN_DEFS:-/etc/login.defs}"
     local btmp_path="${HARDEN_BTMP_PATH:-/var/log/btmp}"
     local faillog_path="${HARDEN_FAILLOG_PATH:-/var/log/faillog}"
-    local faillog_enabled="" ftmp_file="" lastb_status="unavailable" faillog_status="N/A (tool/path unavailable)"
+    local faillog_enabled="" ftmp_file="" lastb_status="unavailable" faillog_status="N/A (tool/path unavailable)" transport_valid=0
 
     if [[ "$MODE" == "dry-run" ]]; then
         FAILED_LOGIN_STATUS="N/A (dry-run)"
         FAILED_LOGIN_SHADOW_STATUS="N/A (dry-run)"
         FAILED_LOGIN_FAILLOG_STATUS="N/A (dry-run)"
         FAILED_LOGIN_BTMP_STATUS="N/A (dry-run)"
+        FAILED_LOGIN_MODERN_STATUS="N/A (dry-run)"
         FAILED_LOGIN_FTMP_STATUS="N/A (dry-run)"
         log INFO "Would validate separate FAILLOG_ENAB/faillog and btmp/lastb failed-login mechanisms"
         return 0
@@ -2619,7 +2657,7 @@ validate_failed_login_logging() {
     else
         FAILED_LOGIN_SHADOW_STATUS="FAILED (FAILLOG_ENAB=${faillog_enabled:-missing})"
     fi
-    if command -v faillog >/dev/null 2>&1 || [[ -e "$faillog_path" ]]; then
+    if [[ -e "$faillog_path" ]]; then
         if [[ -f "$faillog_path" && ! -L "$faillog_path" ]] \
             && { ! command -v faillog >/dev/null 2>&1 || faillog -a >/dev/null 2>&1; }; then
             faillog_status="OK (faillog path readable: ${faillog_path})"
@@ -2628,13 +2666,19 @@ validate_failed_login_logging() {
         fi
     fi
     FAILED_LOGIN_FAILLOG_STATUS="$faillog_status"
-    if command -v lastb >/dev/null 2>&1 && lastb -f "$btmp_path" >/dev/null 2>&1; then
-        lastb_status="readable"
-    fi
-    if [[ -f "$btmp_path" && ! -L "$btmp_path" && "$lastb_status" == "readable" ]]; then
-        FAILED_LOGIN_BTMP_STATUS="OK (btmp regular; lastb readable)"
+    if failed_login_lastb_available; then
+        if lastb -f "$btmp_path" >/dev/null 2>&1; then
+            lastb_status="readable"
+        fi
+        if [[ -f "$btmp_path" && ! -L "$btmp_path" && "$lastb_status" == "readable" ]]; then
+            FAILED_LOGIN_BTMP_STATUS="OK (legacy btmp regular; lastb readable)"
+        else
+            FAILED_LOGIN_BTMP_STATUS="FAILED (legacy btmp=${btmp_path}; lastb=${lastb_status})"
+        fi
+        FAILED_LOGIN_MODERN_STATUS="N/A (legacy lastb path available)"
     else
-        FAILED_LOGIN_BTMP_STATUS="FAILED (btmp=${btmp_path}; lastb=${lastb_status})"
+        FAILED_LOGIN_BTMP_STATUS="N/A (lastb removed/unavailable; journal/syslog path used)"
+        validate_modern_failed_login_path
     fi
     if grep -Eq '^[[:space:]#]*FTMP_FILE([[:space:]]|=)' "$login_defs"; then
         ftmp_file="$(awk '$1 == "FTMP_FILE" { value=$2 } END { print value }' "$login_defs" 2>/dev/null || true)"
@@ -2646,13 +2690,16 @@ validate_failed_login_logging() {
     else
         FAILED_LOGIN_FTMP_STATUS="N/A (FTMP_FILE unsupported by this login.defs)"
     fi
-    if [[ "$FAILED_LOGIN_SHADOW_STATUS" == OK* && "$FAILED_LOGIN_BTMP_STATUS" == OK* \
+    if [[ "$FAILED_LOGIN_BTMP_STATUS" == OK* || "$FAILED_LOGIN_MODERN_STATUS" == OK* ]]; then
+        transport_valid=1
+    fi
+    if [[ "$FAILED_LOGIN_SHADOW_STATUS" == OK* && "$transport_valid" -eq 1 \
         && "$FAILED_LOGIN_FAILLOG_STATUS" != FAILED* && "$FAILED_LOGIN_FTMP_STATUS" != FAILED* ]]; then
-        FAILED_LOGIN_STATUS="OK (separate shadow/faillog and btmp/lastb evidence validated)"
-        log OK "Failed-login mechanisms validated separately: ${FAILED_LOGIN_SHADOW_STATUS}; ${FAILED_LOGIN_BTMP_STATUS}"
+        FAILED_LOGIN_STATUS="OK (separate failed-login mechanisms configured; no failed-login event was generated)"
+        log OK "Failed-login mechanisms validated separately: ${FAILED_LOGIN_SHADOW_STATUS}; ${FAILED_LOGIN_BTMP_STATUS}; ${FAILED_LOGIN_MODERN_STATUS}"
     else
-        FAILED_LOGIN_STATUS="FAILED (shadow=${FAILED_LOGIN_SHADOW_STATUS}; faillog=${FAILED_LOGIN_FAILLOG_STATUS}; btmp=${FAILED_LOGIN_BTMP_STATUS}; FTMP=${FAILED_LOGIN_FTMP_STATUS})"
-        record_skip "failed-login logging" "separate FAILLOG_ENAB/faillog and btmp/lastb validation is incomplete"
+        FAILED_LOGIN_STATUS="FAILED (shadow=${FAILED_LOGIN_SHADOW_STATUS}; faillog=${FAILED_LOGIN_FAILLOG_STATUS}; legacy-btmp=${FAILED_LOGIN_BTMP_STATUS}; modern=${FAILED_LOGIN_MODERN_STATUS}; FTMP=${FAILED_LOGIN_FTMP_STATUS})"
+        record_skip "failed-login logging" "separate legacy or modern failed-login path validation is incomplete"
         log WARN "Failed-login logging validation is incomplete: ${FAILED_LOGIN_STATUS}"
     fi
     if [[ "$MODE" == "apply" ]]; then
@@ -2660,9 +2707,11 @@ validate_failed_login_logging() {
             printf 'Failed-login logging validation at %s\n\n' "$(timestamp)"
             printf 'Lynis/shadow indicator: %s\n' "$FAILED_LOGIN_SHADOW_STATUS"
             printf 'faillog path: %s\n' "$FAILED_LOGIN_FAILLOG_STATUS"
-            printf 'btmp history: %s\n' "$FAILED_LOGIN_BTMP_STATUS"
+            printf 'legacy btmp/lastb history: %s\n' "$FAILED_LOGIN_BTMP_STATUS"
+            printf 'modern journal/syslog SSH auth path: %s\n' "$FAILED_LOGIN_MODERN_STATUS"
             printf 'FTMP_FILE: %s\n' "$FAILED_LOGIN_FTMP_STATUS"
             printf 'pam_faillock: existing policy retained; no second lockout policy installed\n'
+            printf 'observed failed-login event: not generated by harden.sh\n'
         } > "$FAILED_LOGIN_REPORT"
         chmod 0600 "$FAILED_LOGIN_REPORT"
     fi

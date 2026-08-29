@@ -137,15 +137,24 @@ grep -E '^[[:space:]]*FAILLOG_ENAB' /etc/login.defs
 grep -E '^[[:space:]]*FTMP_FILE' /etc/login.defs || true
 command -v faillog >/dev/null && sudo faillog -a
 sudo stat -c '%U:%G %a %s %n' /var/log/btmp
-sudo lastb -f /var/log/btmp | head
+if command -v lastb >/dev/null; then sudo lastb -f /var/log/btmp | head; fi
+systemctl is-active systemd-journald.service
+sudo sshd -T | grep -E '^(loglevel|syslogfacility) '
 sudo cat /root/failed-login-logging-report.txt
 sudo env -i HOME=/root PATH="$PATH" bash -lic 'printf "login-shell TMOUT=%s\\n" "$TMOUT"'
 sudo env -i HOME=/root PATH="$PATH" bash -lc 'printf "noninteractive TMOUT=%s\\n" "${TMOUT-}"'
 ```
 
 Der Bericht muss `FAILLOG_ENAB`/`faillog` als Shadow-/Lynis-Nachweis und
-`btmp`/`lastb` als separaten utmp-Verlauf zeigen. `FTMP_FILE` wird nur auf
-Distributionen geprüft, die diese vorhandene `login.defs`-Option verwenden.
+`btmp`/`lastb` als separaten utmp-Verlauf zeigen. Auf Ubuntu 26.04 ohne
+`lastb` ist dieser Legacy-Pfad ausdrücklich `N/A`; `systemd-journald` aktiv
+sowie `sshd -T` mit `LogLevel` mindestens `INFO` und dokumentierter
+`SyslogFacility` bilden dann den modernen Konfigurationsnachweis. Es wird
+keine tatsächlich geschriebene fehlgeschlagene Anmeldung behauptet. `FTMP_FILE`
+wird nur auf Distributionen geprüft, die diese vorhandene `login.defs`-Option verwenden.
+Unter Ubuntu 26.04 ist der Gesamtstatus dabei `OK`, wenn `FAILLOG_ENAB=yes`
+und dieser moderne Pfad valide sind; ein fehlendes `lastb` oder `faillog` bleibt
+jeweils `N/A`.
 Der interaktive Login-Shell-Befehl muss `TMOUT=900` ausgeben (oder einen bewusst
 gesetzten Admin-Override), der nichtinteraktive Befehl keinen neuen Wert. Prüfe
 eine echte fehlgeschlagene Anmeldung ausschließlich auf einer lokalen,

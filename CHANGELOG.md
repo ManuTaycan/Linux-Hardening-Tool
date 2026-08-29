@@ -92,9 +92,12 @@ für 1.1.3 wird erst nach dem vollständigen Zielsystemtest erstellt.
   optional `faillog` and utmp `btmp`/`lastb` mechanisms without conflating
   them. It preserves `btmp` records, stores metadata only (never its content),
   never restores or deletes audit history, and leaves the existing `pam_faillock`
-  lockout policy as the only lockout mechanism. Interactive
-  shells receive an override-safe 900-second `TMOUT` through a managed profile;
-  non-interactive commands are unaffected.
+  lockout policy as the only lockout mechanism. On modern Ubuntu without
+  `lastb`, the active journald plus effective SSH `LogLevel`/`SyslogFacility`
+  configuration is validated instead; legacy `btmp`/`lastb` is reported as N/A
+  and no synthetic failed login is created. Interactive shells receive an
+  override-safe 900-second `TMOUT` through a managed profile; non-interactive
+  commands are unaffected.
 
 ### Added
 
