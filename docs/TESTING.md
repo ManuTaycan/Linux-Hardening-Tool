@@ -63,6 +63,10 @@ Abnahme aus; `<TAILSCALE-PEER>` ist durch einen genehmigten Peer zu ersetzen.
     Timerstatus prüfen, z. B. `systemctl start dailyaidecheck.service` und
     `systemctl status dailyaidecheck.service dailyaidecheck.timer --no-pager`.
 11. `apt-get check` muss erfolgreich sein.
+12. Den Apply direkt und erneut ohne externe `tee`-Pipe ausführen. Er muss
+    Phase 18 erreichen, `Before 87 -> After 87`, `AIDE baseline rebuilt: 0`
+    und den bereits gesetzten Kernel-Lock ohne `modprobe` melden; die
+    dokumentierten No-op-Pfade dürfen keine unnötigen Änderungen auslösen.
 
 Schlägt das Netfilter-/Tailscale-Gate fehl, muss der Lock beim Apply bzw. beim
 nächsten Boot mit noch schreibbarem Control bei 0 bleiben und die Unit darf
