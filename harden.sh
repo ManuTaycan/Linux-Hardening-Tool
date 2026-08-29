@@ -23,6 +23,7 @@ readonly MAIN_PID="$BASHPID"
 MODE=""
 AGGRESSIVE=0
 AUTO_REBOOT=0
+DISABLE_IPV6=0
 NON_INTERACTIVE=0
 OS_ID=""
 OS_VERSION=""
@@ -91,6 +92,13 @@ DELETED_OPEN_FILES_STATUS="NOT RUN"
 DELETED_OPEN_FILES_REPORT="/root/deleted-open-files-report.txt"
 UEFI_MOR_STATUS="NOT RUN"
 UEFI_MOR_REPORT="${HARDEN_UEFI_MOR_REPORT:-/root/uefi-mor-report.txt}"
+IPV6_POLICY="NOT RUN"
+IPV6_REASON="not assessed"
+IPV6_RUNTIME_STATUS="NOT RUN"
+IPV6_PERSISTENCE_STATUS="NOT RUN"
+IPV6_REPORT="${HARDEN_IPV6_REPORT:-/root/ipv6-policy-report.txt}"
+BANNER_STATUS="NOT RUN"
+MOTD_STATUS="NOT RUN"
 
 readonly COLOR_RESET=$'\033[0m'
 readonly COLOR_DIM=$'\033[2m'
@@ -121,13 +129,14 @@ declare -A SERVICE_EXPOSURE_AFTER=()
 
 usage() {
     cat <<'EOF'
-Usage: harden.sh (--dry-run | --apply) [--aggressive] [--reboot] [--non-interactive]
+Usage: harden.sh (--dry-run | --apply) [--aggressive] [--disable-ipv6] [--reboot] [--non-interactive]
                  [--no-color] [--remote-log-server HOST]
                  [--remote-log-port PORT] [--remote-log-protocol tcp|udp|tls]
 
   --dry-run          Show planned changes. No files, logs, packages, or services change.
   --apply            Apply hardening (must run as root or through sudo).
   --aggressive       Enable compatibility-sensitive server controls.
+  --disable-ipv6     Explicitly disable unused IPv6 (requires --aggressive; never default).
   --reboot           Reboot after a successful --apply run if a reboot is required.
   --non-interactive  Do not prompt for a remote log server; use REMOTE_LOG_* variables.
   --no-color         Disable ANSI colors even on an interactive terminal.
@@ -366,6 +375,7 @@ parse_args() {
                 MODE="apply"
                 ;;
             --aggressive) AGGRESSIVE=1 ;;
+            --disable-ipv6) DISABLE_IPV6=1 ;;
             --reboot) AUTO_REBOOT=1 ;;
             --non-interactive) NON_INTERACTIVE=1 ;;
             --no-color) USE_COLOR=0 ;;
@@ -398,6 +408,9 @@ parse_args() {
     [[ -n "$MODE" ]] || { usage >&2; die "Specify --dry-run or --apply"; }
     if [[ "$AUTO_REBOOT" -eq 1 && "$MODE" != "apply" ]]; then
         die "--reboot is valid only with --apply"
+    fi
+    if [[ "$DISABLE_IPV6" -eq 1 && "$AGGRESSIVE" -ne 1 ]]; then
+        die "--disable-ipv6 requires --aggressive and is intentionally default-off"
     fi
     if [[ "$REMOTE_LOG_OPTION_SEEN" -eq 1 && -z "$REMOTE_LOG_SERVER" ]]; then
         die "--remote-log-port/--remote-log-protocol require --remote-log-server (or REMOTE_LOG_SERVER)"
@@ -460,7 +473,7 @@ backup_config() {
         /etc/systemd /etc/audit /etc/rsyslog.conf /etc/rsyslog.d
         /etc/nftables.conf /etc/nftables.d /etc/fail2ban /etc/sudoers
         /etc/sudoers.d /etc/login.defs /etc/profile.d /etc/modprobe.d /etc/fstab /etc/apt
-        /etc/default/grub /etc/default/grub.d /etc/grub.d /etc/issue /etc/issue.net
+        /etc/default/grub /etc/default/grub.d /etc/grub.d /etc/issue /etc/issue.net /etc/update-motd.d
     )
     local -a present=()
     local item
@@ -1025,18 +1038,85 @@ remote_logging_destination_loaded() {
 }
 
 configure_banners() {
-    install_managed_file /etc/issue 0644 <<'EOF'
-NOTICE: This is a private system for authorized access and use only. Use is subject
-to monitoring, recording, and audit. By continuing, you consent to these conditions.
-Unauthorized use is prohibited and may result in disciplinary action and enforcement
-under applicable law. There is no expectation of privacy. Disconnect if unauthorized.
+    local banner='Authorized access only. Disconnect if you are not authorized.' file
+    local issue_file="${HARDEN_ISSUE_FILE:-/etc/issue}" issue_net_file="${HARDEN_ISSUE_NET_FILE:-/etc/issue.net}"
+    if [[ "$MODE" == apply ]]; then
+        transaction_copy "$issue_file" issue-banner
+        transaction_copy "$issue_net_file" issue-net-banner
+    fi
+    for file in "$issue_file" "$issue_net_file"; do
+        if ! install_managed_file "$file" 0644 <<EOF
+$banner
 EOF
-    install_managed_file /etc/issue.net 0644 <<'EOF'
-NOTICE: This is a private system for authorized access and use only. Use is subject
-to monitoring, recording, and audit. By continuing, you consent to these conditions.
-Unauthorized use is prohibited and may result in disciplinary action and enforcement
-under applicable law. There is no expectation of privacy. Disconnect if unauthorized.
-EOF
+        then
+            [[ "$MODE" != apply ]] || { transaction_restore "$issue_file" issue-banner; transaction_restore "$issue_net_file" issue-net-banner; }
+            BANNER_STATUS="FAILED"
+            return 1
+        fi
+        if [[ "$MODE" == apply ]] && [[ "$(stat -c '%U:%G:%a' "$file" 2>/dev/null || true)" != root:root:644 ]]; then
+            chown root:root "$file" && chmod 0644 "$file" || return 1
+            record_change "Corrected banner ownership and mode: ${file}"
+        fi
+    done
+    BANNER_STATUS=$([[ "$MODE" == apply ]] && printf 'OK' || printf 'PLANNED')
+    return 0
+}
+
+configure_motd_presentation() {
+    local motd_dir="${HARDEN_UPDATE_MOTD_DIR:-/etc/update-motd.d}"
+    local motd_cache="${HARDEN_MOTD_CACHE:-/run/motd.dynamic}"
+    local hook label changed=0 i
+    local -a changed_hooks=() changed_labels=()
+    local -a presentation_hooks=(00-header 10-help-text 10-uname 50-landscape-sysinfo 50-motd-news 80-livepatch 88-esm-announce 90-updates-available 91-contract-ua-esm-status 91-release-upgrade 92-unattended-upgrades 95-hwe-eol)
+    if [[ "$AGGRESSIVE" -ne 1 ]]; then
+        MOTD_STATUS="SKIPPED (requires --aggressive)"
+        record_skip "MOTD" "presentation hooks are changed only with --aggressive"
+        return 0
+    fi
+    if [[ "$OS_ID" != ubuntu || ! -d "$motd_dir" ]]; then
+        MOTD_STATUS="N/A (no Ubuntu presentation hooks)"
+        log INFO "MOTD presentation policy is not applicable on this Debian-compatible layout"
+        return 0
+    fi
+    for hook in "${presentation_hooks[@]}"; do
+        hook="${motd_dir}/${hook}"
+        [[ -f "$hook" && ! -L "$hook" ]] || continue
+        [[ -x "$hook" ]] || continue
+        if [[ "$MODE" == dry-run ]]; then
+            log INFO "Would disable Ubuntu MOTD presentation hook ${hook}"
+            continue
+        fi
+        label="motd-hook-$(basename -- "$hook")"
+        transaction_copy "$hook" "$label"
+        if ! chmod a-x "$hook"; then
+            transaction_restore "$hook" "$label"
+            for ((i=${#changed_hooks[@]} - 1; i>=0; i--)); do
+                transaction_restore "${changed_hooks[$i]}" "${changed_labels[$i]}"
+            done
+            MOTD_STATUS="FAILED"
+            return 1
+        fi
+        changed_hooks+=("$hook")
+        changed_labels+=("$label")
+        changed=1
+        record_change "Disabled Ubuntu MOTD presentation hook ${hook}"
+    done
+    if [[ "$MODE" == dry-run ]]; then
+        MOTD_STATUS="PLANNED (presentation hooks only)"
+    elif [[ "$changed" -eq 1 ]]; then
+        # This is volatile generated presentation output; it is regenerated by pam_motd.
+        if [[ -f "$motd_cache" && ! -L "$motd_cache" ]] && ! rm -f -- "$motd_cache"; then
+            for ((i=${#changed_hooks[@]} - 1; i>=0; i--)); do
+                transaction_restore "${changed_hooks[$i]}" "${changed_labels[$i]}"
+            done
+            MOTD_STATUS="FAILED"
+            return 1
+        fi
+        MOTD_STATUS="OK (presentation hooks disabled; reboot notice hook preserved)"
+    else
+        MOTD_STATUS="OK (already converged; reboot notice hook preserved)"
+    fi
+    return 0
 }
 
 sysctl_candidates() {
@@ -1076,10 +1156,8 @@ net.ipv4.tcp_rfc1337=1
 net.ipv4.tcp_syncookies=1
 net.ipv6.conf.all.accept_redirects=0
 net.ipv6.conf.all.accept_source_route=0
-net.ipv6.conf.all.forwarding=0
 net.ipv6.conf.default.accept_redirects=0
 net.ipv6.conf.default.accept_source_route=0
-net.ipv6.conf.default.forwarding=0
 vm.mmap_min_addr=65536
 vm.unprivileged_userfaultfd=0
 EOF
@@ -1244,10 +1322,113 @@ managed_sysctl_runtime_needs_reload() {
     return 1
 }
 
+ipv6_active_interfaces() {
+    local sysctl_root="${HARDEN_PROC_SYS_ROOT:-/proc/sys}" interface
+    declare -A seen=()
+    [[ -d "$sysctl_root/net/ipv6/conf" ]] || return 0
+    if command -v ip >/dev/null 2>&1; then
+        while IFS= read -r interface; do
+            [[ "$interface" =~ ^[[:alnum:]_.-]+$ ]] || continue
+            [[ -e "$sysctl_root/net/ipv6/conf/${interface}/disable_ipv6" ]] || continue
+            [[ -n "${seen[$interface]+present}" ]] && continue
+            seen["$interface"]=1
+            printf '%s\n' "$interface"
+        done < <(ip -o link show up 2>/dev/null | awk -F': ' '{name=$2; sub(/@.*/, "", name); sub(/:.*/, "", name); if (name != "lo") print name}')
+    fi
+    if systemctl is-active --quiet tailscaled.service 2>/dev/null \
+        && [[ -e "$sysctl_root/net/ipv6/conf/tailscale0/disable_ipv6" ]] && -z "${seen[tailscale0]+present}"; then
+        printf '%s\n' tailscale0
+    fi
+}
+
+detect_ipv6_policy() {
+    local sysctl_root="${HARDEN_PROC_SYS_ROOT:-/proc/sys}" routes rules listeners forwarding global_addresses
+    local -a reasons=()
+    IPV6_POLICY="enabled-safe"
+    IPV6_REASON="IPv6 disable is default-off; hardened IPv6 remains enabled"
+    IPV6_RUNTIME_STATUS="NOT RUN"
+    IPV6_PERSISTENCE_STATUS="NOT RUN"
+    if [[ ! -d "$sysctl_root/net/ipv6/conf" ]]; then
+        IPV6_POLICY="NOT_APPLICABLE"
+        IPV6_REASON="kernel IPv6 sysctl tree is unavailable"
+        IPV6_RUNTIME_STATUS="N/A"
+        return 0
+    fi
+    if systemctl is-active --quiet tailscaled.service 2>/dev/null; then
+        reasons+=("active-tailscale-overlay")
+    fi
+    if ! command -v ip >/dev/null 2>&1 || ! command -v ss >/dev/null 2>&1; then
+        reasons+=("network-inventory-command-unavailable")
+    else
+        global_addresses="$(ip -6 -o addr show scope global 2>/dev/null || true)"
+        [[ -z "$global_addresses" ]] || reasons+=("global-ipv6-address")
+        routes="$(ip -6 route show default 2>/dev/null || true)"
+        [[ -z "$routes" ]] || reasons+=("ipv6-default-route")
+        rules="$(ip -6 rule show 2>/dev/null || true)"
+        if awk '/lookup/ && $NF !~ /^(local|main|default)$/ { found=1 } END { exit !found }' <<<"$rules"; then
+            reasons+=("ipv6-policy-routing")
+        fi
+        listeners="$(ss -H -lntu 2>/dev/null || true)"
+        grep -Eq '(^|[[:space:]])(\[::|::)' <<<"$listeners" && reasons+=("ipv6-listener")
+    fi
+    forwarding="$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || true)"
+    [[ "$forwarding" == 1 ]] && reasons+=("ipv6-forwarding-enabled")
+    if ((${#reasons[@]})); then
+        IPV6_REASON="$(IFS=,; printf '%s' "${reasons[*]}")"
+    fi
+    if [[ "$DISABLE_IPV6" -eq 1 ]]; then
+        if ((${#reasons[@]})); then
+            IPV6_POLICY="enabled-safety-blocked"
+            IPV6_REASON="explicit disable refused: ${IPV6_REASON}"
+            record_skip "IPv6 disable" "$IPV6_REASON"
+        else
+            IPV6_POLICY="disabled-explicit-opt-in"
+            IPV6_REASON="explicit --disable-ipv6 with --aggressive; no IPv6 use, route, listener, forwarding, policy-routing, or overlay signal detected"
+        fi
+    elif ((${#reasons[@]})); then
+        IPV6_POLICY="enabled-required-or-uncertain"
+    fi
+    IPV6_RUNTIME_STATUS="inspected"
+}
+
+ipv6_policy_candidates() {
+    local interface
+    [[ "$IPV6_POLICY" == disabled-explicit-opt-in ]] || return 0
+    printf '%s\n' 'net.ipv6.conf.all.disable_ipv6=1' 'net.ipv6.conf.default.disable_ipv6=1'
+    while IFS= read -r interface; do
+        [[ -n "$interface" ]] || continue
+        printf 'net.ipv6.conf.%s.disable_ipv6=1\n' "$interface"
+    done < <(ipv6_active_interfaces)
+}
+
+write_ipv6_report() {
+    local report="${HARDEN_IPV6_REPORT:-/root/ipv6-policy-report.txt}" key value interface
+    [[ "$MODE" == apply ]] || return 0
+    install -d -m 0700 "$(dirname -- "$report")"
+    {
+        printf 'IPv6 policy diagnostic\n'
+        printf 'generated=%s\n' "$(timestamp)"
+        printf 'policy=%s\n' "$IPV6_POLICY"
+        printf 'reason=%s\n' "$IPV6_REASON"
+        printf 'runtime=%s\n' "$IPV6_RUNTIME_STATUS"
+        printf 'persistence=%s\n' "$IPV6_PERSISTENCE_STATUS"
+        for key in net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6 net.ipv6.conf.all.accept_redirects net.ipv6.conf.default.accept_redirects net.ipv6.conf.all.accept_source_route net.ipv6.conf.default.accept_source_route net.ipv6.conf.all.forwarding; do
+            value="$(sysctl -n "$key" 2>/dev/null || true)"
+            printf '%s=%s\n' "$key" "${value:-unavailable}"
+        done
+        while IFS= read -r interface; do
+            value="$(sysctl -n "net.ipv6.conf.${interface}.disable_ipv6" 2>/dev/null || true)"
+            printf 'net.ipv6.conf.%s.disable_ipv6=%s\n' "$interface" "${value:-unavailable}"
+        done < <(ipv6_active_interfaces)
+    } > "$report"
+    chmod 0600 "$report"
+}
+
 configure_sysctl() {
     local config="${HARDEN_SYSCTL_CONFIG:-/etc/sysctl.d/99-security-hardening.conf}"
     local sysctl_root="${HARDEN_PROC_SYS_ROOT:-/proc/sys}"
     local temporary key value proc_path interface desired_rp_filter="" config_changed=0 runtime_reload_needed=0 failed=0
+    detect_ipv6_policy
     if systemctl is-active --quiet tailscaled.service 2>/dev/null; then
         RP_FILTER_TAILSCALE_STATE=active
         RP_FILTER_POLICY="accepted-exception-loose-2"
@@ -1269,6 +1450,12 @@ configure_sysctl() {
     fi
     if [[ "$MODE" == "dry-run" ]]; then
         log INFO "Would apply rp_filter policy ${RP_FILTER_POLICY} (${RP_FILTER_REASON}) without changing Tailscale preferences"
+        log INFO "Would apply IPv6 policy ${IPV6_POLICY} (${IPV6_REASON}) without GRUB kernel parameters"
+        if [[ "$IPV6_POLICY" == NOT_APPLICABLE ]]; then
+            IPV6_PERSISTENCE_STATUS="N/A"
+        else
+            IPV6_PERSISTENCE_STATUS="PLANNED (safe sysctls; explicit disable only when selected and safe)"
+        fi
         if [[ "$AGGRESSIVE" -eq 1 ]]; then
             log WARN "Would also disable unprivileged user namespaces, kexec loading, and io_uring when supported"
         fi
@@ -1299,7 +1486,7 @@ configure_sysctl() {
             else
                 log SKIP "Unsupported sysctl omitted: ${key}" >&2
             fi
-        done < <(sysctl_candidates; [[ "$AGGRESSIVE" -eq 1 ]] && aggressive_sysctl_candidates)
+        done < <(sysctl_candidates; ipv6_policy_candidates; [[ "$AGGRESSIVE" -eq 1 ]] && aggressive_sysctl_candidates)
         if [[ -n "$desired_rp_filter" ]]; then
             while IFS= read -r interface; do
                 [[ -n "$interface" ]] || continue
@@ -1346,12 +1533,20 @@ configure_sysctl() {
             failed=1
         fi
     done < <(grep -Ev '^[[:space:]]*(#|$)' "$config")
+    if [[ "$IPV6_POLICY" == disabled-explicit-opt-in ]]; then
+        IPV6_PERSISTENCE_STATUS="OK (managed sysctl disable)"
+    elif [[ "$IPV6_POLICY" == NOT_APPLICABLE ]]; then
+        IPV6_PERSISTENCE_STATUS="N/A"
+    else
+        IPV6_PERSISTENCE_STATUS="OK (managed safe IPv6 sysctls; no disable requested)"
+    fi
     [[ "$failed" -eq 0 ]] || record_skip "KRNL-6000" "one or more supported sysctls could not be applied by the running environment"
     tailscale_rp_filter_health
     if [[ "$RP_FILTER_RUNTIME_STATUS" == WARN:* ]]; then
         log WARN "${RP_FILTER_RUNTIME_STATUS}"
     fi
     write_rp_filter_report
+    write_ipv6_report
     if [[ "$AGGRESSIVE" -eq 0 ]]; then
         record_skip "kernel.modules_disabled" "requires --aggressive because it is irreversible until reboot"
     fi
@@ -5545,6 +5740,8 @@ Firewall           : ${FIREWALL_STATUS}
 PAM                : ${PAM_STATUS}
 Failed-login log   : ${FAILED_LOGIN_STATUS}
 Shell timeout      : ${SHELL_TIMEOUT_STATUS}
+Login banners      : ${BANNER_STATUS}
+MOTD policy        : ${MOTD_STATUS}
 Audit              : ${AUDIT_STATUS}
 AppArmor           : ${APPARMOR_STATUS}
 AIDE               : ${AIDE_STATUS}
@@ -5558,6 +5755,11 @@ Deleted open files : ${DELETED_OPEN_FILES_STATUS}
 Deleted-file report: $([[ "$MODE" == "apply" ]] && printf '%s' "${HARDEN_DELETED_OPEN_REPORT:-$DELETED_OPEN_FILES_REPORT}" || printf 'not written in dry-run')
 UEFI MOR           : ${UEFI_MOR_STATUS}
 UEFI MOR report    : $([[ "$MODE" == "apply" ]] && printf '%s' "$UEFI_MOR_REPORT" || printf 'not written in dry-run')
+IPv6 Policy        : ${IPV6_POLICY}
+IPv6 Reason        : ${IPV6_REASON}
+IPv6 Runtime       : ${IPV6_RUNTIME_STATUS}
+IPv6 Persistence   : ${IPV6_PERSISTENCE_STATUS}
+IPv6 Report        : $([[ "$MODE" == "apply" ]] && printf '%s' "$IPV6_REPORT" || printf 'not written in dry-run')
 
 Lynis Score Before : ${LYNIS_BEFORE}
 Lynis Score After  : ${LYNIS_AFTER}
@@ -5629,6 +5831,7 @@ main() {
 
     phase 04 18 "Logging"
     configure_banners
+    configure_motd_presentation
     configure_logging
 
     phase 05 18 "Kernel Hardening"

@@ -103,6 +103,15 @@ für 1.1.3 wird erst nach dem vollständigen Zielsystemtest erstellt.
   and no synthetic failed login is created. Interactive shells receive an
   override-safe 900-second `TMOUT` through a managed profile; non-interactive
   commands are unaffected.
+- IPv6 is now treated as an observed network policy rather than a blanket
+  hardening switch. Global addresses, routes, listeners, forwarding, policy
+  routing, and Tailscale block a requested disable; otherwise an aggressive
+  operator may explicitly choose `--disable-ipv6`. The default remains enabled
+  with safe redirect/source-route controls and a policy report.
+- Apply manages the local and network login banners with a concise,
+  non-assertive authorized-access notice. Ubuntu aggressive runs disable only
+  selected dynamic-MOTD presentation hooks, preserving the reboot-required
+  hook and leaving packages and services installed.
 
 ### Added
 

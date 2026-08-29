@@ -166,6 +166,49 @@ müssen unverändert bleiben. Das Projekt verwendet ausschließlich metadata-onl
 capture; ein btmp-Inhalts-Restore oder -Rollback findet nicht statt. SSH-Remote-Kommandos dürfen weiterhin nicht durch
 `TMOUT` beeinflusst werden.
 
+### Ubuntu-26.04.1-Retest IPv6, Banner und dynamisches MOTD (#9, #24, #25)
+
+Führe den Apply aus einer zweiten bestätigten SSH-/Recovery-Sitzung direkt
+ohne externe `tee`-Pipe aus. Eine IPv6-Deaktivierung ist kein Standardtest:
+zuerst wird nur die erkannte Policy geprüft. Tailscale-Prefs, SSH und die
+Firewall dürfen dabei unverändert bleiben.
+
+```bash
+sudo ./harden.sh --apply --aggressive
+sudo cat /root/ipv6-policy-report.txt
+cat /etc/issue /etc/issue.net
+find /etc/update-motd.d -maxdepth 1 -type f -printf '%m %f\n' | sort
+sudo ./harden.sh --apply --aggressive
+```
+
+Der IPv6-Bericht muss Policy, Grund sowie effektive `all`-/`default`-/Interface-
+Werte nennen. Bei aktivem Tailscale, globaler Adresse, IPv6-Default- oder
+Policy-Route, Listener oder Forwarding bleibt IPv6 aktiviert und die sicheren
+Redirect-/Source-Route-Sysctls werden validiert. Prüfe danach SSH und Tailscale
+einschließlich eines genehmigten `tailscale ping <TAILSCALE-PEER>`.
+
+Nur auf einer nachweislich IPv6-unbenutzten Test-VM darf zusätzlich der
+explizite Opt-in geprüft werden:
+
+```bash
+sudo ./harden.sh --dry-run --aggressive --disable-ipv6
+sudo ./harden.sh --apply --aggressive --disable-ipv6
+sysctl net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6
+sudo ./harden.sh --apply --aggressive --disable-ipv6
+```
+
+Der erste Dry-run muss die Deaktivierung nur planen. Der Apply darf keine
+GRUB-Parameter setzen und muss die persistente sysctl-Policy sowie den
+kontrollierten Rückkehrweg dokumentieren. Der Zweitlauf muss konvergieren.
+
+`/etc/issue` und `/etc/issue.net` müssen exakt `Authorized access only.
+Disconnect if you are not authorized.` enthalten und mode `0644` haben;
+die vorhandene SSH-Banner-Konfiguration bleibt unangetastet. Auf Ubuntu dürfen
+nur Präsentations-Hooks wie Header, Inventar, Update-/Pro-/News-Hinweise nicht
+mehr ausführbar sein. Der `98-reboot-required`-Hook bleibt ausführbar. Es
+werden weder APT-/Ubuntu-Pro-/unattended-upgrades-Pakete noch Services entfernt.
+Ein zweiter Apply darf weder Banner noch Hook-Zustände erneut verändern.
+
 ### Ubuntu-26.04.1-Retest UEFI Memory Overwrite Request (#8)
 
 Der MOR-Pfad ist bewusst rein lesend. Die TCG-Spezifikation definiert

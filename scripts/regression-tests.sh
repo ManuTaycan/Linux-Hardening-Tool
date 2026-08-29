@@ -1656,6 +1656,154 @@ run_uefi_mor_tests() {
         || fail "UEFI MOR implementation contains an EFI-variable mutation command"
 }
 
+run_ipv6_banner_motd_tests() {
+    local case_root="$test_root/ipv6-banner-motd" mock_bin
+    mock_bin="$case_root/bin"
+    install -d "$mock_bin"
+    cat > "$mock_bin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+[[ "$1" == is-active && "$2" == --quiet && "$3" == tailscaled.service && "${IPV6_TEST_TAILSCALE:-0}" == 1 ]] && exit 0
+exit 1
+EOF
+    cat > "$mock_bin/ip" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-} ${2:-} ${3:-} ${4:-}" in
+    '-o link show up') printf '2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\n' ;;
+    '-6 -o addr show') [[ "${IPV6_TEST_GLOBAL:-0}" == 1 ]] && printf '2: eth0    inet6 2001:db8::10/64 scope global\n' ;;
+    '-6 route show default') [[ "${IPV6_TEST_DEFAULT_ROUTE:-0}" == 1 ]] && printf 'default via 2001:db8::1 dev eth0\n' ;;
+    '-6 rule show '*) [[ "${IPV6_TEST_POLICY_ROUTE:-0}" == 1 ]] && printf '100: from all lookup 100\n' || printf '0: from all lookup local\n32766: from all lookup main\n32767: from all lookup default\n' ;;
+esac
+EOF
+    cat > "$mock_bin/ss" <<'EOF'
+#!/usr/bin/env bash
+[[ "${IPV6_TEST_LISTENER:-0}" == 1 ]] && printf 'tcp LISTEN 0 128 [::]:22 [::]:*\n'
+EOF
+    cat > "$mock_bin/sysctl" <<'EOF'
+#!/usr/bin/env bash
+[[ "$1" == -n ]] || exit 64
+path="${HARDEN_PROC_SYS_ROOT:?}/${2//./\/}"
+cat "$path"
+EOF
+    chmod +x "$mock_bin/systemctl" "$mock_bin/ip" "$mock_bin/ss" "$mock_bin/sysctl"
+
+    make_ipv6_tree() {
+        local root="$1" interface key
+        for interface in all default eth0 tailscale0; do
+            install -d "$root/net/ipv6/conf/$interface"
+            for key in disable_ipv6 accept_redirects accept_source_route forwarding; do printf '0\n' > "$root/net/ipv6/conf/$interface/$key"; done
+        done
+    }
+    run_ipv6_case() {
+        local name="$1" tailscale="$2" global="$3" default_route="$4" listener="$5" forwarding="$6" policy_route="$7" disable="$8" expected="$9"
+        local root="$case_root/$name/proc/sys"
+        make_ipv6_tree "$root"
+        printf '%s\n' "$forwarding" > "$root/net/ipv6/conf/all/forwarding"
+        env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_PROC_SYS_ROOT="$root" \
+            IPV6_TEST_TAILSCALE="$tailscale" IPV6_TEST_GLOBAL="$global" IPV6_TEST_DEFAULT_ROUTE="$default_route" IPV6_TEST_LISTENER="$listener" IPV6_TEST_POLICY_ROUTE="$policy_route" bash -c '
+                source "$1/harden.sh"; trap - ERR EXIT
+                MODE=apply; AGGRESSIVE=1; DISABLE_IPV6="$3"; log() { :; }; record_skip() { :; }
+                detect_ipv6_policy
+                [[ "$IPV6_POLICY" == "$2" ]] || { printf "policy=%s reason=%s\n" "$IPV6_POLICY" "$IPV6_REASON" >&2; exit 1; }
+                if [[ "$IPV6_POLICY" == disabled-explicit-opt-in ]]; then
+                    candidates="$(ipv6_policy_candidates)"
+                    grep -Fxq "net.ipv6.conf.all.disable_ipv6=1" <<<"$candidates"
+                    grep -Fxq "net.ipv6.conf.eth0.disable_ipv6=1" <<<"$candidates" || { printf "candidates=%s\n" "$candidates" >&2; exit 1; }
+                else
+                    ! ipv6_policy_candidates | grep -q disable_ipv6
+                fi
+            ' _ "$repo_root" "$expected" "$disable" || fail "IPv6 ${name} policy failed (expected ${expected})"
+    }
+    run_ipv6_case unused-default-off 0 0 0 0 0 0 0 enabled-safe
+    run_ipv6_case unused-opt-in 0 0 0 0 0 0 1 disabled-explicit-opt-in
+    run_ipv6_case global-address 0 1 0 0 0 0 1 enabled-safety-blocked
+    run_ipv6_case default-route 0 0 1 0 0 0 1 enabled-safety-blocked
+    run_ipv6_case listener 0 0 0 1 0 0 1 enabled-safety-blocked
+    run_ipv6_case forwarding 0 0 0 0 1 0 1 enabled-safety-blocked
+    run_ipv6_case policy-routing 0 0 0 0 0 1 1 enabled-safety-blocked
+    run_ipv6_case tailscale 1 0 0 0 0 0 1 enabled-safety-blocked
+
+    local ipv6_dry="$case_root/dry-run"
+    make_ipv6_tree "$ipv6_dry/proc/sys"
+    printf 'unchanged\n' > "$ipv6_dry/99-security-hardening.conf"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_PROC_SYS_ROOT="$ipv6_dry/proc/sys" \
+        HARDEN_SYSCTL_CONFIG="$ipv6_dry/99-security-hardening.conf" HARDEN_IPV6_REPORT="$ipv6_dry/ipv6-report.txt" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=dry-run; AGGRESSIVE=1; DISABLE_IPV6=1; log() { :; }
+            configure_sysctl
+            [[ "$IPV6_POLICY" == disabled-explicit-opt-in ]]
+            [[ "$IPV6_PERSISTENCE_STATUS" == PLANNED* ]]
+            grep -Fxq unchanged "$HARDEN_SYSCTL_CONFIG"
+            [[ ! -e "$HARDEN_IPV6_REPORT" ]]
+        ' _ "$repo_root" || fail "IPv6 dry-run wrote managed state or did not plan explicit disable"
+
+    local banner_root="$case_root/banner" issue issue_net
+    issue="$banner_root/issue"
+    issue_net="$banner_root/issue.net"
+    install -d "$banner_root"
+    printf 'old banner\n' > "$issue"; printf 'old network banner\n' > "$issue_net"; chmod 0600 "$issue" "$issue_net"
+    env HARDEN_SOURCE_ONLY=1 HARDEN_ISSUE_FILE="$issue" HARDEN_ISSUE_NET_FILE="$issue_net" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        MODE=apply; BACKUP_DIR="$2/backup"; CHANGE_LOG="$2/changes.tsv"; mkdir -p "$BACKUP_DIR"; : > "$CHANGE_LOG"
+        transaction_copy() { :; }; transaction_restore() { :; }
+        chown() { :; }
+        stat() {
+            [[ "$1" == -c && "$2" == "%U:%G:%a" ]] && { printf "root:root:644\n"; return 0; }
+            [[ "$1" == -c && "$2" == "%a" ]] && { printf "644\n"; return 0; }
+            command stat "$@"
+        }
+        install_managed_file() {
+            local destination="$1" mode="$2" temporary
+            MANAGED_FILE_CHANGED=0; temporary="$(mktemp)"; cat > "$temporary"
+            if [[ -f "$destination" ]] && cmp -s "$temporary" "$destination"; then rm -f "$temporary"; return 0; fi
+            mkdir -p -- "$(dirname -- "$destination")"; cp -- "$temporary" "$destination"; chmod "$mode" "$destination"; rm -f "$temporary"; MANAGED_FILE_CHANGED=1
+        }
+        configure_banners
+        expected="Authorized access only. Disconnect if you are not authorized."
+        [[ "$(cat "$HARDEN_ISSUE_FILE")" == "$expected" && "$(cat "$HARDEN_ISSUE_NET_FILE")" == "$expected" ]]
+        [[ "$(stat -c %a "$HARDEN_ISSUE_FILE")" == 644 && "$(stat -c %a "$HARDEN_ISSUE_NET_FILE")" == 644 ]]
+        configure_banners
+    ' _ "$repo_root" "$banner_root" || fail "banner content, permissions, or idempotence failed"
+    env HARDEN_SOURCE_ONLY=1 HARDEN_ISSUE_FILE="$issue" HARDEN_ISSUE_NET_FILE="$issue_net" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        MODE=dry-run; configure_banners
+    ' _ "$repo_root" || fail "banner dry-run failed"
+
+    local motd_root="$case_root/motd" motd_dir motd_cache
+    motd_dir="$motd_root/update-motd.d"
+    motd_cache="$motd_root/motd.dynamic"
+    local motd_mock_exec=0
+    [[ "$(uname -s)" == MINGW* ]] && motd_mock_exec=1
+    install -d "$motd_dir"
+    for hook in 00-header 50-landscape-sysinfo 90-updates-available 98-reboot-required; do printf '#!/bin/sh\nexit 0\n' > "$motd_dir/$hook"; chmod 0755 "$motd_dir/$hook"; done
+    printf 'stale presentation\n' > "$motd_cache"
+    env HARDEN_SOURCE_ONLY=1 HARDEN_UPDATE_MOTD_DIR="$motd_dir" HARDEN_MOTD_CACHE="$motd_cache" MOTD_TEST_MOCK_EXEC="$motd_mock_exec" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        MODE=apply; AGGRESSIVE=1; OS_ID=ubuntu; BACKUP_DIR="$2/backup"; CHANGE_LOG="$2/changes.tsv"; mkdir -p "$BACKUP_DIR"; : > "$CHANGE_LOG"
+        transaction_copy() { cp -a -- "$1" "$BACKUP_DIR/$2"; }
+        transaction_restore() { cp -a -- "$BACKUP_DIR/$2" "$1"; chmod 0755 "$1"; }
+        if [[ "$MOTD_TEST_MOCK_EXEC" == 1 ]]; then
+            chmod() { [[ "$1" == a-x ]] && { : > "${2}.disabled"; return 0; }; command chmod "$@"; }
+        fi
+        configure_motd_presentation
+        if [[ "$MOTD_TEST_MOCK_EXEC" == 1 ]]; then
+            [[ -e "$HARDEN_UPDATE_MOTD_DIR/00-header.disabled" && -e "$HARDEN_UPDATE_MOTD_DIR/50-landscape-sysinfo.disabled" && -e "$HARDEN_UPDATE_MOTD_DIR/90-updates-available.disabled" ]]
+            [[ ! -e "$HARDEN_UPDATE_MOTD_DIR/98-reboot-required.disabled" && ! -e "$HARDEN_MOTD_CACHE" ]]
+        else
+            [[ ! -x "$HARDEN_UPDATE_MOTD_DIR/00-header" && ! -x "$HARDEN_UPDATE_MOTD_DIR/50-landscape-sysinfo" && ! -x "$HARDEN_UPDATE_MOTD_DIR/90-updates-available" ]]
+            [[ -x "$HARDEN_UPDATE_MOTD_DIR/98-reboot-required" && ! -e "$HARDEN_MOTD_CACHE" ]]
+        fi
+        transaction_restore "$HARDEN_UPDATE_MOTD_DIR/00-header" motd-hook-00-header
+        [[ "$MOTD_TEST_MOCK_EXEC" == 1 || -x "$HARDEN_UPDATE_MOTD_DIR/00-header" ]]
+    ' _ "$repo_root" "$motd_root" || fail "MOTD presentation classification, preservation, or rollback failed"
+    env HARDEN_SOURCE_ONLY=1 HARDEN_UPDATE_MOTD_DIR="$motd_dir" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        MODE=apply; AGGRESSIVE=1; OS_ID=debian; configure_motd_presentation
+        [[ "$MOTD_STATUS" == "N/A (no Ubuntu presentation hooks)" ]]
+    ' _ "$repo_root" || fail "Debian MOTD no-op failed"
+    ! rg -q 'apt(-get)?[[:space:]]+(purge|remove).*motd|apt(-get)?[[:space:]]+(purge|remove).*ubuntu-pro' "$repo_root/harden.sh" \
+        || fail "MOTD policy removes a package"
+}
+
 run_iowait_tests() {
     local case_root="$test_root/iowait" mock_bin="$test_root/iowait/bin" count="$test_root/iowait/count"
     install -d "$mock_bin"
@@ -2105,6 +2253,17 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
     uefi-mor)
         run_uefi_mor_tests
         ;;
+    ipv6-banner-motd-only)
+        run_ipv6_banner_motd_tests
+        ;;
+    ipv6-banner-motd)
+        run_ipv6_banner_motd_tests
+        run_rp_filter_tests
+        run_deleted_open_tests
+        run_login_timeout_tests
+        run_uefi_mor_tests
+        run_kernel_gate_test
+        ;;
     new-findings)
         run_lynis_summary_tests
         run_fail2ban_tests
@@ -2116,6 +2275,7 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
         run_deleted_open_tests
         run_login_timeout_tests
         run_uefi_mor_tests
+        run_ipv6_banner_motd_tests
         run_rp_filter_tests
         run_iowait_tests
         ;;
@@ -2133,6 +2293,7 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
         run_deleted_open_tests
         run_login_timeout_tests
         run_uefi_mor_tests
+        run_ipv6_banner_motd_tests
         run_rp_filter_tests
         run_iowait_tests
         ;;
