@@ -79,6 +79,8 @@ RP_FILTER_POLICY="not assessed"
 RP_FILTER_REASON="not assessed"
 RP_FILTER_RUNTIME_STATUS="NOT RUN"
 RP_FILTER_PERSISTED_CURRENT_VALUES="no"
+DELETED_OPEN_FILES_STATUS="NOT RUN"
+DELETED_OPEN_FILES_REPORT="/root/deleted-open-files-report.txt"
 
 readonly COLOR_RESET=$'\033[0m'
 readonly COLOR_DIM=$'\033[2m'
@@ -4578,48 +4580,100 @@ systemd_unit_for_pid() {
     ' "$cgroup_file"
 }
 
+capture_deleted_open_files() {
+    local output="$1"
+    lsof -nP +L1 -Fpcuftkn 2>/dev/null | awk '
+        /^p/ {pid=substr($0,2); command=user=fd=type=path=links=""; next}
+        /^c/ {command=substr($0,2); next}
+        /^u/ {user=substr($0,2); next}
+        /^f/ {fd=substr($0,2); type=path=links=""; next}
+        /^t/ {type=substr($0,2); next}
+        /^k/ {links=substr($0,2); next}
+        /^n/ {path=substr($0,2); if (pid != "" && path != "") print pid "\t" command "\t" user "\t" fd "\t" type "\t" links "\t" path}
+    ' > "$output" || true
+}
+
+deleted_open_unit_class() {
+    case "$1" in
+        rsyslog.service|fail2ban.service|cron.service|uuidd.service|networkd-dispatcher.service|acct.service) printf '%s\n' safe-service ;;
+        ssh.service|sshd.service|tailscaled.service|NetworkManager.service|systemd-networkd.service|networking.service|nftables.service|firewalld.service|systemd.service|dbus.service|systemd-journald.service|*.target) printf '%s\n' protected-service ;;
+        *) printf '%s\n' unknown-service ;;
+    esac
+}
+
+write_deleted_open_report() {
+    local report="${HARDEN_DELETED_OPEN_REPORT:-$DELETED_OPEN_FILES_REPORT}" before="$1" after="$2" decisions="$3" stage="$4" temporary
+    [[ "$MODE" == apply ]] || return 0
+    install -d -m 0700 "$(dirname -- "$report")"
+    temporary="$(mktemp)"
+    {
+        printf 'deleted-open-files report\n'
+        printf 'stage=%s\nstatus=%s\n' "$stage" "$DELETED_OPEN_FILES_STATUS"
+        printf '\n[before]\n'; [[ -s "$before" ]] && awk -F '\t' '{printf "pid=%s process=%s user=%s fd=%s type=%s links=%s file=%s\n",$1,$2,$3,$4,$5,$6,$7}' "$before" || printf 'none\n'
+        printf '\n[decisions]\n'; [[ -s "$decisions" ]] && cat "$decisions" || printf 'none\n'
+        printf '\n[after]\n'; [[ -s "$after" ]] && awk -F '\t' '{printf "pid=%s process=%s user=%s fd=%s type=%s links=%s file=%s\n",$1,$2,$3,$4,$5,$6,$7}' "$after" || printf 'none\n'
+        printf '\nremaining-entries=%s\nreboot-required=%s\n' "$(wc -l < "$after")" "$REBOOT_REQUIRED"
+    } > "$temporary"
+    install -m 0600 "$temporary" "$report"
+    rm -f -- "$temporary"
+}
+
 remediate_deleted_open_files() {
-    if [[ "$MODE" == "dry-run" ]]; then
-        log INFO "Would map lsof +L1 PIDs to systemd units, restart only allowlisted safe services, and rescan"
-        return 0
-    fi
+    local before after decisions pid unit class restart_result remaining
     if ! command -v lsof >/dev/null 2>&1; then
-        record_skip "LOGG-2190" "lsof is unavailable"
+        DELETED_OPEN_FILES_STATUS="SKIPPED: lsof unavailable"
+        [[ "$MODE" == apply ]] && record_skip "LOGG-2190" "lsof is unavailable"
         return 0
     fi
-    local before="$BACKUP_DIR/deleted-open-files-before-remediation.txt"
-    local after="$BACKUP_DIR/deleted-open-files-after-remediation.txt"
-    local pids="" pid unit remaining=""
-    declare -A restart_units=()
-    lsof +L1 > "$before" 2>&1 || true
-    chmod 0600 "$before"
-    pids="$(awk 'NR > 1 && $2 ~ /^[0-9]+$/ {print $2}' "$before" | sort -u)"
-    while IFS= read -r pid; do
+    if [[ "$MODE" == dry-run ]]; then
+        log INFO "Would inventory lsof +L1 PID/process/unit ownership and classify only allowlisted service restarts; no file, restart, or reboot state is changed"
+        return 0
+    fi
+    before="$BACKUP_DIR/deleted-open-files-before-remediation.tsv"
+    after="$BACKUP_DIR/deleted-open-files-after-remediation.tsv"
+    decisions="$BACKUP_DIR/deleted-open-files-decisions.txt"
+    : > "$decisions"
+    capture_deleted_open_files "$before"
+    chmod 0600 "$before" "$decisions"
+    if [[ ! -s "$before" ]]; then
+        DELETED_OPEN_FILES_STATUS="OK: no deleted open files"
+        write_deleted_open_report "$before" "$before" "$decisions" remediation
+        log INFO "Deleted-open-file inventory is empty; no service restart is required"
+        return 0
+    fi
+    declare -A restart_units=() seen_units=()
+    while IFS=$'\t' read -r pid _; do
         [[ -n "$pid" ]] || continue
         unit="$(systemd_unit_for_pid "$pid" 2>/dev/null || true)"
-        case "$unit" in
-            rsyslog.service|fail2ban.service|cron.service|uuidd.service|networkd-dispatcher.service|acct.service)
-                restart_units["$unit"]=1
-                ;;
-        esac
-    done <<<"$pids"
-    for unit in "${!restart_units[@]}"; do
-        if systemctl is-active --quiet "$unit" && run_streamed systemctl restart "$unit" \
-            && systemctl is-active --quiet "$unit"; then
-            record_change "Restarted safe service ${unit} to release deleted open files"
+        class="$(deleted_open_unit_class "$unit")"
+        if [[ -z "$unit" ]]; then
+            printf 'pid=%s unit=unknown classification=unknown decision=no-action reason=no-unambiguous-systemd-service\n' "$pid" >> "$decisions"
+        elif [[ "$class" == safe-service ]] && systemctl is-active --quiet "$unit"; then
+            restart_units["$unit"]=1
+            [[ -n "${seen_units[$unit]+yes}" ]] || printf 'pid=%s unit=%s classification=safe-service decision=restart-once\n' "$pid" "$unit" >> "$decisions"
+            seen_units["$unit"]=1
         else
-            log WARN "Did not restart ${unit} or it failed its post-restart health check"
+            printf 'pid=%s unit=%s classification=%s decision=no-action reason=default-deny\n' "$pid" "$unit" "$class" >> "$decisions"
+            [[ "$class" == protected-service ]] && REBOOT_REQUIRED=1
         fi
+    done < "$before"
+    for unit in "${!restart_units[@]}"; do
+        restart_result=failed
+        if run_streamed systemctl restart "$unit" && systemctl is-active --quiet "$unit"; then restart_result=healthy; fi
+        printf 'unit=%s restart-attempted=yes result=%s\n' "$unit" "$restart_result" >> "$decisions"
+        [[ "$restart_result" == healthy ]] && record_change "Restarted allowlisted safe service ${unit} once to release deleted open files" || log WARN "Safe deleted-file restart failed or remained unhealthy: ${unit}"
     done
-    lsof +L1 > "$after" 2>&1 || true
+    capture_deleted_open_files "$after"
     chmod 0600 "$after"
-    remaining="$(awk 'NR > 1 && $2 ~ /^[0-9]+$/ {print $2; found=1} END {if (!found) exit 0}' "$after")"
-    if [[ -n "$remaining" ]]; then
-        record_skip "LOGG-2190" "deleted open files remain after safe targeted restarts; see ${after}"
-    else
+    remaining="$(wc -l < "$after")"
+    if [[ "$remaining" -eq 0 ]]; then
+        DELETED_OPEN_FILES_STATUS="OK: inventory clear after targeted remediation"
         record_change "Confirmed that no deleted open files remain after targeted remediation"
+    else
+        DELETED_OPEN_FILES_STATUS="REMAINING: ${remaining} deleted open file entries"
+        record_skip "LOGG-2190" "deleted open files remain after conservative classification; see ${HARDEN_DELETED_OPEN_REPORT:-$DELETED_OPEN_FILES_REPORT}"
     fi
-    return 0
+    write_deleted_open_report "$before" "$after" "$decisions" remediation
 }
 
 diagnose_iowait_processes() {
@@ -5058,6 +5112,8 @@ Automatic Updates  : ${UPDATES_STATUS}
 rp_filter Policy   : ${RP_FILTER_POLICY}
 rp_filter Runtime  : ${RP_FILTER_RUNTIME_STATUS}
 rp_filter Report   : $([[ "$MODE" == "apply" ]] && printf '%s' "${HARDEN_RP_FILTER_REPORT:-/root/tailscale-rp-filter-report.txt}" || printf 'not written in dry-run')
+Deleted open files : ${DELETED_OPEN_FILES_STATUS}
+Deleted-file report: $([[ "$MODE" == "apply" ]] && printf '%s' "${HARDEN_DELETED_OPEN_REPORT:-$DELETED_OPEN_FILES_REPORT}" || printf 'not written in dry-run')
 
 Lynis Score Before : ${LYNIS_BEFORE}
 Lynis Score After  : ${LYNIS_AFTER}

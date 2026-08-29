@@ -1395,6 +1395,58 @@ EOF
         ' _ "$repo_root" "$case_root" || fail "PROC-3614 classification/diagnostic regression failed"
 }
 
+run_deleted_open_tests() {
+    local case_root="$test_root/deleted-open" mock_bin="$test_root/deleted-open/bin"
+    install -d "$mock_bin"
+    cat > "$mock_bin/lsof" <<'EOF'
+#!/usr/bin/env bash
+case "${DO_TEST_STATE:-empty}" in
+ empty) exit 0 ;;
+ safe-before) grep -Fq 'restart rsyslog.service' "${DO_TEST_LOG:-/dev/null}" 2>/dev/null || printf 'p4242\ncworker\nu100\nf5\ntREG\nk0\nn/var/log/test (deleted)\n' ;;
+ protected) printf 'p22\ncsshd\nu0\nf3\ntREG\nk0\nn/tmp/key (deleted)\n' ;;
+ unknown) printf 'p77\ncmystery\nu1000\nf4\ntREG\nk0\nn/tmp/x (deleted)\n' ;;
+ multi) printf 'p4242\ncworker\nu100\nf5\ntREG\nk0\nn/tmp/a (deleted)\nf6\ntREG\nk0\nn/tmp/b (deleted)\n' ;;
+esac
+EOF
+    cat > "$mock_bin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${DO_TEST_LOG:?}"
+case "$1 $2" in
+ 'is-active --quiet') [[ "${DO_TEST_HEALTH:-1}" == 1 ]] ;;
+ restart\ *) [[ "${DO_TEST_RESTART:-1}" == 1 ]] ;;
+ *) exit 0 ;;
+esac
+EOF
+    chmod +x "$mock_bin/lsof" "$mock_bin/systemctl"
+    local one="$case_root/one"; install -d "$one"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_DELETED_OPEN_REPORT="$one/report" \
+        DO_TEST_STATE=empty DO_TEST_LOG="$one/log" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT; MODE=apply; BACKUP_DIR="$2"; CHANGE_LOG="$2/changes"; : > "$2/log"; : > "$CHANGE_LOG"; REBOOT_REQUIRED=0
+            remediate_deleted_open_files
+            [[ "$DELETED_OPEN_FILES_STATUS" == "OK: no deleted open files" && ! -s "$2/log" ]]
+        ' _ "$repo_root" "$one" || fail "empty deleted-open inventory was not a no-op"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_DELETED_OPEN_REPORT="$one/report" \
+        DO_TEST_STATE=safe-before DO_TEST_LOG="$one/log" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT; MODE=apply; BACKUP_DIR="$2"; CHANGE_LOG="$2/changes"; : > "$CHANGE_LOG"; : > "$DO_TEST_LOG"; REBOOT_REQUIRED=0
+            systemd_unit_for_pid() { printf "rsyslog.service\n"; }
+            remediate_deleted_open_files
+            grep -Fq "restart rsyslog.service" "$DO_TEST_LOG"
+            [[ "$DELETED_OPEN_FILES_STATUS" == "OK: inventory clear after targeted remediation" ]]
+        ' _ "$repo_root" "$one" || fail "safe deleted-open service was not restarted"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_DELETED_OPEN_REPORT="$one/report" \
+        DO_TEST_STATE=protected DO_TEST_LOG="$one/log" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT; MODE=apply; BACKUP_DIR="$2"; CHANGE_LOG="$2/changes"; : > "$CHANGE_LOG"; : > "$DO_TEST_LOG"; REBOOT_REQUIRED=0
+            systemd_unit_for_pid() { printf "sshd.service\n"; }
+            remediate_deleted_open_files
+            ! grep -Fq "restart" "$DO_TEST_LOG"; [[ "$REBOOT_REQUIRED" == 1 ]]
+        ' _ "$repo_root" "$one" || fail "protected deleted-open owner was restarted or did not request controlled reboot"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 DO_TEST_STATE=unknown DO_TEST_LOG="$one/log" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT; MODE=dry-run; BACKUP_DIR="$2"; REBOOT_REQUIRED=0
+            remediate_deleted_open_files
+            [[ ! -e "${HARDEN_DELETED_OPEN_REPORT:-/root/deleted-open-files-report.txt}" && ! -s "$DO_TEST_LOG" ]]
+        ' _ "$repo_root" "$one" || fail "deleted-open dry-run wrote state or restarted a service"
+}
+
 run_rp_filter_tests() {
     local case_root="$test_root/rp-filter" mock_bin="$test_root/rp-filter/bin"
     local sysctl_section
@@ -1683,6 +1735,9 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
     compiler)
         run_compiler_tests
         ;;
+    deleted-open)
+        run_deleted_open_tests
+        ;;
     new-findings)
         run_lynis_summary_tests
         run_fail2ban_tests
@@ -1691,6 +1746,7 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
         run_binfmt_tests
         run_systemd_idempotency_tests
         run_runtime_noop_tests
+        run_deleted_open_tests
         run_rp_filter_tests
         run_iowait_tests
         ;;
@@ -1705,6 +1761,7 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
         run_binfmt_tests
         run_systemd_idempotency_tests
         run_runtime_noop_tests
+        run_deleted_open_tests
         run_rp_filter_tests
         run_iowait_tests
         ;;
