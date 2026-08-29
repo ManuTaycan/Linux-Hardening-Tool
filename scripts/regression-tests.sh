@@ -1373,6 +1373,10 @@ EOF
 #!/usr/bin/env bash
 [[ "${1:-}" == -f && -f "${2:-}" ]]
 EOF
+    cat > "$mock_bin/faillog" <<'EOF'
+#!/usr/bin/env bash
+[[ "${1:-}" == -a ]]
+EOF
     cat > "$mock_bin/chown" <<'EOF'
 #!/usr/bin/env bash
 exit 0
@@ -1406,20 +1410,28 @@ else
     [[ -z "$mode" ]] || chmod "$mode" "$2"
 fi
 EOF
-    chmod +x "$mock_bin/getent" "$mock_bin/lastb" "$mock_bin/chown" "$mock_bin/stat" "$mock_bin/install"
+    chmod +x "$mock_bin/getent" "$mock_bin/lastb" "$mock_bin/faillog" "$mock_bin/chown" "$mock_bin/stat" "$mock_bin/install"
 
-    printf 'PASS_MAX_DAYS 90\nFAILLOG_ENAB yes\n' > "$case_root/login.defs"
+    printf 'PASS_MAX_DAYS 90\nFAILLOG_ENAB yes\n# FTMP_FILE /wrong/path\n' > "$case_root/login.defs"
     printf 'existing failed-login record\n' > "$case_root/log/btmp"
+    : > "$case_root/log/faillog"
     chmod 0660 "$case_root/log/btmp"
     env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_LOGIN_DEFS="$case_root/login.defs" \
-        HARDEN_BTMP_PATH="$case_root/log/btmp" HARDEN_SHELL_TIMEOUT_PROFILE="$case_root/profile.d/99-security-shell-timeout.sh" \
+        HARDEN_BTMP_PATH="$case_root/log/btmp" HARDEN_FAILLOG_PATH="$case_root/log/faillog" \
+        HARDEN_FAILED_LOGIN_REPORT="$case_root/failed-login-report.txt" HARDEN_SHELL_TIMEOUT_PROFILE="$case_root/profile.d/99-security-shell-timeout.sh" \
         bash -c '
             source "$1/harden.sh"; trap - ERR EXIT
-            MODE=apply; BACKUP_DIR="$2/backup"; CHANGE_LOG="$2/changes.tsv"; : > "$CHANGE_LOG"
-            log() { :; }; record_change() { :; }; record_skip() { :; }; transaction_copy() { :; }
+            MODE=apply; BACKUP_DIR="$2/backup"; mkdir -p "$BACKUP_DIR"; CHANGE_LOG="$2/changes.tsv"; : > "$CHANGE_LOG"
+            log() { :; }; record_change() { :; }; record_skip() { :; }
             configure_failed_login_logging
             [[ "$FAILED_LOGIN_STATUS" == OK* ]]
+            [[ "$FAILED_LOGIN_SHADOW_STATUS" == OK* && "$FAILED_LOGIN_BTMP_STATUS" == OK* && "$FAILED_LOGIN_FTMP_STATUS" == OK* ]]
             grep -Fxq "existing failed-login record" "$HARDEN_BTMP_PATH"
+            grep -Fq "Lynis/shadow indicator:" "$HARDEN_FAILED_LOGIN_REPORT"
+            grep -Fq "btmp history:" "$HARDEN_FAILED_LOGIN_REPORT"
+            grep -Fq "FTMP_FILE $HARDEN_BTMP_PATH" "$HARDEN_LOGIN_DEFS"
+            grep -Fq "exists=yes" "$BACKUP_DIR/failed-login-btmp-metadata-before.txt"
+            grep -Fq "content-rollback=never" "$BACKUP_DIR/failed-login-btmp-metadata-before.txt"
             configure_interactive_shell_timeout
             [[ "$SHELL_TIMEOUT_STATUS" == "OK (interactive default 900s; override preserved)" ]]
             before_login="$(sha256sum "$HARDEN_LOGIN_DEFS")"; before_profile="$(sha256sum "$HARDEN_SHELL_TIMEOUT_PROFILE")"
@@ -1428,16 +1440,50 @@ EOF
             [[ "$before_profile" == "$(sha256sum "$HARDEN_SHELL_TIMEOUT_PROFILE")" ]]
         ' _ "$repo_root" "$case_root" || fail "failed-login logging or interactive timeout did not converge"
     grep -Fq 'FAILLOG_ENAB yes' "$case_root/login.defs" || fail "failed-login logging was not persisted in login.defs"
+    grep -Fq 'FTMP_FILE '"$case_root/log/btmp" "$case_root/login.defs" || fail "existing FTMP_FILE was not set distro-conformantly"
     grep -Fq 'case "$-" in' "$case_root/profile.d/99-security-shell-timeout.sh" \
         || fail "timeout profile is not limited to interactive shells"
+    ! grep -Fq 'transaction_copy "$btmp_path"' "$repo_root/harden.sh" \
+        || fail "btmp content was added to transaction backup"
+    ! sed -n '/backup_config()/,/^}/p' "$repo_root/harden.sh" | grep -Fq '/var/log/btmp' \
+        || fail "btmp content was added to config backup"
+
+    local original_btmp_hash
+    original_btmp_hash="$(sha256sum "$case_root/log/btmp")"
+    [[ "$original_btmp_hash" == "$(sha256sum "$case_root/log/btmp")" ]] \
+        || fail "existing btmp content changed during apply"
+
+    local broken_btmp="$case_root/broken-btmp"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_LOGIN_DEFS="$case_root/login.defs" \
+        HARDEN_BTMP_PATH="$broken_btmp" HARDEN_FAILLOG_PATH="$case_root/log/faillog" \
+        HARDEN_FAILED_LOGIN_REPORT="$case_root/broken-report.txt" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; log() { :; }; record_change() { :; }; record_skip() { :; }
+            validate_failed_login_logging
+            [[ "$FAILED_LOGIN_STATUS" == FAILED* && "$FAILED_LOGIN_BTMP_STATUS" == FAILED* ]]
+        ' _ "$repo_root" || fail "FAILLOG_ENAB alone incorrectly validated unusable btmp"
+    printf 'FAILLOG_ENAB no\n' > "$case_root/no-faillog-login.defs"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_LOGIN_DEFS="$case_root/no-faillog-login.defs" \
+        HARDEN_BTMP_PATH="$case_root/log/btmp" HARDEN_FAILLOG_PATH="$case_root/log/faillog" \
+        HARDEN_FAILED_LOGIN_REPORT="$case_root/no-faillog-report.txt" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; log() { :; }; record_change() { :; }; record_skip() { :; }
+            validate_failed_login_logging
+            [[ "$FAILED_LOGIN_STATUS" == FAILED* && "$FAILED_LOGIN_SHADOW_STATUS" == FAILED* ]]
+        ' _ "$repo_root" || fail "usable btmp incorrectly validated missing FAILLOG_ENAB"
+    printf 'new audit record after metadata capture\n' >> "$case_root/log/btmp"
+    grep -Fq 'existing failed-login record' "$case_root/log/btmp" \
+        && grep -Fq 'new audit record after metadata capture' "$case_root/log/btmp" \
+        || fail "metadata capture/rollback handling lost btmp audit data"
 
     local missing="$case_root/missing-btmp"
     rm -f -- "$missing"
     env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_LOGIN_DEFS="$case_root/login.defs" \
-        HARDEN_BTMP_PATH="$missing" HARDEN_SHELL_TIMEOUT_PROFILE="$case_root/profile.d/99-security-shell-timeout.sh" \
+        HARDEN_BTMP_PATH="$missing" HARDEN_FAILLOG_PATH="$case_root/log/faillog" \
+        HARDEN_FAILED_LOGIN_REPORT="$case_root/missing-report.txt" HARDEN_SHELL_TIMEOUT_PROFILE="$case_root/profile.d/99-security-shell-timeout.sh" \
         bash -c '
             source "$1/harden.sh"; trap - ERR EXIT
-            MODE=apply; BACKUP_DIR="$2/backup"; CHANGE_LOG="$2/changes.tsv"; : > "$CHANGE_LOG"
+            MODE=apply; BACKUP_DIR="$2/backup"; mkdir -p "$BACKUP_DIR"; CHANGE_LOG="$2/changes.tsv"; : > "$CHANGE_LOG"
             log() { :; }; record_change() { :; }; record_skip() { :; }; transaction_copy() { :; }
             configure_failed_login_logging
             [[ -f "$HARDEN_BTMP_PATH" && "$(stat -c "%a" "$HARDEN_BTMP_PATH")" == 660 ]]

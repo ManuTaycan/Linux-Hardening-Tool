@@ -53,6 +53,11 @@ FIREWALL_STATUS="NOT RUN"
 SSH_STATUS="NOT RUN"
 PAM_STATUS="NOT RUN"
 FAILED_LOGIN_STATUS="NOT RUN"
+FAILED_LOGIN_SHADOW_STATUS="NOT RUN"
+FAILED_LOGIN_FAILLOG_STATUS="NOT RUN"
+FAILED_LOGIN_BTMP_STATUS="NOT RUN"
+FAILED_LOGIN_FTMP_STATUS="N/A"
+FAILED_LOGIN_REPORT="${HARDEN_FAILED_LOGIN_REPORT:-/root/failed-login-logging-report.txt}"
 SHELL_TIMEOUT_STATUS="NOT RUN"
 AUDIT_STATUS="NOT RUN"
 APPARMOR_STATUS="NOT RUN"
@@ -452,7 +457,6 @@ backup_config() {
         /etc/systemd /etc/audit /etc/rsyslog.conf /etc/rsyslog.d
         /etc/nftables.conf /etc/nftables.d /etc/fail2ban /etc/sudoers
         /etc/sudoers.d /etc/login.defs /etc/profile.d /etc/modprobe.d /etc/fstab /etc/apt
-        /var/log/btmp
         /etc/default/grub /etc/default/grub.d /etc/grub.d /etc/issue /etc/issue.net
     )
     local -a present=()
@@ -2596,26 +2600,90 @@ EOF
 validate_failed_login_logging() {
     local login_defs="${HARDEN_LOGIN_DEFS:-/etc/login.defs}"
     local btmp_path="${HARDEN_BTMP_PATH:-/var/log/btmp}"
-    local faillog_enabled="" lastb_status="unavailable"
+    local faillog_path="${HARDEN_FAILLOG_PATH:-/var/log/faillog}"
+    local faillog_enabled="" ftmp_file="" lastb_status="unavailable" faillog_status="N/A (tool/path unavailable)"
 
     if [[ "$MODE" == "dry-run" ]]; then
         FAILED_LOGIN_STATUS="N/A (dry-run)"
-        log INFO "Would validate FAILLOG_ENAB and the distro btmp/lastb failed-login accounting path"
+        FAILED_LOGIN_SHADOW_STATUS="N/A (dry-run)"
+        FAILED_LOGIN_FAILLOG_STATUS="N/A (dry-run)"
+        FAILED_LOGIN_BTMP_STATUS="N/A (dry-run)"
+        FAILED_LOGIN_FTMP_STATUS="N/A (dry-run)"
+        log INFO "Would validate separate FAILLOG_ENAB/faillog and btmp/lastb failed-login mechanisms"
         return 0
     fi
 
     faillog_enabled="$(awk '$1 == "FAILLOG_ENAB" { value=$2 } END { print value }' "$login_defs" 2>/dev/null || true)"
+    if [[ "$faillog_enabled" == "yes" ]]; then
+        FAILED_LOGIN_SHADOW_STATUS="OK (FAILLOG_ENAB=yes; Lynis/shadow indicator)"
+    else
+        FAILED_LOGIN_SHADOW_STATUS="FAILED (FAILLOG_ENAB=${faillog_enabled:-missing})"
+    fi
+    if command -v faillog >/dev/null 2>&1 || [[ -e "$faillog_path" ]]; then
+        if [[ -f "$faillog_path" && ! -L "$faillog_path" ]] \
+            && { ! command -v faillog >/dev/null 2>&1 || faillog -a >/dev/null 2>&1; }; then
+            faillog_status="OK (faillog path readable: ${faillog_path})"
+        else
+            faillog_status="FAILED (faillog path/tool not readable: ${faillog_path})"
+        fi
+    fi
+    FAILED_LOGIN_FAILLOG_STATUS="$faillog_status"
     if command -v lastb >/dev/null 2>&1 && lastb -f "$btmp_path" >/dev/null 2>&1; then
         lastb_status="readable"
     fi
-    if [[ "$faillog_enabled" == "yes" && -f "$btmp_path" && ! -L "$btmp_path" && "$lastb_status" == "readable" ]]; then
-        FAILED_LOGIN_STATUS="OK (FAILLOG_ENAB=yes; btmp/lastb readable)"
-        log OK "Failed-login logging is enabled through login.defs and validated via ${btmp_path}"
+    if [[ -f "$btmp_path" && ! -L "$btmp_path" && "$lastb_status" == "readable" ]]; then
+        FAILED_LOGIN_BTMP_STATUS="OK (btmp regular; lastb readable)"
     else
-        FAILED_LOGIN_STATUS="FAILED (FAILLOG_ENAB=${faillog_enabled:-missing}; btmp=${btmp_path}; lastb=${lastb_status})"
-        record_skip "failed-login logging" "login.defs/btmp validation did not prove usable failed-login accounting"
+        FAILED_LOGIN_BTMP_STATUS="FAILED (btmp=${btmp_path}; lastb=${lastb_status})"
+    fi
+    if grep -Eq '^[[:space:]#]*FTMP_FILE([[:space:]]|=)' "$login_defs"; then
+        ftmp_file="$(awk '$1 == "FTMP_FILE" { value=$2 } END { print value }' "$login_defs" 2>/dev/null || true)"
+        if [[ "$ftmp_file" == "$btmp_path" ]]; then
+            FAILED_LOGIN_FTMP_STATUS="OK (FTMP_FILE=${btmp_path})"
+        else
+            FAILED_LOGIN_FTMP_STATUS="FAILED (FTMP_FILE=${ftmp_file:-missing}; expected ${btmp_path})"
+        fi
+    else
+        FAILED_LOGIN_FTMP_STATUS="N/A (FTMP_FILE unsupported by this login.defs)"
+    fi
+    if [[ "$FAILED_LOGIN_SHADOW_STATUS" == OK* && "$FAILED_LOGIN_BTMP_STATUS" == OK* \
+        && "$FAILED_LOGIN_FAILLOG_STATUS" != FAILED* && "$FAILED_LOGIN_FTMP_STATUS" != FAILED* ]]; then
+        FAILED_LOGIN_STATUS="OK (separate shadow/faillog and btmp/lastb evidence validated)"
+        log OK "Failed-login mechanisms validated separately: ${FAILED_LOGIN_SHADOW_STATUS}; ${FAILED_LOGIN_BTMP_STATUS}"
+    else
+        FAILED_LOGIN_STATUS="FAILED (shadow=${FAILED_LOGIN_SHADOW_STATUS}; faillog=${FAILED_LOGIN_FAILLOG_STATUS}; btmp=${FAILED_LOGIN_BTMP_STATUS}; FTMP=${FAILED_LOGIN_FTMP_STATUS})"
+        record_skip "failed-login logging" "separate FAILLOG_ENAB/faillog and btmp/lastb validation is incomplete"
         log WARN "Failed-login logging validation is incomplete: ${FAILED_LOGIN_STATUS}"
     fi
+    if [[ "$MODE" == "apply" ]]; then
+        {
+            printf 'Failed-login logging validation at %s\n\n' "$(timestamp)"
+            printf 'Lynis/shadow indicator: %s\n' "$FAILED_LOGIN_SHADOW_STATUS"
+            printf 'faillog path: %s\n' "$FAILED_LOGIN_FAILLOG_STATUS"
+            printf 'btmp history: %s\n' "$FAILED_LOGIN_BTMP_STATUS"
+            printf 'FTMP_FILE: %s\n' "$FAILED_LOGIN_FTMP_STATUS"
+            printf 'pam_faillock: existing policy retained; no second lockout policy installed\n'
+        } > "$FAILED_LOGIN_REPORT"
+        chmod 0600 "$FAILED_LOGIN_REPORT"
+    fi
+}
+
+capture_btmp_metadata_before_change() {
+    local btmp_path="$1" metadata_file="${BACKUP_DIR}/failed-login-btmp-metadata-before.txt"
+    [[ "$MODE" == "apply" ]] || return 0
+    {
+        printf 'path=%s\n' "$btmp_path"
+        if [[ -e "$btmp_path" ]]; then
+            printf 'exists=yes\n'
+            printf 'uid=%s\n' "$(stat -c '%u' "$btmp_path")"
+            printf 'gid=%s\n' "$(stat -c '%g' "$btmp_path")"
+            printf 'mode=%s\n' "$(stat -c '%a' "$btmp_path")"
+        else
+            printf 'exists=no\n'
+        fi
+        printf 'content-rollback=never\n'
+    } > "$metadata_file"
+    chmod 0600 "$metadata_file"
 }
 
 configure_failed_login_logging() {
@@ -2630,6 +2698,9 @@ configure_failed_login_logging() {
         return 0
     fi
     replace_setting "$login_defs" FAILLOG_ENAB yes
+    if grep -Eq '^[[:space:]#]*FTMP_FILE([[:space:]]|=)' "$login_defs"; then
+        replace_setting "$login_defs" FTMP_FILE "$btmp_path"
+    fi
 
     if [[ "$MODE" == "dry-run" ]]; then
         FAILED_LOGIN_STATUS="PLANNED"
@@ -2648,7 +2719,7 @@ configure_failed_login_logging() {
         return 0
     fi
     btmp_group="utmp"
-    transaction_copy "$btmp_path" failed-login-btmp
+    capture_btmp_metadata_before_change "$btmp_path"
     if [[ ! -d "$btmp_parent" ]]; then
         install -d -o root -g root -m 0755 "$btmp_parent" || return 1
     fi
@@ -2668,10 +2739,12 @@ configure_failed_login_logging() {
         btmp_changed=1
     fi
     if [[ "$btmp_changed" -eq 1 ]]; then
-        record_change "Validated failed-login accounting file ${btmp_path} as root:${btmp_group} 0660 without truncation"
+        record_change "Validated failed-login accounting file ${btmp_path} as root:${btmp_group} 0660 without truncation or content backup"
     else
         log INFO "Failed-login accounting file already current: ${btmp_path}"
     fi
+    # btmp is audit evidence: it is never archived by content and never
+    # restored or deleted during rollback; only pre-change metadata is kept.
     validate_failed_login_logging
 }
 

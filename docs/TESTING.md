@@ -134,23 +134,27 @@ Remote-Admin-Account durchgeführt:
 ```bash
 sudo ./harden.sh --apply --aggressive
 grep -E '^[[:space:]]*FAILLOG_ENAB' /etc/login.defs
+grep -E '^[[:space:]]*FTMP_FILE' /etc/login.defs || true
+command -v faillog >/dev/null && sudo faillog -a
 sudo stat -c '%U:%G %a %s %n' /var/log/btmp
 sudo lastb -f /var/log/btmp | head
-sudo grep -n . /etc/profile.d/99-security-shell-timeout.sh
-env -i PATH="$PATH" bash --noprofile --norc -ic \
-  '. /etc/profile.d/99-security-shell-timeout.sh; printf "TMOUT=%s\\n" "$TMOUT"'
-env -i PATH="$PATH" bash --noprofile --norc -c \
-  '. /etc/profile.d/99-security-shell-timeout.sh; printf "TMOUT=%s\\n" "${TMOUT-}"'
+sudo cat /root/failed-login-logging-report.txt
+sudo env -i HOME=/root PATH="$PATH" bash -lic 'printf "login-shell TMOUT=%s\\n" "$TMOUT"'
+sudo env -i HOME=/root PATH="$PATH" bash -lc 'printf "noninteractive TMOUT=%s\\n" "${TMOUT-}"'
 ```
 
-Der erste interaktive Befehl muss `TMOUT=900` ausgeben (oder einen bewusst
+Der Bericht muss `FAILLOG_ENAB`/`faillog` als Shadow-/Lynis-Nachweis und
+`btmp`/`lastb` als separaten utmp-Verlauf zeigen. `FTMP_FILE` wird nur auf
+Distributionen geprüft, die diese vorhandene `login.defs`-Option verwenden.
+Der interaktive Login-Shell-Befehl muss `TMOUT=900` ausgeben (oder einen bewusst
 gesetzten Admin-Override), der nichtinteraktive Befehl keinen neuen Wert. Prüfe
 eine echte fehlgeschlagene Anmeldung ausschließlich auf einer lokalen,
-entbehrlichen Test-VM oder einem ausdrücklich freigegebenen Testkonto; dabei
-muss die bestehende `pam_faillock`-Schwelle eingehalten werden. Anschließend
-`lastb -f /var/log/btmp` erneut prüfen. Wiederhole den Apply: `btmp`-Inhalt und
-Metadaten sowie die Timeout-Datei müssen unverändert bleiben, SSH-Remote-
-Kommandos dürfen weiterhin nicht durch `TMOUT` beeinflusst werden.
+entbehrlichen Test-VM oder einem ausdrücklich freigegebenen Testkonto; niemals
+gegen Manu oder den Remote-Admin. Dabei muss die bestehende `pam_faillock`-
+Schwelle eingehalten werden. Anschließend `lastb -f /var/log/btmp` erneut
+prüfen. Wiederhole den Apply: `btmp`-Inhalt und Metadaten sowie die Timeout-Datei
+müssen unverändert bleiben, SSH-Remote-Kommandos dürfen weiterhin nicht durch
+`TMOUT` beeinflusst werden.
 
 Für die Findings #4, #12, #17, #18, #19 und #20 zusätzlich prüfen:
 
