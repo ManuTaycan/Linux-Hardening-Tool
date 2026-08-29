@@ -88,6 +88,16 @@ für 1.1.3 wird erst nach dem vollständigen Zielsystemtest erstellt.
   and file-descriptor snapshots, classifies transient versus persistent waits,
   and never kills a D-state process.
 - Deleted-open-file handling now writes a normalized PID/process/user/FD/type/link-count/path inventory with systemd-unit attribution. Only a small explicit service allowlist is restarted once; SSH, Tailscale, networking, firewall, system, dbus, and unknown owners are default-denied and remain visible in the report.
+- Failed-login auditing now reports the separate Shadow/Lynis `FAILLOG_ENAB` /
+  optional `faillog` and utmp `btmp`/`lastb` mechanisms without conflating
+  them. It preserves `btmp` records, stores metadata only (never its content),
+  never restores or deletes audit history, and leaves the existing `pam_faillock`
+  lockout policy as the only lockout mechanism. On modern Ubuntu without
+  `lastb`, the active journald plus effective SSH `LogLevel`/`SyslogFacility`
+  configuration is validated instead; legacy `btmp`/`lastb` is reported as N/A
+  and no synthetic failed login is created. Interactive shells receive an
+  override-safe 900-second `TMOUT` through a managed profile; non-interactive
+  commands are unaffected.
 
 ### Added
 

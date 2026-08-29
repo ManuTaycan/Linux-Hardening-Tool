@@ -52,6 +52,14 @@ LYNIS_PARSE_STATUS="NOT RUN"
 FIREWALL_STATUS="NOT RUN"
 SSH_STATUS="NOT RUN"
 PAM_STATUS="NOT RUN"
+FAILED_LOGIN_STATUS="NOT RUN"
+FAILED_LOGIN_SHADOW_STATUS="NOT RUN"
+FAILED_LOGIN_FAILLOG_STATUS="NOT RUN"
+FAILED_LOGIN_BTMP_STATUS="NOT RUN"
+FAILED_LOGIN_MODERN_STATUS="NOT RUN"
+FAILED_LOGIN_FTMP_STATUS="N/A"
+FAILED_LOGIN_REPORT="${HARDEN_FAILED_LOGIN_REPORT:-/root/failed-login-logging-report.txt}"
+SHELL_TIMEOUT_STATUS="NOT RUN"
 AUDIT_STATUS="NOT RUN"
 APPARMOR_STATUS="NOT RUN"
 AIDE_STATUS="NOT RUN"
@@ -449,7 +457,7 @@ backup_config() {
         /etc/ssh /etc/pam.d /etc/security /etc/sysctl.conf /etc/sysctl.d
         /etc/systemd /etc/audit /etc/rsyslog.conf /etc/rsyslog.d
         /etc/nftables.conf /etc/nftables.d /etc/fail2ban /etc/sudoers
-        /etc/sudoers.d /etc/login.defs /etc/modprobe.d /etc/fstab /etc/apt
+        /etc/sudoers.d /etc/login.defs /etc/profile.d /etc/modprobe.d /etc/fstab /etc/apt
         /etc/default/grub /etc/default/grub.d /etc/grub.d /etc/issue /etc/issue.net
     )
     local -a present=()
@@ -2590,27 +2598,283 @@ EOF
     fi
 }
 
+failed_login_lastb_available() {
+    command -v lastb >/dev/null 2>&1
+}
+
+validate_modern_failed_login_path() {
+    local sshd_effective="" log_level="" syslog_facility="" journald_status="" ssh_status=""
+    if ! command -v journalctl >/dev/null 2>&1 \
+        || ! systemctl is-active --quiet systemd-journald.service 2>/dev/null; then
+        journald_status="FAILED (systemd-journald unavailable or inactive)"
+    else
+        journald_status="OK (systemd-journald active)"
+    fi
+    if [[ -z "$SSHD_BIN" || ! -x "$SSHD_BIN" ]] && command -v sshd >/dev/null 2>&1; then
+        SSHD_BIN="$(command -v sshd)"
+    fi
+    if [[ -n "$SSHD_BIN" ]] && sshd_effective="$("$SSHD_BIN" -T 2>/dev/null)"; then
+        log_level="$(awk '$1 == "loglevel" {print tolower($2); exit}' <<<"$sshd_effective")"
+        syslog_facility="$(awk '$1 == "syslogfacility" {print $2; exit}' <<<"$sshd_effective")"
+        case "$log_level" in
+            info|verbose|debug|debug1|debug2|debug3)
+                ssh_status="OK (LogLevel=${log_level}; SyslogFacility=${syslog_facility:-unspecified})"
+                ;;
+            *)
+                ssh_status="FAILED (LogLevel=${log_level:-missing}; SyslogFacility=${syslog_facility:-unspecified})"
+                ;;
+        esac
+    else
+        ssh_status="FAILED (sshd -T effective configuration unavailable)"
+    fi
+    if [[ "$journald_status" == OK* && "$ssh_status" == OK* ]]; then
+        FAILED_LOGIN_MODERN_STATUS="OK (journal/syslog SSH auth path configured; ${journald_status}; ${ssh_status})"
+    else
+        FAILED_LOGIN_MODERN_STATUS="FAILED (${journald_status}; ${ssh_status})"
+    fi
+}
+
+validate_failed_login_logging() {
+    local login_defs="${HARDEN_LOGIN_DEFS:-/etc/login.defs}"
+    local btmp_path="${HARDEN_BTMP_PATH:-/var/log/btmp}"
+    local faillog_path="${HARDEN_FAILLOG_PATH:-/var/log/faillog}"
+    local faillog_enabled="" ftmp_file="" lastb_status="unavailable" faillog_status="N/A (tool/path unavailable)" transport_valid=0
+
+    if [[ "$MODE" == "dry-run" ]]; then
+        FAILED_LOGIN_STATUS="N/A (dry-run)"
+        FAILED_LOGIN_SHADOW_STATUS="N/A (dry-run)"
+        FAILED_LOGIN_FAILLOG_STATUS="N/A (dry-run)"
+        FAILED_LOGIN_BTMP_STATUS="N/A (dry-run)"
+        FAILED_LOGIN_MODERN_STATUS="N/A (dry-run)"
+        FAILED_LOGIN_FTMP_STATUS="N/A (dry-run)"
+        log INFO "Would validate separate FAILLOG_ENAB/faillog and btmp/lastb failed-login mechanisms"
+        return 0
+    fi
+
+    faillog_enabled="$(awk '$1 == "FAILLOG_ENAB" { value=$2 } END { print value }' "$login_defs" 2>/dev/null || true)"
+    if [[ "$faillog_enabled" == "yes" ]]; then
+        FAILED_LOGIN_SHADOW_STATUS="OK (FAILLOG_ENAB=yes; Lynis/shadow indicator)"
+    else
+        FAILED_LOGIN_SHADOW_STATUS="FAILED (FAILLOG_ENAB=${faillog_enabled:-missing})"
+    fi
+    if [[ -e "$faillog_path" ]]; then
+        if [[ -f "$faillog_path" && ! -L "$faillog_path" ]] \
+            && { ! command -v faillog >/dev/null 2>&1 || faillog -a >/dev/null 2>&1; }; then
+            faillog_status="OK (faillog path readable: ${faillog_path})"
+        else
+            faillog_status="FAILED (faillog path/tool not readable: ${faillog_path})"
+        fi
+    fi
+    FAILED_LOGIN_FAILLOG_STATUS="$faillog_status"
+    if failed_login_lastb_available; then
+        if lastb -f "$btmp_path" >/dev/null 2>&1; then
+            lastb_status="readable"
+        fi
+        if [[ -f "$btmp_path" && ! -L "$btmp_path" && "$lastb_status" == "readable" ]]; then
+            FAILED_LOGIN_BTMP_STATUS="OK (legacy btmp regular; lastb readable)"
+        else
+            FAILED_LOGIN_BTMP_STATUS="FAILED (legacy btmp=${btmp_path}; lastb=${lastb_status})"
+        fi
+        FAILED_LOGIN_MODERN_STATUS="N/A (legacy lastb path available)"
+    else
+        FAILED_LOGIN_BTMP_STATUS="N/A (lastb removed/unavailable; journal/syslog path used)"
+        validate_modern_failed_login_path
+    fi
+    if grep -Eq '^[[:space:]#]*FTMP_FILE([[:space:]]|=)' "$login_defs"; then
+        ftmp_file="$(awk '$1 == "FTMP_FILE" { value=$2 } END { print value }' "$login_defs" 2>/dev/null || true)"
+        if [[ "$ftmp_file" == "$btmp_path" ]]; then
+            FAILED_LOGIN_FTMP_STATUS="OK (FTMP_FILE=${btmp_path})"
+        else
+            FAILED_LOGIN_FTMP_STATUS="FAILED (FTMP_FILE=${ftmp_file:-missing}; expected ${btmp_path})"
+        fi
+    else
+        FAILED_LOGIN_FTMP_STATUS="N/A (FTMP_FILE unsupported by this login.defs)"
+    fi
+    if [[ "$FAILED_LOGIN_BTMP_STATUS" == OK* || "$FAILED_LOGIN_MODERN_STATUS" == OK* ]]; then
+        transport_valid=1
+    fi
+    if [[ "$FAILED_LOGIN_SHADOW_STATUS" == OK* && "$transport_valid" -eq 1 \
+        && "$FAILED_LOGIN_FAILLOG_STATUS" != FAILED* && "$FAILED_LOGIN_FTMP_STATUS" != FAILED* ]]; then
+        FAILED_LOGIN_STATUS="OK (separate failed-login mechanisms configured; no failed-login event was generated)"
+        log OK "Failed-login mechanisms validated separately: ${FAILED_LOGIN_SHADOW_STATUS}; ${FAILED_LOGIN_BTMP_STATUS}; ${FAILED_LOGIN_MODERN_STATUS}"
+    else
+        FAILED_LOGIN_STATUS="FAILED (shadow=${FAILED_LOGIN_SHADOW_STATUS}; faillog=${FAILED_LOGIN_FAILLOG_STATUS}; legacy-btmp=${FAILED_LOGIN_BTMP_STATUS}; modern=${FAILED_LOGIN_MODERN_STATUS}; FTMP=${FAILED_LOGIN_FTMP_STATUS})"
+        record_skip "failed-login logging" "separate legacy or modern failed-login path validation is incomplete"
+        log WARN "Failed-login logging validation is incomplete: ${FAILED_LOGIN_STATUS}"
+    fi
+    if [[ "$MODE" == "apply" ]]; then
+        {
+            printf 'Failed-login logging validation at %s\n\n' "$(timestamp)"
+            printf 'Lynis/shadow indicator: %s\n' "$FAILED_LOGIN_SHADOW_STATUS"
+            printf 'faillog path: %s\n' "$FAILED_LOGIN_FAILLOG_STATUS"
+            printf 'legacy btmp/lastb history: %s\n' "$FAILED_LOGIN_BTMP_STATUS"
+            printf 'modern journal/syslog SSH auth path: %s\n' "$FAILED_LOGIN_MODERN_STATUS"
+            printf 'FTMP_FILE: %s\n' "$FAILED_LOGIN_FTMP_STATUS"
+            printf 'pam_faillock: existing policy retained; no second lockout policy installed\n'
+            printf 'observed failed-login event: not generated by harden.sh\n'
+        } > "$FAILED_LOGIN_REPORT"
+        chmod 0600 "$FAILED_LOGIN_REPORT"
+    fi
+}
+
+capture_btmp_metadata_before_change() {
+    local btmp_path="$1" metadata_file="${BACKUP_DIR}/failed-login-btmp-metadata-before.txt"
+    [[ "$MODE" == "apply" ]] || return 0
+    {
+        printf 'path=%s\n' "$btmp_path"
+        if [[ -e "$btmp_path" ]]; then
+            printf 'exists=yes\n'
+            printf 'uid=%s\n' "$(stat -c '%u' "$btmp_path")"
+            printf 'gid=%s\n' "$(stat -c '%g' "$btmp_path")"
+            printf 'mode=%s\n' "$(stat -c '%a' "$btmp_path")"
+        else
+            printf 'exists=no\n'
+        fi
+        printf 'content-rollback=never\n'
+    } > "$metadata_file"
+    chmod 0600 "$metadata_file"
+}
+
+configure_failed_login_logging() {
+    local login_defs="${HARDEN_LOGIN_DEFS:-/etc/login.defs}"
+    local btmp_path="${HARDEN_BTMP_PATH:-/var/log/btmp}"
+    local btmp_parent btmp_group
+    btmp_parent="$(dirname -- "$btmp_path")"
+
+    if [[ ! -f "$login_defs" ]]; then
+        FAILED_LOGIN_STATUS="SKIPPED (login.defs unavailable)"
+        record_skip "failed-login logging" "${login_defs} is unavailable; no alternate lockout policy was added"
+        return 0
+    fi
+    replace_setting "$login_defs" FAILLOG_ENAB yes
+    if grep -Eq '^[[:space:]#]*FTMP_FILE([[:space:]]|=)' "$login_defs"; then
+        replace_setting "$login_defs" FTMP_FILE "$btmp_path"
+    fi
+
+    if [[ "$MODE" == "dry-run" ]]; then
+        FAILED_LOGIN_STATUS="PLANNED"
+        log INFO "Would preserve or create ${btmp_path} as root:utmp 0660 without deleting its accounting contents"
+        validate_failed_login_logging
+        return 0
+    fi
+    if [[ -e "$btmp_path" && ( ! -f "$btmp_path" || -L "$btmp_path" ) ]]; then
+        FAILED_LOGIN_STATUS="FAILED (unsafe btmp path)"
+        record_skip "failed-login logging" "${btmp_path} is not a regular non-symlink file"
+        return 0
+    fi
+    if ! getent group utmp >/dev/null 2>&1; then
+        FAILED_LOGIN_STATUS="FAILED (utmp group unavailable)"
+        record_skip "failed-login logging" "the distribution utmp group is unavailable; ${btmp_path} ownership was not guessed"
+        return 0
+    fi
+    btmp_group="utmp"
+    capture_btmp_metadata_before_change "$btmp_path"
+    if [[ ! -d "$btmp_parent" ]]; then
+        install -d -o root -g root -m 0755 "$btmp_parent" || return 1
+    fi
+    # These operations preserve existing records and are skipped when metadata is
+    # already distro-correct, so a converged run does not touch btmp at all.
+    local btmp_changed=0
+    if [[ ! -e "$btmp_path" ]]; then
+        touch "$btmp_path" || return 1
+        btmp_changed=1
+    fi
+    if [[ "$(stat -c '%U:%G' "$btmp_path")" != "root:${btmp_group}" ]]; then
+        chown root:"$btmp_group" "$btmp_path" || return 1
+        btmp_changed=1
+    fi
+    if [[ "$(stat -c '%a' "$btmp_path")" != 660 ]]; then
+        chmod 0660 "$btmp_path" || return 1
+        btmp_changed=1
+    fi
+    if [[ "$btmp_changed" -eq 1 ]]; then
+        record_change "Validated failed-login accounting file ${btmp_path} as root:${btmp_group} 0660 without truncation or content backup"
+    else
+        log INFO "Failed-login accounting file already current: ${btmp_path}"
+    fi
+    # btmp is audit evidence: it is never archived by content and never
+    # restored or deleted during rollback; only pre-change metadata is kept.
+    validate_failed_login_logging
+}
+
+validate_interactive_shell_timeout() {
+    local profile_path="${HARDEN_SHELL_TIMEOUT_PROFILE:-/etc/profile.d/99-security-shell-timeout.sh}"
+    local expected_timeout="${HARDEN_SHELL_TIMEOUT_SECONDS:-900}"
+    local interactive_timeout non_interactive_timeout overridden_timeout configured_timeout
+
+    if [[ "$MODE" == "dry-run" ]]; then
+        SHELL_TIMEOUT_STATUS="N/A (dry-run)"
+        log INFO "Would validate interactive-only TMOUT behavior from ${profile_path}"
+        return 0
+    fi
+    if ! command -v bash >/dev/null 2>&1 || [[ ! -f "$profile_path" ]]; then
+        SHELL_TIMEOUT_STATUS="FAILED (bash or managed profile unavailable)"
+        return 0
+    fi
+    interactive_timeout="$(env -i PATH="$PATH" bash --noprofile --norc -ic ". \"$profile_path\"; printf '%s' \"\${TMOUT-}\"" 2>/dev/null || true)"
+    non_interactive_timeout="$(env -i PATH="$PATH" bash --noprofile --norc -c ". \"$profile_path\"; printf '%s' \"\${TMOUT-}\"" 2>/dev/null || true)"
+    overridden_timeout="$(env -i PATH="$PATH" TMOUT=321 bash --noprofile --norc -ic ". \"$profile_path\"; printf '%s' \"\${TMOUT-}\"" 2>/dev/null || true)"
+    configured_timeout="$(env -i PATH="$PATH" HARDEN_SHELL_TMOUT=600 bash --noprofile --norc -ic ". \"$profile_path\"; printf '%s' \"\${TMOUT-}\"" 2>/dev/null || true)"
+    if [[ "$interactive_timeout" == "$expected_timeout" && -z "$non_interactive_timeout" \
+        && "$overridden_timeout" == 321 && "$configured_timeout" == 600 ]]; then
+        SHELL_TIMEOUT_STATUS="OK (interactive default ${expected_timeout}s; override preserved)"
+        log OK "Interactive shell timeout is active without affecting non-interactive commands"
+    else
+        SHELL_TIMEOUT_STATUS="FAILED (interactive=${interactive_timeout:-unset}; non-interactive=${non_interactive_timeout:-unset}; override=${overridden_timeout:-unset}; configured=${configured_timeout:-unset})"
+        record_skip "interactive shell timeout" "managed profile did not validate as interactive-only and override-safe"
+        log WARN "Interactive shell timeout validation is incomplete: ${SHELL_TIMEOUT_STATUS}"
+    fi
+}
+
+configure_interactive_shell_timeout() {
+    local timeout="${HARDEN_SHELL_TIMEOUT_SECONDS:-900}"
+    local profile_path="${HARDEN_SHELL_TIMEOUT_PROFILE:-/etc/profile.d/99-security-shell-timeout.sh}"
+    if [[ ! "$timeout" =~ ^[1-9][0-9]{0,4}$ || "$timeout" -gt 86400 ]]; then
+        SHELL_TIMEOUT_STATUS="SKIPPED (invalid timeout)"
+        record_skip "interactive shell timeout" "HARDEN_SHELL_TIMEOUT_SECONDS must be an integer from 1 through 86400"
+        return 0
+    fi
+    {
+        cat <<'EOF'
+# Managed by harden.sh: apply an idle timeout only to interactive POSIX shells.
+# An administrator may retain a session-specific TMOUT or set HARDEN_SHELL_TMOUT.
+case "$-" in
+    *i*)
+        if [ -z "${TMOUT+x}" ]; then
+EOF
+        printf '            TMOUT="${HARDEN_SHELL_TMOUT:-%s}"\n' "$timeout"
+        cat <<'EOF'
+            export TMOUT
+        fi
+        ;;
+esac
+EOF
+    } | install_managed_file "$profile_path" 0644
+    validate_interactive_shell_timeout
+}
+
 configure_password_policy() {
-    [[ -f /etc/login.defs ]] || return 0
-    replace_setting /etc/login.defs PASS_MAX_DAYS 90
-    replace_setting /etc/login.defs PASS_MIN_DAYS 1
-    replace_setting /etc/login.defs PASS_WARN_AGE 14
-    replace_setting /etc/login.defs UMASK 027
-    replace_setting /etc/login.defs LOGIN_RETRIES 5
-    replace_setting /etc/login.defs LOGIN_TIMEOUT 60
+    local login_defs="${HARDEN_LOGIN_DEFS:-/etc/login.defs}"
+    [[ -f "$login_defs" ]] || return 0
+    replace_setting "$login_defs" PASS_MAX_DAYS 90
+    replace_setting "$login_defs" PASS_MIN_DAYS 1
+    replace_setting "$login_defs" PASS_WARN_AGE 14
+    replace_setting "$login_defs" UMASK 027
+    replace_setting "$login_defs" LOGIN_RETRIES 5
+    replace_setting "$login_defs" LOGIN_TIMEOUT 60
     local chpasswd_help=""
     if command -v chpasswd >/dev/null 2>&1; then
         chpasswd_help="$(chpasswd --help 2>&1 || true)"
     fi
     if grep -F 'YESCRYPT' <<<"$chpasswd_help" >/dev/null; then
-        replace_setting /etc/login.defs ENCRYPT_METHOD YESCRYPT
-        remove_setting /etc/login.defs SHA_CRYPT_MIN_ROUNDS
-        remove_setting /etc/login.defs SHA_CRYPT_MAX_ROUNDS
+        replace_setting "$login_defs" ENCRYPT_METHOD YESCRYPT
+        remove_setting "$login_defs" SHA_CRYPT_MIN_ROUNDS
+        remove_setting "$login_defs" SHA_CRYPT_MAX_ROUNDS
         record_skip "AUTH-9230" "Lynis 3.1.6 asks for SHA_CRYPT rounds even with YESCRYPT; meaningless SHA settings were intentionally not score-gamed"
     else
-        replace_setting /etc/login.defs ENCRYPT_METHOD SHA512
-        replace_setting /etc/login.defs SHA_CRYPT_MIN_ROUNDS 100000
-        replace_setting /etc/login.defs SHA_CRYPT_MAX_ROUNDS 200000
+        replace_setting "$login_defs" ENCRYPT_METHOD SHA512
+        replace_setting "$login_defs" SHA_CRYPT_MIN_ROUNDS 100000
+        replace_setting "$login_defs" SHA_CRYPT_MAX_ROUNDS 200000
     fi
 
     install_managed_file /etc/profile.d/99-security-umask.sh 0644 <<'EOF'
@@ -2646,6 +2910,8 @@ silent
 local_users_only
 EOF
     fi
+    configure_failed_login_logging
+    configure_interactive_shell_timeout
 }
 
 insert_pam_before_unix() {
@@ -5148,6 +5414,8 @@ Aggressive         : ${aggressive_label}
 SSH                : ${SSH_STATUS}
 Firewall           : ${FIREWALL_STATUS}
 PAM                : ${PAM_STATUS}
+Failed-login log   : ${FAILED_LOGIN_STATUS}
+Shell timeout      : ${SHELL_TIMEOUT_STATUS}
 Audit              : ${AUDIT_STATUS}
 AppArmor           : ${APPARMOR_STATUS}
 AIDE               : ${AIDE_STATUS}

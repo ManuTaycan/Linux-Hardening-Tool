@@ -12,6 +12,7 @@ eine konkrete Betreiberentscheidung oder ein Wartungsfenster.
 | AUTH-9230 | YESCRYPT wird nicht mit Legacy-SHA-Runden „optimiert“. | Lynis-/Profilunterstützung prüfen, nicht wirkungslose SHA-Werte setzen. |
 | NAME-4028 | Keine erfundene DNS-Domain. | Gültiges Forward-/Reverse-DNS mit dem Betreiber einrichten. |
 | AUTH-9282 | Kein pauschales Account-Ablaufdatum; das könnte Recovery oder Dienstkonten sperren. | Kontospezifische Ablaufdaten nach Eigentümerfreigabe setzen. |
+| Failed-login audit | `FAILLOG_ENAB=yes` ist der Lynis-/Shadow-Indikator für `login(1)`/`faillog`; `/var/log/btmp` und `lastb` sind ein separater utmp-basierter Verlauf. Bestehendes `pam_faillock` ist die einzige Lockout-Policy. | Keine absichtlichen Fehlversuche gegen Remote-Admin-Konten; nur in einer lokalen, entbehrlichen Testumgebung prüfen. |
 | Tailscale/rp_filter | Bei aktivem Tailscale ist `rp_filter=2` für `all`, `default`, relevante aktive Interfaces und `tailscale0` eine bewusste Kompatibilitäts-/Sicherheitsabwägung für asymmetrische Overlay-Routen. Ohne Tailscale wird `1` nur bei eindeutig einfachem IPv4-Routing gesetzt; Policy-Routing oder mehrere Default-Pfade bleiben mit Diagnosebericht unverändert. | Tailscale entfernen oder Routing so vereinfachen, dass striktes Filtering nachweislich sicher ist. |
 
 Jede Zeile ist eine dokumentierte Risikoabwägung, keine Score-Manipulation.

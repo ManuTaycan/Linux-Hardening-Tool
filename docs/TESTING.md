@@ -125,6 +125,47 @@ Sie bleibt vollständig sichtbar, wird als `anonymous-memfd` reportet und löst
 weder Restart noch Reboot aus. Normale `/var/... (deleted)`-Einträge bleiben
 dagegen weiterhin actionable bzw. manual-review-required.
 
+### Ubuntu-26.04.1-Retest failed-login audit und Shell-Timeout (#14)
+
+Führe den Apply aus einer zweiten, bestätigten SSH-/Recovery-Sitzung direkt
+ohne externe Pipe aus. Dabei werden keine absichtlichen Fehlversuche gegen den
+Remote-Admin-Account durchgeführt:
+
+```bash
+sudo ./harden.sh --apply --aggressive
+grep -E '^[[:space:]]*FAILLOG_ENAB' /etc/login.defs
+grep -E '^[[:space:]]*FTMP_FILE' /etc/login.defs || true
+command -v faillog >/dev/null && sudo faillog -a
+sudo stat -c '%U:%G %a %s %n' /var/log/btmp
+if command -v lastb >/dev/null; then sudo lastb -f /var/log/btmp | head; fi
+systemctl is-active systemd-journald.service
+sudo sshd -T | grep -E '^(loglevel|syslogfacility) '
+sudo cat /root/failed-login-logging-report.txt
+sudo env -i HOME=/root PATH="$PATH" bash -lic 'printf "login-shell TMOUT=%s\\n" "$TMOUT"'
+sudo env -i HOME=/root PATH="$PATH" bash -lc 'printf "noninteractive TMOUT=%s\\n" "${TMOUT-}"'
+```
+
+Der Bericht muss `FAILLOG_ENAB`/`faillog` als Shadow-/Lynis-Nachweis und
+`btmp`/`lastb` als separaten utmp-Verlauf zeigen. Auf Ubuntu 26.04 ohne
+`lastb` ist dieser Legacy-Pfad ausdrücklich `N/A`; `systemd-journald` aktiv
+sowie `sshd -T` mit `LogLevel` mindestens `INFO` und dokumentierter
+`SyslogFacility` bilden dann den modernen Konfigurationsnachweis. Es wird
+keine tatsächlich geschriebene fehlgeschlagene Anmeldung behauptet. `FTMP_FILE`
+wird nur auf Distributionen geprüft, die diese vorhandene `login.defs`-Option verwenden.
+Unter Ubuntu 26.04 ist der Gesamtstatus dabei `OK`, wenn `FAILLOG_ENAB=yes`
+und dieser moderne Pfad valide sind; ein fehlendes `lastb` oder `faillog` bleibt
+jeweils `N/A`.
+Der interaktive Login-Shell-Befehl muss `TMOUT=900` ausgeben (oder einen bewusst
+gesetzten Admin-Override), der nichtinteraktive Befehl keinen neuen Wert. Prüfe
+eine echte fehlgeschlagene Anmeldung ausschließlich auf einer lokalen,
+entbehrlichen Test-VM oder einem ausdrücklich freigegebenen Testkonto; niemals
+gegen Manu oder den Remote-Admin. Dabei muss die bestehende `pam_faillock`-
+Schwelle eingehalten werden. Anschließend `lastb -f /var/log/btmp` erneut
+prüfen. Wiederhole den Apply: `btmp`-Inhalt und Metadaten sowie die Timeout-Datei
+müssen unverändert bleiben. Das Projekt verwendet ausschließlich metadata-only
+capture; ein btmp-Inhalts-Restore oder -Rollback findet nicht statt. SSH-Remote-Kommandos dürfen weiterhin nicht durch
+`TMOUT` beeinflusst werden.
+
 Für die Findings #4, #12, #17, #18, #19 und #20 zusätzlich prüfen:
 
 - `aide-lynis-FINT-4402-evidence.txt`, AIDE-Konfigurationsprüfung,
