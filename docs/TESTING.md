@@ -184,7 +184,10 @@ sudo ./harden.sh --apply --aggressive
 Der IPv6-Bericht muss Policy, Grund sowie effektive `all`-/`default`-/Interface-
 Werte nennen. Bei aktivem Tailscale, globaler Adresse, IPv6-Default- oder
 Policy-Route, Listener oder Forwarding bleibt IPv6 aktiviert und die sicheren
-Redirect-/Source-Route-Sysctls werden validiert. Prüfe danach SSH und Tailscale
+Redirect-/Source-Route-Sysctls werden validiert. Auf dem normalen nicht
+forwardenden Host müssen `all` und `default` bei `accept_source_route=-1` und
+`forwarding=0` stehen; ein aktiver oder unklarer Forwarding-Zustand wird
+erhalten und blockiert eine Deaktivierung. Prüfe danach SSH und Tailscale
 einschließlich eines genehmigten `tailscale ping <TAILSCALE-PEER>`.
 
 Nur auf einer nachweislich IPv6-unbenutzten Test-VM darf zusätzlich der
@@ -199,7 +202,11 @@ sudo ./harden.sh --apply --aggressive --disable-ipv6
 
 Der erste Dry-run muss die Deaktivierung nur planen. Der Apply darf keine
 GRUB-Parameter setzen und muss die persistente sysctl-Policy sowie den
-kontrollierten Rückkehrweg dokumentieren. Der Zweitlauf muss konvergieren.
+kontrollierten Rückkehrweg dokumentieren. Prüfe für `all`, `default`, `lo` und
+jede weitere vorhandene IPv6-Instanz jeweils `disable_ipv6=1`. Ein späterer
+normaler Apply darf diesen vom Tool gesetzten Zustand nicht überraschend
+aufheben, sondern muss `disabled-preserved-existing` reporten. Der Zweitlauf
+muss konvergieren.
 
 `/etc/issue` und `/etc/issue.net` müssen exakt `Authorized access only.
 Disconnect if you are not authorized.` enthalten und mode `0644` haben;

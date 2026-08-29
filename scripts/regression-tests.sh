@@ -1674,21 +1674,47 @@ case "${1:-} ${2:-} ${3:-} ${4:-}" in
     '-6 rule show '*) [[ "${IPV6_TEST_POLICY_ROUTE:-0}" == 1 ]] && printf '100: from all lookup 100\n' || printf '0: from all lookup local\n32766: from all lookup main\n32767: from all lookup default\n' ;;
 esac
 EOF
-    cat > "$mock_bin/ss" <<'EOF'
+cat > "$mock_bin/ss" <<'EOF'
 #!/usr/bin/env bash
-[[ "${IPV6_TEST_LISTENER:-0}" == 1 ]] && printf 'tcp LISTEN 0 128 [::]:22 [::]:*\n'
+[[ "$1 $2 $3" == '-H -6 -lntu' ]] || exit 64
+case "${IPV6_TEST_LISTENER:-0}" in
+    1) printf 'tcp LISTEN 0 128 [::]:22 [::]:*\n' ;;
+    wildcard) printf 'tcp LISTEN 0 128 *:443 *:*\n' ;;
+esac
 EOF
-    cat > "$mock_bin/sysctl" <<'EOF'
+cat > "$mock_bin/sysctl" <<'EOF'
 #!/usr/bin/env bash
-[[ "$1" == -n ]] || exit 64
-path="${HARDEN_PROC_SYS_ROOT:?}/${2//./\/}"
-cat "$path"
+set -Eeuo pipefail
+root="${HARDEN_PROC_SYS_ROOT:?}"
+set_value() {
+    local key="$1" value="$2" path="$root/${key//./\/}"
+    [[ -e "$path" ]] || return 1
+    printf '%s\n' "$value" > "$path"
+}
+case "${1:-}" in
+    -n) cat "$root/${2//./\/}" ;;
+    -w)
+        key="${2%%=*}"; value="${2#*=}"
+        set_value "$key" "$value"
+        ;;
+    -p)
+        count=0
+        while IFS='=' read -r key value; do
+            key="${key//[[:space:]]/}"; value="${value//[[:space:]]/}"
+            [[ -n "$key" && "$key" != \#* ]] || continue
+            count=$((count + 1))
+            set_value "$key" "$value"
+            [[ "${IPV6_TEST_FAIL_SYSCTL_AFTER:-0}" -eq 0 || "$count" -lt "${IPV6_TEST_FAIL_SYSCTL_AFTER}" ]] || exit 1
+        done < "$2"
+        ;;
+    *) exit 64 ;;
+esac
 EOF
     chmod +x "$mock_bin/systemctl" "$mock_bin/ip" "$mock_bin/ss" "$mock_bin/sysctl"
 
     make_ipv6_tree() {
         local root="$1" interface key
-        for interface in all default eth0 tailscale0; do
+        for interface in all default lo eth0 tailscale0; do
             install -d "$root/net/ipv6/conf/$interface"
             for key in disable_ipv6 accept_redirects accept_source_route forwarding; do printf '0\n' > "$root/net/ipv6/conf/$interface/$key"; done
         done
@@ -1702,12 +1728,14 @@ EOF
             IPV6_TEST_TAILSCALE="$tailscale" IPV6_TEST_GLOBAL="$global" IPV6_TEST_DEFAULT_ROUTE="$default_route" IPV6_TEST_LISTENER="$listener" IPV6_TEST_POLICY_ROUTE="$policy_route" bash -c '
                 source "$1/harden.sh"; trap - ERR EXIT
                 MODE=apply; AGGRESSIVE=1; DISABLE_IPV6="$3"; log() { :; }; record_skip() { :; }
-                detect_ipv6_policy
-                [[ "$IPV6_POLICY" == "$2" ]] || { printf "policy=%s reason=%s\n" "$IPV6_POLICY" "$IPV6_REASON" >&2; exit 1; }
+                set +e; detect_ipv6_policy; detect_status=$?; set -e
+                [[ "$IPV6_POLICY" == "$2" ]] || { printf "status=%s policy=%s reason=%s forwarding=%s\n" "$detect_status" "$IPV6_POLICY" "$IPV6_REASON" "$IPV6_FORWARDING_STATE" >&2; exit 1; }
                 if [[ "$IPV6_POLICY" == disabled-explicit-opt-in ]]; then
                     candidates="$(ipv6_policy_candidates)"
                     grep -Fxq "net.ipv6.conf.all.disable_ipv6=1" <<<"$candidates"
                     grep -Fxq "net.ipv6.conf.eth0.disable_ipv6=1" <<<"$candidates" || { printf "candidates=%s\n" "$candidates" >&2; exit 1; }
+                    grep -Fxq "net.ipv6.conf.lo.disable_ipv6=1" <<<"$candidates"
+                    grep -Fxq "net.ipv6.conf.tailscale0.disable_ipv6=1" <<<"$candidates"
                 else
                     ! ipv6_policy_candidates | grep -q disable_ipv6
                 fi
@@ -1718,6 +1746,7 @@ EOF
     run_ipv6_case global-address 0 1 0 0 0 0 1 enabled-safety-blocked
     run_ipv6_case default-route 0 0 1 0 0 0 1 enabled-safety-blocked
     run_ipv6_case listener 0 0 0 1 0 0 1 enabled-safety-blocked
+    run_ipv6_case wildcard-listener 0 0 0 wildcard 0 0 1 enabled-safety-blocked
     run_ipv6_case forwarding 0 0 0 0 1 0 1 enabled-safety-blocked
     run_ipv6_case policy-routing 0 0 0 0 0 1 1 enabled-safety-blocked
     run_ipv6_case tailscale 1 0 0 0 0 0 1 enabled-safety-blocked
@@ -1735,6 +1764,84 @@ EOF
             grep -Fxq unchanged "$HARDEN_SYSCTL_CONFIG"
             [[ ! -e "$HARDEN_IPV6_REPORT" ]]
         ' _ "$repo_root" || fail "IPv6 dry-run wrote managed state or did not plan explicit disable"
+
+    run_ipv6_apply() {
+        local root="$1" disable="$2" fail_after="${3:-0}"
+        env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_PROC_SYS_ROOT="$root/proc/sys" \
+            HARDEN_SYSCTL_CONFIG="$root/99-security-hardening.conf" HARDEN_IPV6_REPORT="$root/ipv6-report.txt" \
+            HARDEN_RP_FILTER_REPORT="$root/rp-filter-report.txt" IPV6_TEST_FAIL_SYSCTL_AFTER="$fail_after" IPV6_TEST_EXPECT_FAILURE="$([[ "$fail_after" -gt 0 ]] && printf 1 || printf 0)" bash -c '
+                source "$1/harden.sh"; trap - ERR EXIT
+                MODE=apply; AGGRESSIVE=1; DISABLE_IPV6="$3"; BACKUP_DIR="$2/backup"; CHANGE_LOG="$2/changes.tsv"
+                mkdir -p "$BACKUP_DIR"; : > "$CHANGE_LOG"
+                log() { :; }; record_change() { :; }; record_skip() { :; }
+                run_streamed() { "$@"; }
+                write_rp_filter_report() { :; }
+                write_ipv6_report() { printf "policy=%s\nreason=%s\nruntime=%s\npersistence=%s\n" "$IPV6_POLICY" "$IPV6_REASON" "$IPV6_RUNTIME_STATUS" "$IPV6_PERSISTENCE_STATUS" > "$HARDEN_IPV6_REPORT"; }
+                transaction_copy() { [[ -e "$1" ]] && cp -a -- "$1" "$BACKUP_DIR/$2" || : > "$BACKUP_DIR/$2.absent"; }
+                transaction_restore() { [[ -e "$BACKUP_DIR/$2.absent" ]] && rm -f -- "$1" || cp -a -- "$BACKUP_DIR/$2" "$1"; }
+                install_managed_file() { local destination="$1" mode="$2" temporary; MANAGED_FILE_CHANGED=0; temporary="$(mktemp)"; cat > "$temporary"; if [[ -f "$destination" ]] && cmp -s "$temporary" "$destination"; then rm -f "$temporary"; return 0; fi; mkdir -p -- "$(dirname -- "$destination")"; cp -- "$temporary" "$destination"; chmod "$mode" "$destination"; rm -f "$temporary"; MANAGED_FILE_CHANGED=1; }
+                set +e; configure_sysctl; configure_status=$?; set -e
+                if [[ "$configure_status" -ne 0 ]]; then
+                    [[ "$IPV6_TEST_EXPECT_FAILURE" == 1 ]] || printf "configure-status=%s ipv6-policy=%s runtime=%s persistence=%s\n" "$configure_status" "$IPV6_POLICY" "$IPV6_RUNTIME_STATUS" "$IPV6_PERSISTENCE_STATUS" >&2
+                    exit "$configure_status"
+                fi
+            ' _ "$repo_root" "$root" "$disable"
+    }
+
+    local ipv6_apply="$case_root/apply"
+    make_ipv6_tree "$ipv6_apply/proc/sys"
+    : > "$ipv6_apply/99-security-hardening.conf"
+    run_ipv6_apply "$ipv6_apply" 0 || fail "normal IPv6 safe sysctl application failed"
+    grep -Fxq 'net.ipv6.conf.all.accept_source_route = -1' "$ipv6_apply/99-security-hardening.conf" \
+        && grep -Fxq 'net.ipv6.conf.default.accept_source_route = -1' "$ipv6_apply/99-security-hardening.conf" \
+        && grep -Fxq 'net.ipv6.conf.all.forwarding = 0' "$ipv6_apply/99-security-hardening.conf" \
+        && grep -Fxq 'net.ipv6.conf.default.forwarding = 0' "$ipv6_apply/99-security-hardening.conf" \
+        || fail "normal non-forwarding host did not persist source-route=-1 and forwarding=0"
+
+    run_ipv6_apply "$ipv6_apply" 1 || fail "explicit IPv6 disable failed"
+    for key in all default lo eth0 tailscale0; do
+        [[ "$(cat "$ipv6_apply/proc/sys/net/ipv6/conf/$key/disable_ipv6")" == 1 ]] \
+            || fail "explicit IPv6 disable did not set ${key}"
+    done
+    grep -Fxq 'net.ipv6.conf.lo.disable_ipv6 = 1' "$ipv6_apply/99-security-hardening.conf" \
+        || fail "explicit IPv6 disable did not persist lo"
+    run_ipv6_apply "$ipv6_apply" 0 || fail "preserved IPv6 disable follow-up failed"
+    grep -Fq 'previous explicit tool-managed IPv6 disable is retained' "$ipv6_apply/ipv6-report.txt" \
+        || fail "normal follow-up did not report preserved IPv6 disable"
+    for key in all default lo eth0 tailscale0; do
+        [[ "$(cat "$ipv6_apply/proc/sys/net/ipv6/conf/$key/disable_ipv6")" == 1 ]] \
+            || fail "normal follow-up unexpectedly re-enabled ${key}"
+    done
+
+    local ipv6_forwarding="$case_root/interface-forwarding"
+    make_ipv6_tree "$ipv6_forwarding/proc/sys"
+    printf '1\n' > "$ipv6_forwarding/proc/sys/net/ipv6/conf/eth0/forwarding"
+    : > "$ipv6_forwarding/99-security-hardening.conf"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_PROC_SYS_ROOT="$ipv6_forwarding/proc/sys" \
+        HARDEN_SYSCTL_CONFIG="$ipv6_forwarding/99-security-hardening.conf" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; AGGRESSIVE=1; DISABLE_IPV6=1; log() { :; }; record_skip() { :; }
+            detect_ipv6_policy "$HARDEN_SYSCTL_CONFIG"
+            [[ "$IPV6_POLICY" == enabled-safety-blocked && "$IPV6_REASON" == *ipv6-forwarding-active* ]]
+        ' _ "$repo_root" || fail "active interface IPv6 forwarding did not block disable"
+
+    local ipv6_rollback="$case_root/rollback"
+    make_ipv6_tree "$ipv6_rollback/proc/sys"
+    printf '0\n' > "$ipv6_rollback/proc/sys/net/ipv6/conf/all/disable_ipv6"
+    printf '1\n' > "$ipv6_rollback/proc/sys/net/ipv6/conf/default/disable_ipv6"
+    printf '0\n' > "$ipv6_rollback/proc/sys/net/ipv6/conf/lo/disable_ipv6"
+    printf '1\n' > "$ipv6_rollback/proc/sys/net/ipv6/conf/eth0/disable_ipv6"
+    printf '0\n' > "$ipv6_rollback/proc/sys/net/ipv6/conf/tailscale0/disable_ipv6"
+    printf 'old-config\n' > "$ipv6_rollback/99-security-hardening.conf"
+    run_ipv6_apply "$ipv6_rollback" 1 2 && fail "partial IPv6 sysctl reload unexpectedly succeeded"
+    [[ "$(cat "$ipv6_rollback/proc/sys/net/ipv6/conf/all/disable_ipv6")" == 0 \
+        && "$(cat "$ipv6_rollback/proc/sys/net/ipv6/conf/default/disable_ipv6")" == 1 \
+        && "$(cat "$ipv6_rollback/proc/sys/net/ipv6/conf/lo/disable_ipv6")" == 0 \
+        && "$(cat "$ipv6_rollback/proc/sys/net/ipv6/conf/eth0/disable_ipv6")" == 1 \
+        && "$(cat "$ipv6_rollback/proc/sys/net/ipv6/conf/tailscale0/disable_ipv6")" == 0 ]] \
+        || fail "partial IPv6 sysctl reload did not restore exact runtime values"
+    grep -Fxq old-config "$ipv6_rollback/99-security-hardening.conf" \
+        || fail "partial IPv6 sysctl reload did not restore previous config"
 
     local banner_root="$case_root/banner" issue issue_net
     issue="$banner_root/issue"

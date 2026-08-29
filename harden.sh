@@ -97,6 +97,9 @@ IPV6_REASON="not assessed"
 IPV6_RUNTIME_STATUS="NOT RUN"
 IPV6_PERSISTENCE_STATUS="NOT RUN"
 IPV6_REPORT="${HARDEN_IPV6_REPORT:-/root/ipv6-policy-report.txt}"
+IPV6_FORWARDING_STATE="NOT RUN"
+IPV6_MANAGED_DISABLE_EXISTING=0
+declare -A IPV6_RUNTIME_BEFORE=()
 BANNER_STATUS="NOT RUN"
 MOTD_STATUS="NOT RUN"
 
@@ -1155,9 +1158,9 @@ net.ipv4.icmp_ignore_bogus_error_responses=1
 net.ipv4.tcp_rfc1337=1
 net.ipv4.tcp_syncookies=1
 net.ipv6.conf.all.accept_redirects=0
-net.ipv6.conf.all.accept_source_route=0
+net.ipv6.conf.all.accept_source_route=-1
 net.ipv6.conf.default.accept_redirects=0
-net.ipv6.conf.default.accept_source_route=0
+net.ipv6.conf.default.accept_source_route=-1
 vm.mmap_min_addr=65536
 vm.unprivileged_userfaultfd=0
 EOF
@@ -1183,8 +1186,8 @@ rp_filter_active_interfaces() {
             printf '%s\n' "$interface"
         done < <(ip -o link show up 2>/dev/null | awk -F': ' '{name=$2; sub(/@.*/, "", name); sub(/:.*/, "", name); if (name != "lo") print name}')
     fi
-    if [[ "$RP_FILTER_TAILSCALE_STATE" == active && -e "$sysctl_root/net/ipv4/conf/tailscale0/rp_filter" \
-        && -z "${seen[tailscale0]+present}" ]]; then
+    if [[ "$RP_FILTER_TAILSCALE_STATE" == active && -e "$sysctl_root/net/ipv4/conf/tailscale0/rp_filter" ]] \
+        && [[ -z "${seen[tailscale0]+present}" ]]; then
         printf '%s\n' tailscale0
     fi
 }
@@ -1336,18 +1339,69 @@ ipv6_active_interfaces() {
         done < <(ip -o link show up 2>/dev/null | awk -F': ' '{name=$2; sub(/@.*/, "", name); sub(/:.*/, "", name); if (name != "lo") print name}')
     fi
     if systemctl is-active --quiet tailscaled.service 2>/dev/null \
-        && [[ -e "$sysctl_root/net/ipv6/conf/tailscale0/disable_ipv6" ]] && -z "${seen[tailscale0]+present}"; then
+        && [[ -e "$sysctl_root/net/ipv6/conf/tailscale0/disable_ipv6" ]] && [[ -z "${seen[tailscale0]+present}" ]]; then
         printf '%s\n' tailscale0
     fi
 }
 
+ipv6_existing_interfaces() {
+    local sysctl_root="${HARDEN_PROC_SYS_ROOT:-/proc/sys}" entry interface
+    [[ -d "$sysctl_root/net/ipv6/conf" ]] || return 0
+    while IFS= read -r entry; do
+        interface="$(basename -- "$entry")"
+        [[ "$interface" == all || "$interface" == default ]] && continue
+        [[ -e "$entry/disable_ipv6" ]] || continue
+        printf '%s\n' "$interface"
+    done < <(find "$sysctl_root/net/ipv6/conf" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | sort)
+}
+
+ipv6_disable_runtime_keys() {
+    local interface
+    printf '%s\n' net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6
+    while IFS= read -r interface; do
+        [[ -n "$interface" ]] && printf 'net.ipv6.conf.%s.disable_ipv6\n' "$interface"
+    done < <(ipv6_existing_interfaces)
+}
+
+ipv6_managed_disable_exists() {
+    local config="$1"
+    [[ -f "$config" ]] && grep -Eq '^[[:space:]]*net\.ipv6\.conf\.[[:alnum:]_.-]+\.disable_ipv6[[:space:]]*=[[:space:]]*1[[:space:]]*$' "$config"
+}
+
+detect_ipv6_forwarding() {
+    local key value interface
+    IPV6_FORWARDING_STATE="inactive-normal"
+    for key in net.ipv6.conf.all.forwarding net.ipv6.conf.default.forwarding; do
+        value="$(sysctl -n "$key" 2>/dev/null || true)"
+        if [[ "$value" == 1 ]]; then
+            IPV6_FORWARDING_STATE="active"
+            return 0
+        elif [[ "$value" != 0 ]]; then
+            IPV6_FORWARDING_STATE="unknown"
+            return 0
+        fi
+    done
+    while IFS= read -r interface; do
+        [[ -n "$interface" ]] || continue
+        value="$(sysctl -n "net.ipv6.conf.${interface}.forwarding" 2>/dev/null || true)"
+        if [[ "$value" == 1 ]]; then
+            IPV6_FORWARDING_STATE="active"
+            return 0
+        elif [[ "$value" != 0 ]]; then
+            IPV6_FORWARDING_STATE="unknown"
+            return 0
+        fi
+    done < <(ipv6_active_interfaces)
+}
+
 detect_ipv6_policy() {
-    local sysctl_root="${HARDEN_PROC_SYS_ROOT:-/proc/sys}" routes rules listeners forwarding global_addresses
+    local config="${1:-${HARDEN_SYSCTL_CONFIG:-/etc/sysctl.d/99-security-hardening.conf}}" sysctl_root="${HARDEN_PROC_SYS_ROOT:-/proc/sys}" routes rules listeners global_addresses
     local -a reasons=()
     IPV6_POLICY="enabled-safe"
     IPV6_REASON="IPv6 disable is default-off; hardened IPv6 remains enabled"
     IPV6_RUNTIME_STATUS="NOT RUN"
     IPV6_PERSISTENCE_STATUS="NOT RUN"
+    IPV6_MANAGED_DISABLE_EXISTING=0
     if [[ ! -d "$sysctl_root/net/ipv6/conf" ]]; then
         IPV6_POLICY="NOT_APPLICABLE"
         IPV6_REASON="kernel IPv6 sysctl tree is unavailable"
@@ -1368,15 +1422,22 @@ detect_ipv6_policy() {
         if awk '/lookup/ && $NF !~ /^(local|main|default)$/ { found=1 } END { exit !found }' <<<"$rules"; then
             reasons+=("ipv6-policy-routing")
         fi
-        listeners="$(ss -H -lntu 2>/dev/null || true)"
-        grep -Eq '(^|[[:space:]])(\[::|::)' <<<"$listeners" && reasons+=("ipv6-listener")
+        listeners="$(ss -H -6 -lntu 2>/dev/null || true)"
+        [[ -z "$listeners" ]] || reasons+=("ipv6-listener")
     fi
-    forwarding="$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || true)"
-    [[ "$forwarding" == 1 ]] && reasons+=("ipv6-forwarding-enabled")
+    detect_ipv6_forwarding
+    case "$IPV6_FORWARDING_STATE" in
+        active) reasons+=("ipv6-forwarding-active") ;;
+        unknown) reasons+=("ipv6-forwarding-unknown") ;;
+    esac
     if ((${#reasons[@]})); then
         IPV6_REASON="$(IFS=,; printf '%s' "${reasons[*]}")"
     fi
-    if [[ "$DISABLE_IPV6" -eq 1 ]]; then
+    if ipv6_managed_disable_exists "$config"; then
+        IPV6_MANAGED_DISABLE_EXISTING=1
+        IPV6_POLICY="disabled-preserved-existing"
+        IPV6_REASON="previous explicit tool-managed IPv6 disable is retained until an explicit rollback path is chosen"
+    elif [[ "$DISABLE_IPV6" -eq 1 ]]; then
         if ((${#reasons[@]})); then
             IPV6_POLICY="enabled-safety-blocked"
             IPV6_REASON="explicit disable refused: ${IPV6_REASON}"
@@ -1393,12 +1454,55 @@ detect_ipv6_policy() {
 
 ipv6_policy_candidates() {
     local interface
-    [[ "$IPV6_POLICY" == disabled-explicit-opt-in ]] || return 0
-    printf '%s\n' 'net.ipv6.conf.all.disable_ipv6=1' 'net.ipv6.conf.default.disable_ipv6=1'
-    while IFS= read -r interface; do
-        [[ -n "$interface" ]] || continue
-        printf 'net.ipv6.conf.%s.disable_ipv6=1\n' "$interface"
-    done < <(ipv6_active_interfaces)
+    if [[ "$IPV6_POLICY" == disabled-explicit-opt-in || "$IPV6_POLICY" == disabled-preserved-existing ]]; then
+        while IFS= read -r interface; do
+            [[ -n "$interface" ]] && printf '%s=1\n' "$interface"
+        done < <(ipv6_disable_runtime_keys)
+    fi
+    if [[ "$IPV6_FORWARDING_STATE" == inactive-normal ]]; then
+        printf '%s\n' 'net.ipv6.conf.all.forwarding=0' 'net.ipv6.conf.default.forwarding=0'
+    fi
+}
+
+capture_ipv6_disable_runtime() {
+    local key value
+    IPV6_RUNTIME_BEFORE=()
+    while IFS= read -r key; do
+        value="$(sysctl -n "$key" 2>/dev/null || true)"
+        [[ "$value" =~ ^[01]$ ]] || return 1
+        IPV6_RUNTIME_BEFORE["$key"]="$value"
+    done < <(ipv6_disable_runtime_keys)
+    ((${#IPV6_RUNTIME_BEFORE[@]} > 1))
+}
+
+restore_ipv6_disable_runtime() {
+    local key value failed=0
+    for key in "${!IPV6_RUNTIME_BEFORE[@]}"; do
+        value="${IPV6_RUNTIME_BEFORE[$key]}"
+        sysctl -w "${key}=${value}" >/dev/null 2>&1 || failed=1
+    done
+    for key in "${!IPV6_RUNTIME_BEFORE[@]}"; do
+        [[ "$(sysctl -n "$key" 2>/dev/null || true)" == "${IPV6_RUNTIME_BEFORE[$key]}" ]] || failed=1
+    done
+    [[ "$failed" -eq 0 ]]
+}
+
+validate_ipv6_disable_runtime() {
+    local key failed=0
+    while IFS= read -r key; do
+        [[ "$(sysctl -n "$key" 2>/dev/null || true)" == 1 ]] || failed=1
+    done < <(ipv6_disable_runtime_keys)
+    [[ "$failed" -eq 0 ]]
+}
+
+rollback_ipv6_disable() {
+    local config="$1" restore_result=FAILED
+    transaction_restore "$config" sysctl-hardening.conf
+    run_streamed sysctl -p "$config" || true
+    if restore_ipv6_disable_runtime; then restore_result=OK; fi
+    IPV6_RUNTIME_STATUS="FAILED (rollback runtime restore=${restore_result})"
+    IPV6_PERSISTENCE_STATUS="FAILED (previous config restored)"
+    record_skip "IPv6 disable" "managed sysctl reload or full-interface verification failed; previous configuration and captured runtime values were restored (${restore_result})"
 }
 
 write_ipv6_report() {
@@ -1413,14 +1517,17 @@ write_ipv6_report() {
         printf 'reason=%s\n' "$IPV6_REASON"
         printf 'runtime=%s\n' "$IPV6_RUNTIME_STATUS"
         printf 'persistence=%s\n' "$IPV6_PERSISTENCE_STATUS"
-        for key in net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6 net.ipv6.conf.all.accept_redirects net.ipv6.conf.default.accept_redirects net.ipv6.conf.all.accept_source_route net.ipv6.conf.default.accept_source_route net.ipv6.conf.all.forwarding; do
+        printf 'forwarding-state=%s\n' "$IPV6_FORWARDING_STATE"
+        for key in net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6 net.ipv6.conf.all.accept_redirects net.ipv6.conf.default.accept_redirects net.ipv6.conf.all.accept_source_route net.ipv6.conf.default.accept_source_route net.ipv6.conf.all.forwarding net.ipv6.conf.default.forwarding; do
             value="$(sysctl -n "$key" 2>/dev/null || true)"
             printf '%s=%s\n' "$key" "${value:-unavailable}"
         done
         while IFS= read -r interface; do
             value="$(sysctl -n "net.ipv6.conf.${interface}.disable_ipv6" 2>/dev/null || true)"
             printf 'net.ipv6.conf.%s.disable_ipv6=%s\n' "$interface" "${value:-unavailable}"
-        done < <(ipv6_active_interfaces)
+            value="$(sysctl -n "net.ipv6.conf.${interface}.forwarding" 2>/dev/null || true)"
+            printf 'net.ipv6.conf.%s.forwarding=%s\n' "$interface" "${value:-unavailable}"
+        done < <(ipv6_existing_interfaces)
     } > "$report"
     chmod 0600 "$report"
 }
@@ -1428,8 +1535,8 @@ write_ipv6_report() {
 configure_sysctl() {
     local config="${HARDEN_SYSCTL_CONFIG:-/etc/sysctl.d/99-security-hardening.conf}"
     local sysctl_root="${HARDEN_PROC_SYS_ROOT:-/proc/sys}"
-    local temporary key value proc_path interface desired_rp_filter="" config_changed=0 runtime_reload_needed=0 failed=0
-    detect_ipv6_policy
+    local temporary key value proc_path interface desired_rp_filter="" config_changed=0 runtime_reload_needed=0 failed=0 ipv6_disable_new=0
+    detect_ipv6_policy "$config"
     if systemctl is-active --quiet tailscaled.service 2>/dev/null; then
         RP_FILTER_TAILSCALE_STATE=active
         RP_FILTER_POLICY="accepted-exception-loose-2"
@@ -1461,6 +1568,15 @@ configure_sysctl() {
             log WARN "Would also disable unprivileged user namespaces, kexec loading, and io_uring when supported"
         fi
         return 0
+    fi
+    if [[ "$IPV6_POLICY" == disabled-explicit-opt-in ]]; then
+        if ! capture_ipv6_disable_runtime; then
+            IPV6_RUNTIME_STATUS="FAILED (could not capture every pre-disable runtime value)"
+            IPV6_PERSISTENCE_STATUS="FAILED (no config change made)"
+            record_skip "IPv6 disable" "all/default and every existing IPv6 interface must be readable before disabling IPv6"
+            return 1
+        fi
+        ipv6_disable_new=1
     fi
     temporary="$(mktemp)"
     {
@@ -1512,8 +1628,12 @@ configure_sysctl() {
     rm -f "$temporary"
     if [[ "$config_changed" -eq 1 || "$runtime_reload_needed" -eq 1 ]]; then
         if ! run_streamed sysctl -p "$config"; then
-            transaction_restore "$config" sysctl-hardening.conf
-            run_streamed sysctl -p "$config" || true
+            if [[ "$ipv6_disable_new" -eq 1 ]]; then
+                rollback_ipv6_disable "$config"
+            else
+                transaction_restore "$config" sysctl-hardening.conf
+                run_streamed sysctl -p "$config" || true
+            fi
             record_skip "KRNL-6000" "targeted reload of the managed sysctl policy failed; previous file was restored"
             return 1
         fi
@@ -1534,12 +1654,23 @@ configure_sysctl() {
             failed=1
         fi
     done < <(grep -Ev '^[[:space:]]*(#|$)' "$config")
-    if [[ "$IPV6_POLICY" == disabled-explicit-opt-in ]]; then
-        IPV6_PERSISTENCE_STATUS="OK (managed sysctl disable)"
+    if [[ "$IPV6_POLICY" == disabled-explicit-opt-in || "$IPV6_POLICY" == disabled-preserved-existing ]]; then
+        if validate_ipv6_disable_runtime; then
+            IPV6_RUNTIME_STATUS="OK (all/default and every existing interface disabled)"
+            IPV6_PERSISTENCE_STATUS="OK (managed sysctl disable)"
+        else
+            failed=1
+            log WARN "IPv6 disable verification failed for all/default or an existing interface"
+        fi
     elif [[ "$IPV6_POLICY" == NOT_APPLICABLE ]]; then
         IPV6_PERSISTENCE_STATUS="N/A"
     else
+        IPV6_RUNTIME_STATUS="OK (safe IPv6 sysctls validated)"
         IPV6_PERSISTENCE_STATUS="OK (managed safe IPv6 sysctls; no disable requested)"
+    fi
+    if [[ "$failed" -ne 0 && "$ipv6_disable_new" -eq 1 ]]; then
+        rollback_ipv6_disable "$config"
+        return 1
     fi
     [[ "$failed" -eq 0 ]] || record_skip "KRNL-6000" "one or more supported sysctls could not be applied by the running environment"
     tailscale_rp_filter_health
