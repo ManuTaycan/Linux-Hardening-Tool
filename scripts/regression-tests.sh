@@ -1356,7 +1356,7 @@ EOF
         grep -Fq "INITRAMFS_POLICY_CHANGED" <<<"$kernel_section"
         grep -Fq "Managed module policy is unchanged" <<<"$kernel_section"
         grep -Fq "grub_config_changed" <<<"$grub_section"
-        [[ "$(grep -Fc "REBOOT_REQUIRED=1" "$1/harden.sh")" == 3 ]]
+        [[ "$(grep -Fc "REBOOT_REQUIRED=1" "$1/harden.sh")" == 4 ]]
     ' _ "$repo_root" || fail "initramfs/GRUB/reboot-required change gating regressed"
 }
 
