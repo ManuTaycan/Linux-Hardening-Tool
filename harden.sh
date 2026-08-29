@@ -4601,8 +4601,12 @@ deleted_open_unit_class() {
     esac
 }
 
+deleted_open_is_anonymous_memfd() {
+    [[ "$1" == 0 && "$2" == /memfd:*' (deleted)' ]]
+}
+
 write_deleted_open_report() {
-    local report="${HARDEN_DELETED_OPEN_REPORT:-$DELETED_OPEN_FILES_REPORT}" before="$1" after="$2" decisions="$3" stage="$4" temporary
+    local report="${HARDEN_DELETED_OPEN_REPORT:-$DELETED_OPEN_FILES_REPORT}" before="$1" after="$2" decisions="$3" stage="$4" temporary total actionable memfd
     [[ "$MODE" == apply ]] || return 0
     install -d -m 0700 "$(dirname -- "$report")"
     temporary="$(mktemp)"
@@ -4613,14 +4617,17 @@ write_deleted_open_report() {
         printf '\n[decisions]\n'; [[ -s "$decisions" ]] && cat "$decisions" || printf 'none\n'
         printf '\n[after]\n'; [[ -s "$after" ]] && awk -F '\t' '{printf "pid=%s process=%s user=%s fd=%s type=%s links=%s file=%s\n",$1,$2,$3,$4,$5,$6,$7}' "$after" || printf 'none\n'
         printf '\n[remaining-classification]\n'; grep '^after ' "$decisions" 2>/dev/null || printf 'none\n'
-        printf '\nremaining-entries=%s\nreboot-required=%s\n' "$(wc -l < "$after")" "$REBOOT_REQUIRED"
+        total="$(wc -l < "$after")"
+        memfd="$(awk -F '\t' '$6 == 0 && $7 ~ /^\/memfd:.* \(deleted\)$/ {count++} END {print count+0}' "$after")"
+        actionable=$((total - memfd))
+        printf '\ntotal-lsof-plus-L1-entries=%s\nactionable-deleted-file-entries=%s\nanonymous-memfd-exceptions=%s\nreboot-required=%s\n' "$total" "$actionable" "$memfd" "$REBOOT_REQUIRED"
     } > "$temporary"
     install -m 0600 "$temporary" "$report"
     rm -f -- "$temporary"
 }
 
 remediate_deleted_open_files() {
-    local before after decisions pid process user fd type links file unit class restart_result remaining released
+    local before after decisions pid process user fd type links file unit class restart_result remaining released total memfd
     if ! command -v lsof >/dev/null 2>&1; then
         DELETED_OPEN_FILES_STATUS="SKIPPED: lsof unavailable"
         [[ "$MODE" == apply ]] && record_skip "LOGG-2190" "lsof is unavailable"
@@ -4643,8 +4650,12 @@ remediate_deleted_open_files() {
         return 0
     fi
     declare -A restart_units=() seen_units=()
-    while IFS=$'\t' read -r pid _; do
+    while IFS=$'\t' read -r pid process user fd type links file; do
         [[ -n "$pid" ]] || continue
+        if deleted_open_is_anonymous_memfd "$links" "$file"; then
+            printf 'pid=%s process=%s unit=not-required file=%s classification=anonymous-memfd decision=no-action reason=volatile-RAM-backed-not-a-persistent-deleted-inode\n' "$pid" "$process" "$file" >> "$decisions"
+            continue
+        fi
         unit="$(systemd_unit_for_pid "$pid" 2>/dev/null || true)"
         class="$(deleted_open_unit_class "$unit")"
         if [[ -z "$unit" ]]; then
@@ -4665,10 +4676,16 @@ remediate_deleted_open_files() {
     done
     capture_deleted_open_files "$after"
     chmod 0600 "$after"
-    remaining="$(wc -l < "$after")"
+    total="$(wc -l < "$after")"
+    memfd="$(awk -F '\t' '$6 == 0 && $7 ~ /^\/memfd:.* \(deleted\)$/ {count++} END {print count+0}' "$after")"
+    remaining=$((total - memfd))
     declare -A after_units=()
     while IFS=$'\t' read -r pid process user fd type links file; do
         [[ -n "$pid" ]] || continue
+        if deleted_open_is_anonymous_memfd "$links" "$file"; then
+            printf 'after pid=%s process=%s unit=not-required file=%s classification=anonymous-memfd decision=no-action reason=expected-volatile-systemd-or-process-memfd\n' "$pid" "$process" "$file" >> "$decisions"
+            continue
+        fi
         unit="$(systemd_unit_for_pid "$pid" 2>/dev/null || true)"
         class="$(deleted_open_unit_class "$unit")"
         [[ -n "$unit" ]] || unit=unknown
@@ -4691,11 +4708,14 @@ remediate_deleted_open_files() {
             record_change "Restarted allowlisted safe service ${unit} once; service-health=healthy and deleted-file-released=yes"
         fi
     done
-    if [[ "$remaining" -eq 0 ]]; then
+    if [[ "$remaining" -eq 0 && "$total" -eq 0 ]]; then
         DELETED_OPEN_FILES_STATUS="OK: inventory clear after targeted remediation"
         record_change "Confirmed that no deleted open files remain after targeted remediation"
+    elif [[ "$remaining" -eq 0 ]]; then
+        DELETED_OPEN_FILES_STATUS="ACCEPTED: only anonymous memfd entries remain"
+        record_skip "LOGG-2190" "only anonymous volatile memfd entries remain; no service restart or reboot is justified"
     else
-        DELETED_OPEN_FILES_STATUS="REMAINING: ${remaining} deleted open file entries"
+        DELETED_OPEN_FILES_STATUS="REMAINING: ${remaining} actionable deleted file entries (${memfd} anonymous memfd exceptions)"
         record_skip "LOGG-2190" "deleted open files remain after conservative classification; see ${HARDEN_DELETED_OPEN_REPORT:-$DELETED_OPEN_FILES_REPORT}"
     fi
     write_deleted_open_report "$before" "$after" "$decisions" remediation

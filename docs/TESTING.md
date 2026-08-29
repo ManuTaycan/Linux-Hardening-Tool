@@ -119,6 +119,12 @@ explizit erlaubte aktive Dienste dürfen höchstens einmal neu starten; der
 nachfolgende `lsof +L1`-Scan muss den Erfolg belegen. Prüfe insbesondere, dass
 SSH, Tailscale, Netzwerk, Firewall und systemd/dbus nicht neu gestartet wurden.
 
+Ein Eintrag wie `/memfd:systemd-udevd (deleted)` mit Link-Count `0` ist eine
+anonyme, volatile RAM-Datei und kein verwaister persistenter Dateisystem-Inode.
+Sie bleibt vollständig sichtbar, wird als `anonymous-memfd` reportet und löst
+weder Restart noch Reboot aus. Normale `/var/... (deleted)`-Einträge bleiben
+dagegen weiterhin actionable bzw. manual-review-required.
+
 Für die Findings #4, #12, #17, #18, #19 und #20 zusätzlich prüfen:
 
 - `aide-lynis-FINT-4402-evidence.txt`, AIDE-Konfigurationsprüfung,
