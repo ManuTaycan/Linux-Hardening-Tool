@@ -33,8 +33,11 @@ meldet einen unvollständigen Lauf sichtbar und liefert dann keinen Exit 0.
 
 ## Validierung und Abschluss
 
-Phase 13 sammelt Validierungsdaten. Phase 14 und 17 führen Lynis aus; Phase 16
-stellt sicher, dass die AIDE-Konfiguration, eine nichtleere Datenbank, ein
+Im Apply-Modus erfasst Phase 01 vor den Hardening-Änderungen eine separate
+Lynis-Baseline einschließlich `report.dat`; im Dry-Run bleibt dieser schreibende
+Scan aus. Phase 13 sammelt Validierungsdaten. Phase 14 und 17 führen die beiden
+Post-Hardening-Lynis-Läufe aus; Phase 16 stellt sicher, dass die
+AIDE-Konfiguration, eine nichtleere Datenbank, ein
 lesbarer Check und der Timer vor dem finalen Lynis-Lauf vorhanden sind. Ein
 erfolgreicher Apply-Lauf benötigt Phase 18 sowie erfolgreiche Validation-,
 Final-Lynis- und Summary-Gates.

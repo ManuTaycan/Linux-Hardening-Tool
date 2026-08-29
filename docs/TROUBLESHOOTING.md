@@ -41,8 +41,17 @@ oder Compiler-Purge wird abgebrochen, nicht erzwungen. Wiederherstellung eines
 bewusst entfernten Pakets erfolgt aus den konfigurierten Distributionsquellen
 mit `apt-get install PAKET`; anschließend APT und die zugehörigen Dienste
 validieren. Erhaltene Compiler werden nach Paketupdates erneut root-only
-gesetzt. `binfmt_misc` bleibt aktiv, sobald eine Registrierung, Definition oder
-ein qemu-/Wine-/JVM-Verbraucher erkannt wird.
+gesetzt. Kernel-Headers allein sind kein Purge-Veto; aktive DKMS-Nutzung und
+jede simulierte nicht zur Toolchain gehörende Abhängigkeit bleiben es.
+
+Die distributionsseitige `python3.X`-binfmt-Regel dient nur dem direkten Start
+versionsspezifischer kompilierter `.pyc`-Dateien. Auf einem Host ohne geschützte
+Fremdformat-Verbraucher kann das Skript genau diese Vendor-Datei über den von
+systemd vorgesehenen gleichnamigen `/etc/binfmt.d/... -> /dev/null`-Override
+maskieren und nur die passende Laufzeitregistrierung entfernen. Normales
+Python, APT, systemd und andere Registrierungen werden danach geprüft. Unbekannte
+oder qemu-/Wine-/JVM-Formate werden weiterhin erhalten; sie lösen keinen blinden
+globalen Modul-Blacklist-Pfad aus.
 
 ## Lynis-Summary oder Fail2ban widersprüchlich
 

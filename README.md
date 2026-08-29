@@ -48,7 +48,8 @@ Letzter realer Stand mit Version 1.1.2: Lynis Hardening Index **86**.
   Hardening und Modulblockierung
 - Paket-/Update-Hardening, gezielte Service-Deaktivierung und systemd-
   Sandboxing mit gemessener Exposure vor/nach der Änderung
-- zwei Lynis-Läufe, offene Findings und Abschlussberichte
+- gemessene Lynis-Baseline plus zwei Post-Hardening-Läufe, offene Findings und
+  Abschlussberichte; im Dry-Run wird kein schreibender Lynis-Scan gestartet
 - nachvollziehbare AIDE-/PackageKit-/Compiler-/binfmt-Entscheidungsartefakte
   sowie zeitlich wiederholte, rein diagnostische PROC-3614-Snapshots
 

@@ -18,7 +18,6 @@ umask 027
 readonly SCRIPT_VERSION="1.1.3"
 readonly LOG_FILE="${HARDEN_LOG_FILE:-/var/log/server-hardening.log}"
 readonly SYSTEMD_HARDENING_REPORT="/root/systemd-hardening-report.txt"
-readonly SOURCE_LYNIS_INDEX="86"
 readonly MAIN_PID="$BASHPID"
 
 MODE=""
@@ -45,6 +44,7 @@ REMOTE_LOG_OPTION_SEEN=0
 REMOTE_LOG_DECLINED=0
 PROMPT_REPLY=""
 REBOOT_REQUIRED=0
+LYNIS_BEFORE="NOT RUN"
 LYNIS_AFTER="not run"
 LYNIS_WARNINGS="unknown"
 LYNIS_SUGGESTIONS="unknown"
@@ -1166,12 +1166,23 @@ root_or_boot_uses_usb() {
     return 1
 }
 
+binfmt_unregister_entry() {
+    local entry_file="$1"
+    printf '%s\n' -1 > "$entry_file"
+}
+
 configure_binfmt_misc() {
     local binfmt_root="${HARDEN_BINFMT_ROOT:-/proc/sys/fs/binfmt_misc}"
     local report="${BACKUP_DIR:-/root}/binfmt-misc-inventory.txt"
     local modprobe_file="${HARDEN_BINFMT_MODPROBE_FILE:-/etc/modprobe.d/99-disable-unused-binfmt-misc.conf}"
-    local -a registrations=() consumers=() config_files=()
-    local entry package config_dir config_line status="unavailable" remaining_registration=""
+    local etc_binfmt_dir="${HARDEN_BINFMT_ETC_DIR:-/etc/binfmt.d}"
+    local vendor_binfmt_dir="${HARDEN_BINFMT_VENDOR_DIR:-/usr/lib/binfmt.d}"
+    local python_root="${HARDEN_BINFMT_PYTHON_ROOT:-/usr/bin}"
+    local -a registrations=() consumers=() config_files=() python_names=() disabled_python=() already_disabled_python=()
+    local entry package config_dir config_line status="unavailable" remaining_registration="" name="" base=""
+    local override="" transaction_label="" python_binary="" validation_failed="" other_registration=""
+    local override_was_current=0
+    declare -A python_local_override=() active_registration=() seen_python=()
     local -a config_dirs=(/etc/binfmt.d /run/binfmt.d /usr/local/lib/binfmt.d /usr/lib/binfmt.d /lib/binfmt.d)
     if [[ -n "${HARDEN_BINFMT_CONFIG_DIRS:-}" ]]; then
         IFS=: read -r -a config_dirs <<<"$HARDEN_BINFMT_CONFIG_DIRS"
@@ -1186,8 +1197,24 @@ configure_binfmt_misc() {
     for config_dir in "${config_dirs[@]}"; do
         [[ -d "$config_dir" ]] || continue
         while IFS= read -r config_line; do config_files+=("$config_line"); done < <(
-            find "$config_dir" -maxdepth 1 -type f -name '*.conf' -print 2>/dev/null | sort
+            find "$config_dir" -maxdepth 1 \( -type f -o -type l \) -name '*.conf' -print 2>/dev/null | sort
         )
+    done
+    for entry in "${registrations[@]}"; do active_registration["$entry"]=1; done
+    for config_line in "${config_files[@]}"; do
+        base="$(basename -- "$config_line")"
+        name="${base%.conf}"
+        [[ "$name" =~ ^python3\.[0-9]+$ ]] || continue
+        if [[ "$config_line" == "$etc_binfmt_dir/"* ]]; then
+            python_local_override["$name"]="$config_line"
+        elif [[ "$config_line" == "$vendor_binfmt_dir/"* && -f "$config_line" && ! -L "$config_line" ]] \
+            && grep -Fq ":${name}:M::" "$config_line" \
+            && grep -Fq "::/usr/bin/${name}:" "$config_line"; then
+            if [[ -z "${seen_python[$name]+present}" ]]; then
+                python_names+=("$name")
+                seen_python["$name"]=1
+            fi
+        fi
     done
     for package in qemu-user qemu-user-static binfmt-support wine wine64 wine32 mono-runtime default-jre default-jre-headless; do
         package_installed "$package" && consumers+=("$package")
@@ -1199,7 +1226,9 @@ configure_binfmt_misc() {
         | awk '$1 ~ /^ii/ {print $2}' | sort -u || true)
 
     if [[ "$MODE" == "dry-run" ]]; then
-        if ((${#registrations[@]} || ${#config_files[@]} || ${#consumers[@]})); then
+        if ((${#python_names[@]})) && [[ "$AGGRESSIVE" -eq 1 ]]; then
+            log INFO "Would mask only the vendor Python bytecode binfmt registrations (${python_names[*]}) and validate Python, APT, systemd, and all other registrations"
+        elif ((${#registrations[@]} || ${#config_files[@]} || ${#consumers[@]})); then
             log INFO "Would preserve binfmt_misc after inventory because registrations, configuration, or interpreter consumers exist"
         elif [[ "$AGGRESSIVE" -eq 1 ]]; then
             log INFO "Would persistently disable unused systemd-binfmt/binfmt_misc and verify no registrations remain"
@@ -1223,8 +1252,95 @@ configure_binfmt_misc() {
             grep -Ev '^[[:space:]]*(#|$)' "$entry" 2>/dev/null || true
         done
         printf '\nprotected-consumer-packages=%s\n' "${consumers[*]:-none}"
+        printf 'python-bytecode-candidates=%s\n' "${python_names[*]:-none}"
+        printf 'python-bytecode-purpose=direct execution of version-specific compiled .pyc files; normal interpreter execution does not require binfmt_misc\n'
     } > "$report"
     chmod 0600 "$report"
+
+    if ((${#python_names[@]})); then
+        if [[ "$AGGRESSIVE" -ne 1 ]]; then
+            record_skip "HRDN-7231" "Python bytecode registrations ${python_names[*]} can be disabled individually, but persistent deactivation requires --aggressive; see ${report}"
+            return 0
+        fi
+        for name in "${python_names[@]}"; do
+            override="${etc_binfmt_dir}/${name}.conf"
+            python_binary="${python_root}/${name}"
+            validation_failed=""
+            override_was_current=0
+            if [[ -n "${python_local_override[$name]+present}" ]] \
+                && [[ ! -L "$override" || "$(readlink -- "$override" 2>/dev/null || true)" != /dev/null ]]; then
+                record_skip "HRDN-7231:${name}" "local administrator binfmt override ${override} is not a /dev/null mask and was preserved"
+                continue
+            fi
+            if [[ -L "$override" && "$(readlink -- "$override" 2>/dev/null || true)" == /dev/null ]]; then
+                override_was_current=1
+            fi
+            if [[ ! -x "$python_binary" ]]; then
+                record_skip "HRDN-7231:${name}" "vendor bytecode registration exists but interpreter ${python_binary} is unavailable; retained due to inconsistent package state"
+                continue
+            fi
+            if [[ -n "${active_registration[$name]+present}" ]] \
+                && ! grep -Fxq "interpreter /usr/bin/${name}" "$binfmt_root/$name" 2>/dev/null; then
+                record_skip "HRDN-7231:${name}" "active registration does not use the expected vendor interpreter /usr/bin/${name}; retained for manual review"
+                continue
+            fi
+            if [[ ! -d "$etc_binfmt_dir" ]] \
+                && ! install -d -o root -g root -m 0755 "$etc_binfmt_dir"; then
+                record_skip "HRDN-7231:${name}" "could not create ${etc_binfmt_dir}; vendor registration was retained"
+                continue
+            fi
+            transaction_label="binfmt-${name}.conf"
+            transaction_copy "$override" "$transaction_label"
+            if [[ ! -L "$override" || "$(readlink -- "$override" 2>/dev/null || true)" != /dev/null ]]; then
+                rm -f -- "$override"
+                if ! ln -s /dev/null "$override"; then
+                    transaction_restore "$override" "$transaction_label"
+                    record_skip "HRDN-7231:${name}" "could not install targeted ${override} -> /dev/null override"
+                    continue
+                fi
+            fi
+            if [[ -n "${active_registration[$name]+present}" ]] \
+                && ! binfmt_unregister_entry "$binfmt_root/$name"; then
+                validation_failed="runtime unregister failed"
+            fi
+            [[ ! -e "$binfmt_root/$name" ]] || validation_failed="runtime registration remained active"
+            [[ -n "$validation_failed" ]] || "$python_binary" -c 'import sys; raise SystemExit(0)' >/dev/null 2>&1 \
+                || validation_failed="${name} interpreter validation failed"
+            [[ -n "$validation_failed" ]] || python3 -c 'import sys; raise SystemExit(0)' >/dev/null 2>&1 \
+                || validation_failed="default python3 validation failed"
+            [[ -n "$validation_failed" ]] || LC_ALL=C apt-get check >/dev/null 2>&1 \
+                || validation_failed="apt-get check failed"
+            [[ -n "$validation_failed" ]] || run_streamed systemctl daemon-reload \
+                || validation_failed="systemctl daemon-reload failed"
+            if [[ -z "$validation_failed" ]]; then
+                for other_registration in "${registrations[@]}"; do
+                    [[ "$other_registration" == "$name" || -e "$binfmt_root/$other_registration" ]] \
+                        || validation_failed="unrelated registration ${other_registration} disappeared"
+                done
+            fi
+            if [[ -n "$validation_failed" ]]; then
+                transaction_restore "$override" "$transaction_label"
+                if unit_file_exists systemd-binfmt.service; then
+                    run_streamed systemctl restart systemd-binfmt.service || true
+                fi
+                record_skip "HRDN-7231:${name}" "targeted Python bytecode deactivation rolled back: ${validation_failed}"
+                continue
+            fi
+            if [[ "$override_was_current" -eq 1 && -z "${active_registration[$name]+present}" ]]; then
+                already_disabled_python+=("$name")
+            else
+                disabled_python+=("$name")
+            fi
+        done
+        if ((${#disabled_python[@]})); then
+            record_change "Target-disabled reversible Python bytecode binfmt registrations via /etc/binfmt.d -> /dev/null without changing normal Python/APT/systemd operation or unrelated formats: ${disabled_python[*]}"
+        fi
+        if ((${#already_disabled_python[@]})); then
+            log OK "Python bytecode binfmt override already active and revalidated: ${already_disabled_python[*]}"
+        fi
+        record_skip "HRDN-7231" "global binfmt_misc disable was not used; non-Python registrations and consumers remain preserved and inventoried in ${report}"
+        return 0
+    fi
 
     if ((${#registrations[@]} || ${#config_files[@]} || ${#consumers[@]})); then
         record_skip "HRDN-7231" "binfmt_misc preserved; active/configured formats or protected qemu/Wine/JVM consumers are inventoried in ${report}"
@@ -2478,9 +2594,14 @@ configure_startup_service_review() {
     return 0
 }
 
+parse_apt_purge_packages() {
+    awk '$1 == "Purg" || $1 == "Remv" {print $2}' | sort -u
+}
+
 configure_headless_packagekit() {
-    local -a installed=() removals=()
-    local package simulation="" removal="" unsafe=""
+    local -a installed=() removals=() dependency_removals=()
+    local package simulation="" removal="" dependency_reason=""
+    declare -A requested=()
     case "$OS_ID" in
         ubuntu) log INFO "Applying Ubuntu headless PackageKit policy" ;;
         debian) log INFO "Applying Debian headless PackageKit policy" ;;
@@ -2490,7 +2611,10 @@ configure_headless_packagekit() {
             ;;
     esac
     for package in packagekit packagekit-tools; do
-        package_installed "$package" && installed+=("$package")
+        if package_installed "$package"; then
+            installed+=("$package")
+            requested["$package"]=1
+        fi
     done
     if [[ "$MODE" == "dry-run" ]]; then
         if ((${#installed[@]})); then
@@ -2519,30 +2643,22 @@ configure_headless_packagekit() {
         record_skip "PKGS-7394:PackageKit" "unattended-upgrades failed its pre-removal dry-run; PackageKit was unmasked and retained"
         return 0
     fi
-    simulation="$(apt-get -s purge "${installed[@]}" 2>&1)" || {
+    simulation="$(LC_ALL=C apt-get -s purge "${installed[@]}" 2>&1)" || {
         record_skip "PKGS-7394:PackageKit" "APT purge simulation failed; PackageKit was unmasked and retained"
         return 0
     }
-    mapfile -t removals < <(awk '$1 == "Remv" {print $2}' <<<"$simulation" | sort -u)
+    mapfile -t removals < <(parse_apt_purge_packages <<<"$simulation")
     if ((${#removals[@]} == 0)); then
         record_skip "PKGS-7394:PackageKit" "APT simulation did not confirm a removable PackageKit package"
         return 0
     fi
     for removal in "${removals[@]}"; do
-        case "$removal" in
-            packagekit|packagekit-tools) ;;
-            linux-*|grub*|shim*|systemd*|dbus*|apt|apt-*|unattended-upgrades|ubuntu-*|debian-*|openssh*|sudo*|tailscale*|nftables*|iptables*|netplan*|network-manager*|ifupdown*|cloud-init*)
-                unsafe="$removal"
-                break
-                ;;
-            *)
-                unsafe="$removal"
-                break
-                ;;
-        esac
+        [[ -n "${requested[$removal]+present}" ]] || dependency_removals+=("$removal")
     done
-    if [[ -n "$unsafe" ]]; then
-        record_skip "PKGS-7394:PackageKit" "APT simulation would also remove ${unsafe}; PackageKit was unmasked and retained"
+    if ((${#dependency_removals[@]})); then
+        printf -v dependency_reason '%s, ' "${dependency_removals[@]}"
+        dependency_reason="${dependency_reason%, }"
+        record_skip "PKGS-7394:PackageKit" "APT simulation would also purge dependency packages: ${dependency_reason}; PackageKit was unmasked and retained"
         return 0
     fi
     if run_streamed env DEBIAN_FRONTEND=noninteractive apt-get purge -y "${installed[@]}"; then
@@ -2680,6 +2796,18 @@ measure_service_exposure() {
     return 0
 }
 
+classify_systemd_exposure() {
+    local before="$1" after="$2" dropin_was_current="$3"
+    if awk -v before="$before" -v after="$after" 'BEGIN { exit !(after < before) }'; then
+        printf '%s\n' decreased
+    elif [[ "$dropin_was_current" -eq 1 ]] \
+        && awk -v before="$before" -v after="$after" 'BEGIN { exit !(after == before) }'; then
+        printf '%s\n' unchanged
+    else
+        printf '%s\n' not-decreased
+    fi
+}
+
 systemd_verify_unit() {
     local unit_or_file="$1" analyze_help=""
     analyze_help="$(systemd-analyze --help 2>&1 || true)"
@@ -2724,7 +2852,8 @@ install_service_dropin() {
     local after_file="$BACKUP_DIR/systemd-security-${service//[^A-Za-z0-9_.-]/_}-after.txt"
     local preverify_file="$BACKUP_DIR/systemd-verify-${service//[^A-Za-z0-9_.-]/_}-pre-install.txt"
     local postverify_file="$BACKUP_DIR/systemd-verify-${service//[^A-Za-z0-9_.-]/_}-installed.txt"
-    local before="" after="" was_active=0 health_action="restart" exposure_line=""
+    local before="" after="" was_active=0 health_action="restart" exposure_line="" exposure_outcome=""
+    local dropin_was_current=0
     local dropin_stage="" verify_dir="" verify_unit=""
     if ! dropin_stage="$(mktemp)"; then
         log WARN "Could not create a staging file; skipped systemd hardening for ${service}"
@@ -2734,6 +2863,9 @@ install_service_dropin() {
         rm -f -- "$dropin_stage"
         log WARN "Could not stage the drop-in; skipped systemd hardening for ${service}"
         return 0
+    fi
+    if [[ -f "$destination" ]] && cmp -s "$dropin_stage" "$destination"; then
+        dropin_was_current=1
     fi
     if ! verify_dir="$(mktemp -d)"; then
         rm -f -- "$dropin_stage"
@@ -2804,8 +2936,11 @@ install_service_dropin() {
         printf -v exposure_line '%-32s %s -> %s' "$service" "$before" "$after"
         SERVICE_EXPOSURE_SUMMARY+=("$exposure_line")
         printf '%-36s %s -> %s\n' "$service" "$before" "$after" >> "$SYSTEMD_HARDENING_REPORT"
-        if awk -v before="$before" -v after="$after" 'BEGIN { exit !(after < before) }'; then
+        exposure_outcome="$(classify_systemd_exposure "$before" "$after" "$dropin_was_current")"
+        if [[ "$exposure_outcome" == decreased ]]; then
             record_change "Installed and health-tested systemd hardening for ${service}; exposure ${before} -> ${after}"
+        elif [[ "$exposure_outcome" == unchanged ]]; then
+            log OK "${service} drop-in is already active and passed health checks; exposure unchanged/already hardened (${before} -> ${after})"
         else
             log WARN "${service} passed health checks but exposure did not decrease (${before} -> ${after})"
         fi
@@ -3121,12 +3256,29 @@ compiler_command_path() {
     command -v "$1" 2>/dev/null || true
 }
 
+dkms_is_in_use() {
+    local dkms_state_dir="${HARDEN_DKMS_STATE_DIR:-/var/lib/dkms}"
+    local status="" packages=""
+    if command -v dkms >/dev/null 2>&1; then
+        status="$(dkms status 2>/dev/null || true)"
+        [[ -z "$status" ]] || return 0
+    fi
+    packages="$(dpkg-query -W -f='${db:Status-Abbrev}\t${binary:Package}\n' '*-dkms' 2>/dev/null \
+        | awk '$1 ~ /^ii/ && $2 ~ /-dkms([:-]|$)/ {print $2}' || true)"
+    [[ -z "$packages" ]] || return 0
+    if [[ -d "$dkms_state_dir" ]] \
+        && find "$dkms_state_dir" -mindepth 2 -maxdepth 2 -type d -print -quit 2>/dev/null | grep -q .; then
+        return 0
+    fi
+    return 1
+}
+
 restrict_compilers() {
     # Lynis 3.1.6 sets COMPILER_INSTALLED only for these five binary names.
     local -a lynis_tools=(as cc clang g++ gcc)
     local -a restriction_tools=(cc gcc g++ c++ clang clang++ cpp make as ld ld.bfd ld.gold)
-    local -a candidates=() lynis_paths=() owner_packages=() removals=()
-    local tool path real mode owner group owner_id group_id package simulation="" unsafe_reason="" protected_build_packages=""
+    local -a candidates=() lynis_paths=() owner_packages=() removals=() unsafe_removals=()
+    local tool path real mode owner group owner_id group_id package simulation="" unsafe_reason="" unsafe_list=""
     local restricted_owner="${HARDEN_TEST_OWNER:-root}" restricted_group="${HARDEN_TEST_GROUP:-root}"
     local restricted_uid restricted_gid
     local compiler_usr_root="${HARDEN_COMPILER_USR_ROOT:-/usr}"
@@ -3179,26 +3331,24 @@ restrict_compilers() {
     done
 
     if [[ "$AGGRESSIVE" -eq 1 && ${#owner_packages[@]} -gt 0 ]]; then
-        protected_build_packages="$(dpkg-query -W -f='${binary:Package}\n' 'dkms' '*-dkms' 'linux-headers-*' 2>/dev/null || true)"
-        if grep -Eq '(^dkms$|-dkms($|:)|^linux-headers-)' <<<"$protected_build_packages"; then
-            unsafe_reason="DKMS or installed kernel headers require a build toolchain for supported updates"
-        elif [[ "$MODE" == "dry-run" ]]; then
+        if [[ "$MODE" == "dry-run" ]]; then
             log INFO "Would simulate purge of Lynis-detected compiler owner packages: ${owner_packages[*]}"
-        elif simulation="$(apt-get -s purge "${owner_packages[@]}" 2>&1)"; then
-            mapfile -t removals < <(awk '$1 == "Remv" {print $2}' <<<"$simulation" | sort -u)
+        elif simulation="$(LC_ALL=C apt-get -s purge "${owner_packages[@]}" 2>&1)"; then
+            mapfile -t removals < <(parse_apt_purge_packages <<<"$simulation")
+            if dkms_is_in_use; then
+                unsafe_reason="active DKMS modules or installed *-dkms packages require the build toolchain"
+            fi
             for package in "${removals[@]}"; do
                 case "$package" in
                     gcc|gcc-[0-9]*|g++|g++-[0-9]*|clang|clang-[0-9]*|binutils|binutils-*|build-essential|cpp|cpp-[0-9]*) ;;
-                    linux-*|dkms|*-dkms|grub*|shim*|systemd*|openssh*|sudo*|tailscale*|nftables*|iptables*|netplan*|network-manager*|ifupdown*|cloud-init*|open-vm-tools*|qemu-guest-agent|ubuntu-*|debian-*)
-                        unsafe_reason="APT simulation includes protected package ${package}"
-                        break
-                        ;;
-                    *)
-                        unsafe_reason="APT simulation includes non-toolchain package ${package}"
-                        break
-                        ;;
+                    *) unsafe_removals+=("$package") ;;
                 esac
             done
+            if ((${#unsafe_removals[@]})); then
+                printf -v unsafe_list '%s, ' "${unsafe_removals[@]}"
+                unsafe_list="${unsafe_list%, }"
+                unsafe_reason="APT simulation would also purge non-toolchain/dependent packages: ${unsafe_list}"
+            fi
             if [[ -z "$unsafe_reason" && ${#removals[@]} -gt 0 ]] \
                 && run_streamed env DEBIAN_FRONTEND=noninteractive apt-get purge -y "${owner_packages[@]}"; then
                 PACKAGES_REMOVED+=("${owner_packages[@]}")
@@ -3874,6 +4024,54 @@ run_lynis() {
     return 0
 }
 
+extract_lynis_score() {
+    local report="$1" data="$2" score=""
+    if [[ -s "$report" ]]; then
+        score="$(sed $'s/\033\\[[0-9;]*[[:alpha:]]//g' "$report" | awk '
+            /Hardening index[[:space:]]*:/ {
+                line=$0
+                sub(/^.*Hardening index[[:space:]]*:[[:space:]]*/, "", line)
+                if (match(line, /[0-9]+/)) value=substr(line, RSTART, RLENGTH)
+            }
+            END {print value}
+        ')"
+    fi
+    if [[ -z "$score" && -s "$data" ]]; then
+        score="$(awk -F= '$1 == "hardening_index" {value=$2} END {print value}' "$data")"
+    fi
+    [[ "$score" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$score"
+}
+
+capture_lynis_baseline() {
+    local report="${HARDEN_LYNIS_BASELINE_REPORT:-/root/lynis-before-hardening.txt}"
+    local data="${HARDEN_LYNIS_BASELINE_DATA:-/root/lynis-before-hardening-report.dat}"
+    local score=""
+    if [[ "$MODE" == "dry-run" ]]; then
+        LYNIS_BEFORE="N/A (dry-run; NOT RUN)"
+        log INFO "Dry run: pre-hardening Lynis baseline is NOT RUN because Lynis would write runtime reports"
+        return 0
+    fi
+    if ! command -v lynis >/dev/null 2>&1; then
+        LYNIS_BEFORE="N/A (Lynis unavailable)"
+        record_skip "Lynis baseline" "lynis is not installed before package hardening; no package was installed merely to obtain a baseline"
+        return 0
+    fi
+    if ! run_lynis "$report" "pre-hardening baseline"; then
+        LYNIS_BEFORE="FAILED"
+        log WARN "Pre-hardening Lynis baseline failed; its separate report was retained"
+        return 0
+    fi
+    if score="$(extract_lynis_score "$report" "$data")"; then
+        LYNIS_BEFORE="$score"
+        log OK "Measured pre-hardening Lynis baseline: ${LYNIS_BEFORE}"
+    else
+        LYNIS_BEFORE="PARSE ERROR"
+        log WARN "Could not parse the pre-hardening Lynis score from ${report} or ${data}"
+    fi
+    return 0
+}
+
 second_optimization_pass() {
     if [[ "$MODE" == "dry-run" ]]; then
         log INFO "Would parse first-pass Test IDs, re-assert safe controls, then run Lynis a second time"
@@ -3932,15 +4130,7 @@ extract_lynis_summary() {
         log WARN "Final Lynis report is absent; summary values remain unknown"
         return 0
     fi
-    LYNIS_AFTER="$(sed $'s/\033\\[[0-9;]*[[:alpha:]]//g' "$report" | awk '
-        /Hardening index[[:space:]]*:/ {
-            line=$0
-            sub(/^.*Hardening index[[:space:]]*:[[:space:]]*/, "", line)
-            if (match(line, /[0-9]+/)) value=substr(line, RSTART, RLENGTH)
-        }
-        END {print value}
-    ')"
-    [[ -n "$LYNIS_AFTER" || ! -s "$data" ]] || LYNIS_AFTER="$(awk -F= '$1 == "hardening_index" {value=$2} END {print value}' "$data")"
+    LYNIS_AFTER="$(extract_lynis_score "$report" "$data" || true)"
     LYNIS_WARNINGS="$(sed $'s/\033\\[[0-9;]*[[:alpha:]]//g' "$report" | awk '
         /Warnings[[:space:]]*\([0-9]+\)/ {line=$0; sub(/^.*Warnings[[:space:]]*\(/,"",line); sub(/\).*$/,"",line); value=line}
         END {print value}
@@ -4100,7 +4290,7 @@ Fail2ban           : ${FAIL2BAN_STATUS}
 Remote Logging     : ${REMOTE_LOG_STATUS}
 Automatic Updates  : ${UPDATES_STATUS}
 
-Lynis Score Before : ${SOURCE_LYNIS_INDEX}
+Lynis Score Before : ${LYNIS_BEFORE}
 Lynis Score After  : ${LYNIS_AFTER}
 Warnings           : ${LYNIS_WARNINGS}
 Suggestions        : ${LYNIS_SUGGESTIONS}
@@ -4154,6 +4344,7 @@ main() {
     log INFO "Server hardening ${SCRIPT_VERSION} started"
     [[ "$MODE" == "dry-run" ]] && log INFO "Dry run: no backup, log file, or system state will be changed"
     detect_os
+    capture_lynis_baseline
 
     phase 02 18 "Backup"
     backup_config

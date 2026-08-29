@@ -214,6 +214,7 @@ EOF
             [[ "$AIDE_STATUS" == OK ]]
             [[ "$(< "$4")" == 1 ]]
             [[ "$(wc -l < "$5")" == 2 ]]
+            grep -Fq "baseline rebuilt: 0" "$CHANGE_LOG"
             grep -Fq "User=_aide" "$2/aide-service-context.txt"
             grep -Fq "CAP_DAC_READ_SEARCH CAP_AUDIT_WRITE" "$2/aide-service-context.txt"
             grep -Fq "Result=success" "$2/aide-service-context.txt"
@@ -325,6 +326,48 @@ run_lynis_summary_tests() {
     local case_root="$test_root/lynis-summary"
     local report="$case_root/final.txt" data="$case_root/final-report.dat" diagnostic="$case_root/diagnostic.txt"
     install -d "$case_root"
+    cat > "$case_root/fresh.txt" <<'EOF'
+  Hardening index : 61 [############        ]
+EOF
+    cat > "$case_root/fresh-report.dat" <<'EOF'
+hardening_index=61
+EOF
+    cat > "$case_root/hardened.txt" <<'EOF'
+  Hardening index : 87 [#################   ]
+EOF
+    cat > "$case_root/hardened-report.dat" <<'EOF'
+hardening_index=87
+EOF
+    env HARDEN_SOURCE_ONLY=1 HARDEN_LYNIS_BASELINE_REPORT="$case_root/fresh.txt" \
+        HARDEN_LYNIS_BASELINE_DATA="$case_root/fresh-report.dat" bash -c '
+            source "$1/harden.sh"
+            trap - ERR EXIT
+            MODE=apply
+            lynis() { :; }
+            run_lynis() { :; }
+            capture_lynis_baseline
+            [[ "$LYNIS_BEFORE" == 61 && "$LYNIS_BEFORE" != 86 ]]
+        ' _ "$repo_root" || fail "fresh-system Lynis Before baseline was not measured dynamically"
+    env HARDEN_SOURCE_ONLY=1 HARDEN_LYNIS_BASELINE_REPORT="$case_root/hardened.txt" \
+        HARDEN_LYNIS_BASELINE_DATA="$case_root/hardened-report.dat" bash -c '
+            source "$1/harden.sh"
+            trap - ERR EXIT
+            MODE=apply
+            lynis() { :; }
+            run_lynis() { :; }
+            capture_lynis_baseline
+            [[ "$LYNIS_BEFORE" == 87 ]]
+        ' _ "$repo_root" || fail "second-run Lynis Before did not reflect the already-hardened starting state"
+    env HARDEN_SOURCE_ONLY=1 HARDEN_LYNIS_BASELINE_REPORT="$case_root/dry.txt" bash -c '
+            source "$1/harden.sh"
+            trap - ERR EXIT
+            MODE=dry-run
+            run_lynis() { exit 91; }
+            capture_lynis_baseline
+            [[ "$LYNIS_BEFORE" == "N/A (dry-run; NOT RUN)" ]]
+            [[ ! -e "$HARDEN_LYNIS_BASELINE_REPORT" ]]
+        ' _ "$repo_root" || fail "dry-run unexpectedly launched or wrote a Lynis baseline"
+    ! grep -Fq 'SOURCE_LYNIS_INDEX=' "$repo_root/harden.sh" || fail "static Lynis Before source score remains"
     cat > "$report" <<'EOF'
   Lynis security scan details:
   Hardening index : 86 [#################   ]
@@ -407,7 +450,8 @@ run_packagekit_tests() {
     cat > "$mock_bin/apt-get" <<'EOF'
 #!/usr/bin/env bash
 if [[ " $* " == *' -s purge '* ]]; then
-    printf 'Remv packagekit [1.2.8]\nRemv packagekit-tools [1.2.8]\n'
+    [[ "${LC_ALL:-}" == C ]] || exit 64
+    printf 'Purg packagekit [1.2.8]\nPurg packagekit-tools [1.2.8]\n'
 elif [[ "${1:-}" == check ]]; then
     printf 'apt-check-ok\n'
 elif [[ " $* " == *' purge -y '* ]]; then
@@ -469,7 +513,8 @@ EOF
             package_installed() { [[ "$1" == packagekit || "$1" == packagekit-tools ]]; }
             apt-get() {
                 if [[ "${1:-}" == -s && "${2:-}" == purge ]]; then
-                    printf "Remv packagekit [1.2.8]\nRemv ubuntu-server [1.0]\n"
+                    [[ "${LC_ALL:-}" == C ]] || return 64
+                    printf "Purg ubuntu-server [1.0]\nPurg software-properties-common [0.111]\nPurg packagekit [1.2.8]\n"
                 elif [[ "${1:-}" == check ]]; then
                     return 0
                 else
@@ -480,8 +525,10 @@ EOF
             export -f apt-get
             configure_headless_packagekit
             [[ ! -s "$2/apt.log" ]]
-            grep -Fq "APT simulation would also remove ubuntu-server" "$CHANGE_LOG" || \
-                printf "%s\n" "${SKIPPED_FINDINGS[*]}" | grep -Fq "ubuntu-server"
+            reason="$(printf "%s\n" "${SKIPPED_FINDINGS[*]}")"
+            grep -Fq "software-properties-common" <<<"$reason"
+            grep -Fq "ubuntu-server" <<<"$reason"
+            ! grep -Eq "(^|[[:space:]])autoremove([[:space:]]|$)" "$1/harden.sh"
         ' _ "$repo_root" "$case_root" || fail "unsafe PackageKit dependency simulation was not blocked"
 }
 
@@ -501,7 +548,9 @@ if [[ "${1:-}" == -S ]]; then
         *) printf 'gcc: %s\n' "$target" ;;
     esac
 elif [[ "${COMPILER_PROTECTED:-0}" -eq 1 ]]; then
-    printf 'dkms\nlinux-headers-generic\n'
+    printf 'ii\tnvidia-dkms-570\n'
+elif [[ "${COMPILER_HEADERS_ONLY:-0}" -eq 1 ]]; then
+    printf 'ii\tlinux-headers-generic\n'
 else
     exit 1
 fi
@@ -509,10 +558,11 @@ EOF
     cat > "$mock_bin/apt-get" <<'EOF'
 #!/usr/bin/env bash
 if [[ " $* " == *' -s purge '* ]]; then
+    [[ "${LC_ALL:-}" == C ]] || exit 64
     if [[ "${COMPILER_UNSAFE:-0}" -eq 1 ]]; then
-        printf 'Remv gcc [14]\nRemv ubuntu-server [1.0]\n'
+        printf 'Purg rkhunter [1.4.6]\nPurg crash [8.0]\nPurg binutils [2.44]\nPurg binutils-x86-64-linux-gnu [2.44]\n'
     else
-        printf 'Remv gcc [14]\nRemv binutils [2.43]\n'
+        printf 'Purg gcc [14]\nPurg binutils [2.43]\n'
     fi
 elif [[ " $* " == *' purge -y '* ]]; then
     printf '%s\n' "$*" >> "$COMPILER_APT_LOG"
@@ -562,13 +612,107 @@ EOF
             [[ ! -s "$2/apt.log" ]]
             [[ "$(stat -c "%a" "$3/as")" == 750 ]]
             [[ "$(stat -c "%a" "$3/gcc")" == 750 ]]
-            printf "%s\n" "${SKIPPED_FINDINGS[*]}" | grep -Fq "DKMS or installed kernel headers"
+            printf "%s\n" "${SKIPPED_FINDINGS[*]}" | grep -Fq "active DKMS modules or installed *-dkms packages"
         ' _ "$repo_root" "$case_root" "$mock_bin" || fail "protected compiler dependency/root-only fallback regression failed"
+
+    : > "$apt_log"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 COMPILER_APT_LOG="$apt_log" \
+        COMPILER_BIN_DIR="$mock_bin" COMPILER_UNSAFE=1 HARDEN_TEST_OWNER="$(id -u)" \
+        HARDEN_TEST_GROUP="$(id -g)" HARDEN_COMPILER_USR_ROOT="$case_root/empty-usr" \
+        HARDEN_COMPILER_LOCAL_ROOT="$case_root/empty-local" HARDEN_DKMS_STATE_DIR="$case_root/no-dkms" bash -c '
+            source "$1/harden.sh"
+            trap - ERR EXIT
+            MODE=apply
+            AGGRESSIVE=1
+            BACKUP_DIR="$2/backup"
+            CHANGE_LOG="$2/unsafe.tsv"
+            : > "$CHANGE_LOG"
+            compiler_command_path() { if [[ -x "$COMPILER_BIN_DIR/$1" ]]; then printf "%s/%s\n" "$COMPILER_BIN_DIR" "$1"; fi; return 0; }
+            restrict_compilers
+            [[ ! -s "$2/apt.log" ]]
+            reason="$(printf "%s\n" "${SKIPPED_FINDINGS[*]}")"
+            grep -Fq "rkhunter" <<<"$reason"
+            grep -Fq "crash" <<<"$reason"
+            ! grep -Eq "(^|[[:space:]])autoremove([[:space:]]|$)" "$1/harden.sh"
+        ' _ "$repo_root" "$case_root" || fail "compiler purge dependency cascade fixture was not blocked with a concrete reason"
+
+    : > "$apt_log"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 COMPILER_APT_LOG="$apt_log" \
+        COMPILER_BIN_DIR="$mock_bin" COMPILER_HEADERS_ONLY=1 HARDEN_TEST_OWNER="$(id -u)" \
+        HARDEN_TEST_GROUP="$(id -g)" HARDEN_COMPILER_USR_ROOT="$case_root/empty-usr" \
+        HARDEN_COMPILER_LOCAL_ROOT="$case_root/empty-local" HARDEN_DKMS_STATE_DIR="$case_root/no-dkms" bash -c '
+            source "$1/harden.sh"
+            trap - ERR EXIT
+            MODE=apply
+            AGGRESSIVE=1
+            BACKUP_DIR="$2/backup"
+            CHANGE_LOG="$2/headers.tsv"
+            : > "$CHANGE_LOG"
+            compiler_command_path() { if [[ -x "$COMPILER_BIN_DIR/$1" ]]; then printf "%s/%s\n" "$COMPILER_BIN_DIR" "$1"; fi; return 0; }
+            restrict_compilers
+            grep -Fq "purge -y" "$2/apt.log"
+        ' _ "$repo_root" "$case_root" || fail "kernel headers alone still blocked the compiler APT simulation/removal path"
 }
 
 run_binfmt_tests() {
     local case_root="$test_root/binfmt" root="$test_root/binfmt/proc" config="$test_root/binfmt/config"
     install -d "$root" "$config" "$case_root/backup"
+    local etc_config="$case_root/etc-binfmt" python_root="$case_root/python-bin" mock_bin="$case_root/bin"
+    install -d "$etc_config" "$python_root" "$mock_bin"
+    cat > "$config/python3.14.conf" <<'EOF'
+:python3.14:M::\x0e\x0d\x0d\x0a::/usr/bin/python3.14:
+EOF
+    cat > "$python_root/python3.14" <<'EOF'
+#!/usr/bin/env bash
+printf 'python3.14-ok\n' >> "$BINFMT_VERIFY_LOG"
+EOF
+    cat > "$mock_bin/python3" <<'EOF'
+#!/usr/bin/env bash
+printf 'python3-ok\n' >> "$BINFMT_VERIFY_LOG"
+EOF
+    cat > "$mock_bin/apt-get" <<'EOF'
+#!/usr/bin/env bash
+[[ "${LC_ALL:-}" == C && "${1:-}" == check ]] || exit 64
+printf 'apt-check-ok\n' >> "$BINFMT_VERIFY_LOG"
+EOF
+    cat > "$mock_bin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+printf 'systemctl %s\n' "$*" >> "$BINFMT_VERIFY_LOG"
+EOF
+    chmod +x "$python_root/python3.14" "$mock_bin/python3" "$mock_bin/apt-get" "$mock_bin/systemctl"
+    printf 'enabled\n' > "$root/status"
+    printf 'enabled\ninterpreter /usr/bin/python3.14\n' > "$root/python3.14"
+    printf 'enabled\ninterpreter /usr/bin/qemu-aarch64-static\n' > "$root/qemu-aarch64"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_BINFMT_ROOT="$root" \
+        HARDEN_BINFMT_CONFIG_DIRS="$etc_config:$config" HARDEN_BINFMT_ETC_DIR="$etc_config" \
+        HARDEN_BINFMT_VENDOR_DIR="$config" HARDEN_BINFMT_PYTHON_ROOT="$python_root" \
+        BINFMT_VERIFY_LOG="$case_root/python-verify.log" bash -c '
+            source "$1/harden.sh"
+            trap - ERR EXIT
+            MODE=apply
+            AGGRESSIVE=1
+            BACKUP_DIR="$2/backup"
+            CHANGE_LOG="$2/python.tsv"
+            : > "$CHANGE_LOG"
+            package_installed() { return 1; }
+            dpkg-query() { return 1; }
+            unit_file_exists() { return 1; }
+            binfmt_unregister_entry() { rm -f -- "$1"; }
+            transaction_copy() { :; }
+            transaction_restore() { return 99; }
+            configure_binfmt_misc
+            [[ ! -e "$3/python3.14" ]]
+            [[ -e "$3/qemu-aarch64" ]]
+            [[ -L "$4/python3.14.conf" && "$(readlink -- "$4/python3.14.conf")" == /dev/null ]]
+            grep -Fq "python3.14-ok" "$5"
+            grep -Fq "python3-ok" "$5"
+            grep -Fq "apt-check-ok" "$5"
+            grep -Fq "systemctl daemon-reload" "$5"
+            configure_binfmt_misc
+            [[ "$(grep -c "Target-disabled reversible Python" "$CHANGE_LOG")" == 1 ]]
+        ' _ "$repo_root" "$case_root" "$root" "$etc_config" "$case_root/python-verify.log" \
+        || fail "targeted reversible python3.14 binfmt deactivation/validation failed"
+    rm -f -- "$root/qemu-aarch64" "$config/python3.14.conf"
     printf 'enabled\n' > "$root/status"
     env HARDEN_SOURCE_ONLY=1 HARDEN_BINFMT_ROOT="$root" HARDEN_BINFMT_CONFIG_DIRS="$config" \
         HARDEN_BINFMT_MODPROBE_FILE="$case_root/modprobe.conf" BINFMT_DISABLE_LOG="$case_root/disable.log" bash -c '
@@ -608,6 +752,17 @@ run_binfmt_tests() {
             [[ "$(tr -d "[:space:]" < "$3/status")" == enabled ]]
             grep -Fq "qemu-aarch64" "$2/backup/binfmt-misc-inventory.txt"
         ' _ "$repo_root" "$case_root" "$root" || fail "active binfmt registration was not preserved"
+}
+
+run_systemd_idempotency_tests() {
+    env HARDEN_SOURCE_ONLY=1 bash -c '
+        source "$1/harden.sh"
+        trap - ERR EXIT
+        [[ "$(classify_systemd_exposure 7.1 3.4 0)" == decreased ]]
+        [[ "$(classify_systemd_exposure 3.4 3.4 1)" == unchanged ]]
+        [[ "$(classify_systemd_exposure 3.4 3.4 0)" == not-decreased ]]
+        [[ "$(classify_systemd_exposure 3.4 3.5 1)" == not-decreased ]]
+    ' _ "$repo_root" || fail "systemd exposure idempotency classification failed"
 }
 
 run_iowait_tests() {
@@ -655,6 +810,7 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
         run_packagekit_tests
         run_compiler_tests
         run_binfmt_tests
+        run_systemd_idempotency_tests
         run_iowait_tests
         ;;
     all)
@@ -666,6 +822,7 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
         run_packagekit_tests
         run_compiler_tests
         run_binfmt_tests
+        run_systemd_idempotency_tests
         run_iowait_tests
         ;;
     *) fail "unknown HARDEN_REGRESSION_FILTER value" ;;
