@@ -48,7 +48,13 @@ Letzter realer Stand mit Version 1.1.2: Lynis Hardening Index **86**.
   Hardening und Modulblockierung
 - Paket-/Update-Hardening, gezielte Service-Deaktivierung und systemd-
   Sandboxing mit gemessener Exposure vor/nach der Änderung
-- zwei Lynis-Läufe, offene Findings und Abschlussberichte
+- gemessene Lynis-Baseline plus zwei Post-Hardening-Läufe, offene Findings und
+  Abschlussberichte; im Dry-Run wird kein schreibender Lynis-Scan gestartet
+- nachvollziehbare AIDE-/PackageKit-/Compiler-/binfmt-Entscheidungsartefakte
+  sowie zeitlich wiederholte, rein diagnostische PROC-3614-Snapshots
+- ein spätes Tailscale-/Netfilter-aware Kernelmodul-Gate, das benötigte
+  modulare NAT-Komponenten vorlädt und den irreversiblen Lock bei unbewiesener
+  Dual-Stack-/Tailscale-Gesundheit sicher blockiert
 
 ## Installation per Git
 
@@ -149,6 +155,10 @@ Nach einem Apply-Lauf sind unter anderem folgende Dateien relevant:
 /root/systemd-hardening-report.txt
 /root/lynis-after-hardening-pass1.txt
 /root/lynis-after-hardening.txt
+/root/lynis-after-hardening-report.dat
+/root/lynis-summary-parse-diagnostics.txt (nur bei Parsefehler)
+/root/hardening-iowait-processes.txt
+/root/kernel-module-lockdown-report.txt
 /root/hardening-backup-YYYYMMDD-HHMMSS/
 ```
 

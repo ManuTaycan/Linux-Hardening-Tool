@@ -23,10 +23,64 @@ für 1.1.3 wird erst nach dem vollständigen Zielsystemtest erstellt.
 - The irreversible `kernel.modules_disabled=1` write is guarded by the final
   phase-17 network, firewall, AppArmor, validation, and AIDE prerequisites and
   is verified after the write.
+- The late kernel-module lock now closes the confirmed Tailscale boot race:
+  it classifies the running kernel's Netfilter/NAT features, preloads only
+  present modular IPv4/IPv6 components, waits on observable iptables-nft,
+  Tailscale-chain, backend, and router/netfilter-health readiness, and only
+  then performs the irreversible write. The same verified helper runs during
+  Apply and boot; a failed prerequisite leaves module loading enabled, fails
+  the unit visibly, and writes a secret-free diagnostic report.
+- Kernel-lock helper, preload unit, late-lock unit and Tailscale drop-in are
+  transaction-backed and rolled back together if candidate/installed unit
+  verification or daemon reload fails. The owned firewall unit is rendered
+  once and verified before installation as well as after installation.
+- Hosts already locked by an earlier run receive the corrected boot units
+  without an impossible live `modprobe`; recovery of missing modules is
+  explicitly deferred to the next controlled reboot.
+- Converged runs avoid unnecessary `update-initramfs`, `update-grub`, fstab
+  daemon reloads, compiler ownership/mode writes, account-aging changes,
+  rkhunter property rebuilds, and service disable/mask calls. Reboot-required
+  is set by managed initramfs/GRUB work only when its input actually changed.
 - CI prüft den committed Base-to-Head-Diff auf Whitespace und testet den
   Installer in einem temporären Zielpfad.
 - `--install-path` bezeichnet jetzt die ausführbare Zieldatei statt eines
   Verzeichnisses.
+- AIDE writes its validated `HardenSHA2` group into the effective primary
+  runtime configuration. This matches what AIDE executes and what Lynis 3.1.6
+  actually inspects for `FINT-4402`; included path rules, database activation,
+  service-context validation, and the timer remain unchanged.
+- Headless PackageKit is unmasked and removed only when an APT purge simulation
+  contains no other package. Simulations run with `LC_ALL=C` and parse both
+  `Purg` and `Remv`; unsafe dependency graphs (including the confirmed
+  `ubuntu-server`/`software-properties-common` cascade) retain PackageKit
+  unmasked with the exact dependency reason.
+- Aggressive compiler handling inventories the exact Lynis 3.1.6 detector set
+  (`as`, `cc`, `clang`, `g++`, `gcc`) and owning packages. A simulated purge is
+  allowed only for a narrow toolchain set and is blocked by active DKMS or any
+  simulated non-toolchain dependency (including the confirmed `rkhunter` and
+  `crash` cascade); installed kernel headers alone no longer preempt the APT
+  simulation. The fallback remains root-only and never runs autoremove.
+- `binfmt_misc` registrations, persistent definitions, and qemu/Wine/JVM
+  consumers are inventoried. The Python-version registration is identified as
+  direct `.pyc` execution support and is disabled reversibly and individually
+  with a same-name `/etc/binfmt.d` `/dev/null` override only after Python, APT,
+  systemd, and unrelated registrations validate; no global blacklist is used
+  for that case. Only an otherwise empty, consumer-free aggressive host gets
+  the whole runtime facility and `systemd-binfmt` persistently disabled.
+- Final Lynis score/warning/suggestion parsing now accepts real 3.1.6 console
+  output and falls back to the saved structured report. Fail2ban status is
+  refreshed from service, server ping, and the live `sshd` jail after a bounded
+  readiness check.
+- Apply now captures a separate pre-hardening Lynis console report and
+  `report.dat`, and the summary uses that measured baseline instead of a static
+  source score. Dry-run explicitly reports `N/A / NOT RUN` and launches no
+  writing Lynis scan.
+- Repeated systemd hardening treats an already-current, health-tested drop-in
+  with identical exposure as unchanged/already hardened rather than warning
+  that exposure did not decrease.
+- `PROC-3614` now records repeated PID, unit, stat, wait-channel, command, IO,
+  and file-descriptor snapshots, classifies transient versus persistent waits,
+  and never kills a D-state process.
 
 ### Added
 
@@ -51,6 +105,10 @@ für 1.1.3 wird erst nach dem vollständigen Zielsystemtest erstellt.
 
 ### Validation status
 
-- Lokale Syntax-, statische und simulierte Regressionstests bestanden.
-- Ein vollständiger Ubuntu-26.04.1-Zielsystemtest und die Bestätigung des
-  Zielwerts Hardening Index >= 90 stehen noch aus.
+- Ubuntu 26.04.1 Target-System-Abnahme bestanden.
+- Fresh Lynis 63 -> 87; konvergiert 87 -> 87.
+- AIDE baseline rebuilt 1 -> 0.
+- Gepatchter Reboot: Tailscale/Netfilter/NAT gesund; `kernel.modules_disabled=1`
+  erst nach dem Runtime-Gate.
+- Finaler konvergierter Lauf: keine Packages installed/removed, keine Failed
+  Services/Rollbacks, Reboot required NO.

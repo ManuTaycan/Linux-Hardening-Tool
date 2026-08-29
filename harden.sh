@@ -18,7 +18,6 @@ umask 027
 readonly SCRIPT_VERSION="1.1.3"
 readonly LOG_FILE="${HARDEN_LOG_FILE:-/var/log/server-hardening.log}"
 readonly SYSTEMD_HARDENING_REPORT="/root/systemd-hardening-report.txt"
-readonly SOURCE_LYNIS_INDEX="86"
 readonly MAIN_PID="$BASHPID"
 
 MODE=""
@@ -45,9 +44,11 @@ REMOTE_LOG_OPTION_SEEN=0
 REMOTE_LOG_DECLINED=0
 PROMPT_REPLY=""
 REBOOT_REQUIRED=0
+LYNIS_BEFORE="NOT RUN"
 LYNIS_AFTER="not run"
 LYNIS_WARNINGS="unknown"
 LYNIS_SUGGESTIONS="unknown"
+LYNIS_PARSE_STATUS="NOT RUN"
 FIREWALL_STATUS="NOT RUN"
 SSH_STATUS="NOT RUN"
 PAM_STATUS="NOT RUN"
@@ -68,6 +69,10 @@ NETWORK_HARDENING_COMPLETED=0
 FIREWALL_COMPLETED=0
 APPARMOR_COMPLETED=0
 SYSTEMD_EXPOSURE_RESULT=""
+IOWAIT_PREVIOUS_PIDS=""
+MANAGED_FILE_CHANGED=0
+MANAGED_SETTING_CHANGED=0
+INITRAMFS_POLICY_CHANGED=0
 
 readonly COLOR_RESET=$'\033[0m'
 readonly COLOR_DIM=$'\033[2m'
@@ -483,6 +488,7 @@ transaction_restore() {
 
 install_managed_file() {
     local destination="$1" mode="${2:-0644}" owner="${3:-root}" group="${4:-root}"
+    MANAGED_FILE_CHANGED=0
     if [[ "$MODE" == "dry-run" ]]; then
         cat >/dev/null || return 1
         log INFO "Would install managed file ${destination} (${owner}:${group} ${mode})"
@@ -505,12 +511,14 @@ install_managed_file() {
         return 1
     fi
     rm -f -- "$temporary" || return 1
+    MANAGED_FILE_CHANGED=1
     record_change "Installed managed file ${destination}"
     return 0
 }
 
 replace_setting() {
     local file="$1" key="$2" value="$3" separator="${4:- }"
+    MANAGED_SETTING_CHANGED=0
     if [[ "$MODE" == "dry-run" ]]; then
         log INFO "Would set ${key}${separator}${value} in ${file}"
         return 0
@@ -526,8 +534,14 @@ replace_setting() {
         { print }
         END { if (!done) print key sep value }
     ' "$file" > "$temporary"
+    if cmp -s "$temporary" "$file"; then
+        rm -f "$temporary"
+        log INFO "Setting already current: ${key} in ${file}"
+        return 0
+    fi
     install -o root -g root -m "$(stat -c '%a' "$file" 2>/dev/null || printf 0644)" "$temporary" "$file"
     rm -f "$temporary"
+    MANAGED_SETTING_CHANGED=1
     record_change "Set ${key} in ${file}"
 }
 
@@ -1164,6 +1178,221 @@ root_or_boot_uses_usb() {
     return 1
 }
 
+binfmt_unregister_entry() {
+    local entry_file="$1"
+    printf '%s\n' -1 > "$entry_file"
+}
+
+configure_binfmt_misc() {
+    local binfmt_root="${HARDEN_BINFMT_ROOT:-/proc/sys/fs/binfmt_misc}"
+    local report="${BACKUP_DIR:-/root}/binfmt-misc-inventory.txt"
+    local modprobe_file="${HARDEN_BINFMT_MODPROBE_FILE:-/etc/modprobe.d/99-disable-unused-binfmt-misc.conf}"
+    local etc_binfmt_dir="${HARDEN_BINFMT_ETC_DIR:-/etc/binfmt.d}"
+    local vendor_binfmt_dir="${HARDEN_BINFMT_VENDOR_DIR:-/usr/lib/binfmt.d}"
+    local python_root="${HARDEN_BINFMT_PYTHON_ROOT:-/usr/bin}"
+    local -a registrations=() consumers=() config_files=() python_names=() disabled_python=() already_disabled_python=()
+    local entry package config_dir config_line status="unavailable" remaining_registration="" name="" base=""
+    local override="" transaction_label="" python_binary="" validation_failed="" other_registration=""
+    local override_was_current=0
+    declare -A python_local_override=() active_registration=() seen_python=()
+    local -a config_dirs=(/etc/binfmt.d /run/binfmt.d /usr/local/lib/binfmt.d /usr/lib/binfmt.d /lib/binfmt.d)
+    if [[ -n "${HARDEN_BINFMT_CONFIG_DIRS:-}" ]]; then
+        IFS=: read -r -a config_dirs <<<"$HARDEN_BINFMT_CONFIG_DIRS"
+    fi
+
+    if [[ -d "$binfmt_root" ]]; then
+        while IFS= read -r entry; do registrations+=("$entry"); done < <(
+            find "$binfmt_root" -maxdepth 1 -type f ! -name register ! -name status -printf '%f\n' 2>/dev/null | sort
+        )
+        [[ ! -r "$binfmt_root/status" ]] || status="$(tr -d '[:space:]' < "$binfmt_root/status" 2>/dev/null || true)"
+    fi
+    for config_dir in "${config_dirs[@]}"; do
+        [[ -d "$config_dir" ]] || continue
+        while IFS= read -r config_line; do config_files+=("$config_line"); done < <(
+            find "$config_dir" -maxdepth 1 \( -type f -o -type l \) -name '*.conf' -print 2>/dev/null | sort
+        )
+    done
+    for entry in "${registrations[@]}"; do active_registration["$entry"]=1; done
+    for config_line in "${config_files[@]}"; do
+        base="$(basename -- "$config_line")"
+        name="${base%.conf}"
+        [[ "$name" =~ ^python3\.[0-9]+$ ]] || continue
+        if [[ "$config_line" == "$etc_binfmt_dir/"* ]]; then
+            python_local_override["$name"]="$config_line"
+        elif [[ "$config_line" == "$vendor_binfmt_dir/"* && -f "$config_line" && ! -L "$config_line" ]] \
+            && grep -Fq ":${name}:M::" "$config_line" \
+            && grep -Fq "::/usr/bin/${name}:" "$config_line"; then
+            if [[ -z "${seen_python[$name]+present}" ]]; then
+                python_names+=("$name")
+                seen_python["$name"]=1
+            fi
+        fi
+    done
+    for package in qemu-user qemu-user-static binfmt-support wine wine64 wine32 mono-runtime default-jre default-jre-headless; do
+        package_installed "$package" && consumers+=("$package")
+    done
+    while IFS= read -r package; do
+        [[ -n "$package" ]] && consumers+=("$package")
+    done < <(dpkg-query -W -f='${db:Status-Abbrev}\t${binary:Package}\n' \
+        'qemu-user*' 'wine*' 'openjdk-*' '*-jre*' 2>/dev/null \
+        | awk '$1 ~ /^ii/ {print $2}' | sort -u || true)
+
+    if [[ "$MODE" == "dry-run" ]]; then
+        if ((${#python_names[@]})) && [[ "$AGGRESSIVE" -eq 1 ]]; then
+            log INFO "Would mask only the vendor Python bytecode binfmt registrations (${python_names[*]}) and validate Python, APT, systemd, and all other registrations"
+        elif ((${#registrations[@]} || ${#config_files[@]} || ${#consumers[@]})); then
+            log INFO "Would preserve binfmt_misc after inventory because registrations, configuration, or interpreter consumers exist"
+        elif [[ "$AGGRESSIVE" -eq 1 ]]; then
+            log INFO "Would persistently disable unused systemd-binfmt/binfmt_misc and verify no registrations remain"
+        else
+            record_skip "HRDN-7231" "unused binfmt_misc deactivation requires --aggressive"
+        fi
+        return 0
+    fi
+
+    {
+        printf 'binfmt_misc inventory generated %s\n' "$(timestamp)"
+        printf 'kernel-status=%s\n' "${status:-unknown}"
+        printf 'registrations=%s\n' "${registrations[*]:-none}"
+        for entry in "${registrations[@]}"; do
+            printf '\n[%s]\n' "$entry"
+            sed -n '1,80p' "$binfmt_root/$entry" 2>/dev/null || true
+        done
+        printf '\nconfiguration-files=%s\n' "${config_files[*]:-none}"
+        for entry in "${config_files[@]}"; do
+            printf '\n[%s]\n' "$entry"
+            grep -Ev '^[[:space:]]*(#|$)' "$entry" 2>/dev/null || true
+        done
+        printf '\nprotected-consumer-packages=%s\n' "${consumers[*]:-none}"
+        printf 'python-bytecode-candidates=%s\n' "${python_names[*]:-none}"
+        printf 'python-bytecode-purpose=direct execution of version-specific compiled .pyc files; normal interpreter execution does not require binfmt_misc\n'
+    } > "$report"
+    chmod 0600 "$report"
+
+    if ((${#python_names[@]})); then
+        if [[ "$AGGRESSIVE" -ne 1 ]]; then
+            record_skip "HRDN-7231" "Python bytecode registrations ${python_names[*]} can be disabled individually, but persistent deactivation requires --aggressive; see ${report}"
+            return 0
+        fi
+        for name in "${python_names[@]}"; do
+            override="${etc_binfmt_dir}/${name}.conf"
+            python_binary="${python_root}/${name}"
+            validation_failed=""
+            override_was_current=0
+            if [[ -n "${python_local_override[$name]+present}" ]] \
+                && [[ ! -L "$override" || "$(readlink -- "$override" 2>/dev/null || true)" != /dev/null ]]; then
+                record_skip "HRDN-7231:${name}" "local administrator binfmt override ${override} is not a /dev/null mask and was preserved"
+                continue
+            fi
+            if [[ -L "$override" && "$(readlink -- "$override" 2>/dev/null || true)" == /dev/null ]]; then
+                override_was_current=1
+            fi
+            if [[ ! -x "$python_binary" ]]; then
+                record_skip "HRDN-7231:${name}" "vendor bytecode registration exists but interpreter ${python_binary} is unavailable; retained due to inconsistent package state"
+                continue
+            fi
+            if [[ -n "${active_registration[$name]+present}" ]] \
+                && ! grep -Fxq "interpreter /usr/bin/${name}" "$binfmt_root/$name" 2>/dev/null; then
+                record_skip "HRDN-7231:${name}" "active registration does not use the expected vendor interpreter /usr/bin/${name}; retained for manual review"
+                continue
+            fi
+            if [[ ! -d "$etc_binfmt_dir" ]] \
+                && ! install -d -o root -g root -m 0755 "$etc_binfmt_dir"; then
+                record_skip "HRDN-7231:${name}" "could not create ${etc_binfmt_dir}; vendor registration was retained"
+                continue
+            fi
+            transaction_label="binfmt-${name}.conf"
+            transaction_copy "$override" "$transaction_label"
+            if [[ ! -L "$override" || "$(readlink -- "$override" 2>/dev/null || true)" != /dev/null ]]; then
+                rm -f -- "$override"
+                if ! ln -s /dev/null "$override"; then
+                    transaction_restore "$override" "$transaction_label"
+                    record_skip "HRDN-7231:${name}" "could not install targeted ${override} -> /dev/null override"
+                    continue
+                fi
+            fi
+            if [[ -n "${active_registration[$name]+present}" ]] \
+                && ! binfmt_unregister_entry "$binfmt_root/$name"; then
+                validation_failed="runtime unregister failed"
+            fi
+            [[ ! -e "$binfmt_root/$name" ]] || validation_failed="runtime registration remained active"
+            [[ -n "$validation_failed" ]] || "$python_binary" -c 'import sys; raise SystemExit(0)' >/dev/null 2>&1 \
+                || validation_failed="${name} interpreter validation failed"
+            [[ -n "$validation_failed" ]] || python3 -c 'import sys; raise SystemExit(0)' >/dev/null 2>&1 \
+                || validation_failed="default python3 validation failed"
+            [[ -n "$validation_failed" ]] || LC_ALL=C apt-get check >/dev/null 2>&1 \
+                || validation_failed="apt-get check failed"
+            [[ -n "$validation_failed" ]] || run_streamed systemctl daemon-reload \
+                || validation_failed="systemctl daemon-reload failed"
+            if [[ -z "$validation_failed" ]]; then
+                for other_registration in "${registrations[@]}"; do
+                    [[ "$other_registration" == "$name" || -e "$binfmt_root/$other_registration" ]] \
+                        || validation_failed="unrelated registration ${other_registration} disappeared"
+                done
+            fi
+            if [[ -n "$validation_failed" ]]; then
+                transaction_restore "$override" "$transaction_label"
+                if unit_file_exists systemd-binfmt.service; then
+                    run_streamed systemctl restart systemd-binfmt.service || true
+                fi
+                record_skip "HRDN-7231:${name}" "targeted Python bytecode deactivation rolled back: ${validation_failed}"
+                continue
+            fi
+            if [[ "$override_was_current" -eq 1 && -z "${active_registration[$name]+present}" ]]; then
+                already_disabled_python+=("$name")
+            else
+                disabled_python+=("$name")
+            fi
+        done
+        if ((${#disabled_python[@]})); then
+            record_change "Target-disabled reversible Python bytecode binfmt registrations via /etc/binfmt.d -> /dev/null without changing normal Python/APT/systemd operation or unrelated formats: ${disabled_python[*]}"
+        fi
+        if ((${#already_disabled_python[@]})); then
+            log OK "Python bytecode binfmt override already active and revalidated: ${already_disabled_python[*]}"
+        fi
+        record_skip "HRDN-7231" "global binfmt_misc disable was not used; non-Python registrations and consumers remain preserved and inventoried in ${report}"
+        return 0
+    fi
+
+    if ((${#registrations[@]} || ${#config_files[@]} || ${#consumers[@]})); then
+        record_skip "HRDN-7231" "binfmt_misc preserved; active/configured formats or protected qemu/Wine/JVM consumers are inventoried in ${report}"
+        return 0
+    fi
+    if [[ "$AGGRESSIVE" -ne 1 ]]; then
+        record_skip "HRDN-7231" "no consumer was found, but persistent deactivation requires --aggressive; see ${report}"
+        return 0
+    fi
+
+    if [[ -w "$binfmt_root/status" ]]; then
+        printf '0\n' > "$binfmt_root/status"
+        status="$(tr -d '[:space:]' < "$binfmt_root/status" 2>/dev/null || true)"
+        [[ "$status" == disabled || "$status" == 0 ]] || {
+            record_skip "HRDN-7231" "binfmt_misc runtime status did not become disabled; see ${report}"
+            return 0
+        }
+    fi
+    if [[ -d "$binfmt_root" ]]; then
+        remaining_registration="$(find "$binfmt_root" -maxdepth 1 -type f ! -name register ! -name status -print 2>/dev/null || true)"
+    fi
+    if [[ -n "$remaining_registration" ]]; then
+        record_skip "HRDN-7231" "registrations remained after runtime disable; no persistent service/module block was installed and formats were not deleted blindly"
+        return 0
+    fi
+    install_managed_file "$modprobe_file" 0644 <<'EOF'
+# Managed by harden.sh after proving no active/configured foreign formats.
+install binfmt_misc /bin/false
+blacklist binfmt_misc
+EOF
+    if [[ "$MANAGED_FILE_CHANGED" -eq 1 ]]; then
+        INITRAMFS_POLICY_CHANGED=1
+    fi
+    if unit_file_exists systemd-binfmt.service; then
+        disable_service systemd-binfmt.service 1
+    fi
+    record_change "Inventoried and persistently disabled unused systemd-binfmt/binfmt_misc without deleting configured interpreters"
+    return 0
+}
+
 configure_kernel_modules() {
     local -a modules=(cramfs freevxfs hfs hfsplus jffs2 udf dccp sctp rds tipc)
     local module loaded_modules=""
@@ -1201,17 +1430,19 @@ configure_kernel_modules() {
         if [[ ! -d /sys/bus/thunderbolt/devices || -z "$(ls -A /sys/bus/thunderbolt/devices 2>/dev/null)" ]]; then
             content+=$'\ninstall thunderbolt /bin/false\nblacklist thunderbolt'
         fi
-        if ! systemctl is-active --quiet systemd-binfmt.service 2>/dev/null; then
-            content+=$'\ninstall binfmt_misc /bin/false\nblacklist binfmt_misc'
-        else
-            record_skip "non-native binary formats" "systemd-binfmt is active; disabling its kernel module could break configured interpreters"
-        fi
     else
         record_skip "USB-1000" "USB storage blocking requires --aggressive after verifying console and storage dependencies"
     fi
+    INITRAMFS_POLICY_CHANGED=0
     printf '%s\n' "$content" | install_managed_file /etc/modprobe.d/99-security-hardening.conf 0644
+    if [[ "$MANAGED_FILE_CHANGED" -eq 1 ]]; then
+        INITRAMFS_POLICY_CHANGED=1
+    fi
+    configure_binfmt_misc
     if [[ "$MODE" == "apply" ]]; then
-        if command -v update-initramfs >/dev/null 2>&1; then
+        if [[ "$INITRAMFS_POLICY_CHANGED" -ne 1 ]]; then
+            log INFO "Managed module policy is unchanged; update-initramfs is not required"
+        elif command -v update-initramfs >/dev/null 2>&1; then
             if run_streamed update-initramfs -u; then
                 REBOOT_REQUIRED=1
             else
@@ -1223,50 +1454,483 @@ configure_kernel_modules() {
     fi
 }
 
-prepare_kernel_module_lock() {
+kernel_config_value() {
+    local symbol="$1" config_file="${HARDEN_KERNEL_CONFIG:-/boot/config-$(uname -r)}"
+    local value=""
+    if [[ -r "$config_file" ]]; then
+        value="$(awk -F= -v symbol="$symbol" '$1 == symbol {value=$2} END {print value}' "$config_file")"
+    elif [[ -r "${HARDEN_PROC_CONFIG:-/proc/config.gz}" ]] && command -v gzip >/dev/null 2>&1; then
+        value="$(gzip -cd "${HARDEN_PROC_CONFIG:-/proc/config.gz}" 2>/dev/null \
+            | awk -F= -v symbol="$symbol" '$1 == symbol {value=$2} END {print value}')"
+    else
+        printf '%s\n' unknown
+        return 0
+    fi
+    case "$value" in
+        y) printf '%s\n' builtin ;;
+        m) printf '%s\n' module ;;
+        *) printf '%s\n' unavailable ;;
+    esac
+    return 0
+}
+
+kernel_module_is_loaded() {
+    local module="${1//-/_}" sys_module_root="${HARDEN_SYS_MODULE_ROOT:-/sys/module}"
+    local proc_modules="${HARDEN_PROC_MODULES:-/proc/modules}"
+    [[ -d "$sys_module_root/$module" ]] && return 0
+    [[ -r "$proc_modules" ]] \
+        && awk -v module="$module" '$1 == module {found=1} END {exit !found}' "$proc_modules"
+}
+
+kernel_lock_report_start() {
+    local report="${HARDEN_KERNEL_LOCK_REPORT:-/root/kernel-module-lockdown-report.txt}"
+    local parent
+    parent="$(dirname -- "$report")"
+    if [[ ! -d "$parent" ]]; then
+        install -d -m 0700 "$parent" || return 1
+    fi
+    KERNEL_LOCK_REPORT_WORK="${report}.tmp.$$"
+    : > "$KERNEL_LOCK_REPORT_WORK" || return 1
+    chmod 0600 "$KERNEL_LOCK_REPORT_WORK" || return 1
+    printf 'kernel-module-lockdown diagnostic\ngenerated=%s\nkernel=%s\n' \
+        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$(uname -r)" >> "$KERNEL_LOCK_REPORT_WORK"
+    return 0
+}
+
+kernel_lock_report_line() {
+    printf '%s=%s\n' "$1" "$2" >> "$KERNEL_LOCK_REPORT_WORK"
+}
+
+kernel_lock_report_finish() {
+    local report="${HARDEN_KERNEL_LOCK_REPORT:-/root/kernel-module-lockdown-report.txt}"
+    mv -f -- "$KERNEL_LOCK_REPORT_WORK" "$report"
+    chmod 0600 "$report"
+}
+
+kernel_lock_fail() {
+    local reason="$1"
+    kernel_lock_report_line gate-result "BLOCKED"
+    kernel_lock_report_line gate-error "$reason"
+    kernel_lock_report_finish || true
+    printf 'ERROR: kernel module lock blocked: %s\n' "$reason" >&2
+    return 1
+}
+
+tailscale_kernel_runtime_ready() {
+    local family command version summary backend chain_output="" health_problem=0 router_v4=0 router_v6=0
+    local ipv4_masquerade=0 ipv6_masquerade=0
+    KERNEL_GATE_FAILURE=""
+    if ! systemctl is-active --quiet server-hardening-firewall.service 2>/dev/null; then
+        KERNEL_GATE_FAILURE="server-hardening-firewall.service is not active"
+        return 1
+    fi
+    kernel_lock_report_line firewall-service active
+    if ! systemctl is-active --quiet tailscaled.service 2>/dev/null; then
+        KERNEL_GATE_FAILURE="tailscaled.service stopped before the final lock gate"
+        return 1
+    fi
+    for family in ipv4 ipv6; do
+        if [[ "$family" == ipv4 ]]; then command=iptables; else command=ip6tables; fi
+        if ! command -v "$command" >/dev/null 2>&1; then
+            KERNEL_GATE_FAILURE="${command} is unavailable"
+            return 1
+        fi
+        version="$($command --version 2>/dev/null || true)"
+        kernel_lock_report_line "${family}-iptables-backend" "${version:-unavailable}"
+        if [[ "$version" != *nf_tables* ]]; then
+            KERNEL_GATE_FAILURE="${command} is not using the nf_tables backend"
+            return 1
+        fi
+        if ! "$command" -w -t nat -S POSTROUTING >/dev/null 2>&1; then
+            KERNEL_GATE_FAILURE="${family} nat/POSTROUTING is unavailable"
+            return 1
+        fi
+        kernel_lock_report_line "${family}-nat-postrouting" OK
+        chain_output="$($command -w -t nat -S ts-postrouting 2>/dev/null || true)"
+        if ! "$command" -w -t filter -S ts-input >/dev/null 2>&1 \
+            || ! "$command" -w -t filter -S ts-forward >/dev/null 2>&1 \
+            || [[ -z "$chain_output" ]] \
+            || ! "$command" -w -t filter -C INPUT -j ts-input >/dev/null 2>&1 \
+            || ! "$command" -w -t filter -C FORWARD -j ts-forward >/dev/null 2>&1 \
+            || ! "$command" -w -t nat -C POSTROUTING -j ts-postrouting >/dev/null 2>&1; then
+            KERNEL_GATE_FAILURE="${family} Tailscale netfilter chains or hooks are incomplete"
+            return 1
+        fi
+        kernel_lock_report_line "${family}-tailscale-chains" OK
+        if grep -Fq MASQUERADE <<<"$chain_output"; then
+            if [[ "$family" == ipv4 ]]; then ipv4_masquerade=1; else ipv6_masquerade=1; fi
+        fi
+    done
+    if ! command -v tailscale >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+        KERNEL_GATE_FAILURE="tailscale status or the Python JSON parser is unavailable"
+        return 1
+    fi
+    if ! summary="$(tailscale status --json 2>/dev/null | python3 -c '
+import json, re, sys
+import ipaddress
+data = json.load(sys.stdin)
+print("backend=" + str(data.get("BackendState", "")))
+node = data.get("Self") or {}
+routes = node.get("PrimaryRoutes") or []
+router4 = bool(node.get("ExitNodeOption"))
+router6 = bool(node.get("ExitNodeOption"))
+for route in routes:
+    try:
+        network = ipaddress.ip_network(str(route), strict=False)
+        router4 = router4 or network.version == 4
+        router6 = router6 or network.version == 6
+    except ValueError:
+        pass
+print("router-v4=" + ("1" if router4 else "0"))
+print("router-v6=" + ("1" if router6 else "0"))
+for item in data.get("Health") or []:
+    if re.search(r"router|netfilter|firewall|iptables|nftables|masquerad|postrouting|forwarding", str(item), re.I):
+        print("health-problem=1")
+')"; then
+        KERNEL_GATE_FAILURE="tailscale status --json could not be parsed"
+        return 1
+    fi
+    backend="$(awk -F= '$1 == "backend" {print substr($0, index($0, "=") + 1)}' <<<"$summary")"
+    grep -Fxq 'health-problem=1' <<<"$summary" && health_problem=1
+    grep -Fxq 'router-v4=1' <<<"$summary" && router_v4=1
+    grep -Fxq 'router-v6=1' <<<"$summary" && router_v6=1
+    kernel_lock_report_line tailscale-backend-state "${backend:-unknown}"
+    kernel_lock_report_line tailscale-router-role "ipv4=${router_v4};ipv6=${router_v6}"
+    kernel_lock_report_line tailscale-router-netfilter-health "$([[ "$health_problem" -eq 0 ]] && printf clear || printf warning)"
+    if [[ "$backend" != Running ]]; then
+        KERNEL_GATE_FAILURE="Tailscale backend state is ${backend:-unknown}, not Running"
+        return 1
+    fi
+    if [[ "$health_problem" -ne 0 ]]; then
+        KERNEL_GATE_FAILURE="Tailscale reports a current router/netfilter health warning"
+        return 1
+    fi
+    if [[ "$router_v4" -eq 1 && "$ipv4_masquerade" -ne 1 ]]; then
+        KERNEL_GATE_FAILURE="IPv4 Tailscale router role lacks a MASQUERADE rule in nat/ts-postrouting"
+        return 1
+    fi
+    if [[ "$router_v6" -eq 1 && "$ipv6_masquerade" -ne 1 ]]; then
+        KERNEL_GATE_FAILURE="IPv6 Tailscale router role lacks a MASQUERADE rule in nat/ts-postrouting"
+        return 1
+    fi
+    kernel_lock_report_line tailscale-router-masquerade "ipv4=${ipv4_masquerade};ipv6=${ipv6_masquerade}"
+    return 0
+}
+
+preload_tailscale_kernel_modules() {
+    local allow_load="${1:-1}" symbol module scope state loaded
+    local unknown_config=0
+    declare -A seen_modules=()
+    while IFS=: read -r symbol module scope; do
+        [[ -n "$symbol" ]] || continue
+        state="$(kernel_config_value "$symbol")"
+        loaded=no
+        kernel_module_is_loaded "$module" && loaded=yes
+        kernel_lock_report_line "$symbol" "${state};module=${module};scope=${scope};loaded=${loaded}"
+        if [[ "$state" == unknown ]]; then
+            unknown_config=1
+            continue
+        fi
+        if [[ "$state" == module && -z "${seen_modules[$module]+present}" ]]; then
+            seen_modules["$module"]=1
+            if [[ "$loaded" == no ]]; then
+                if [[ "$allow_load" -ne 1 ]]; then
+                    kernel_lock_report_line "preloaded-${module}" blocked-already-locked
+                    continue
+                fi
+                if ! modprobe "$module"; then
+                    kernel_lock_fail "modprobe ${module} failed for ${symbol}"
+                    return 1
+                fi
+                if ! kernel_module_is_loaded "$module"; then
+                    kernel_lock_fail "${module} did not become loaded after modprobe"
+                    return 1
+                fi
+                kernel_lock_report_line "preloaded-${module}" yes
+            else
+                kernel_lock_report_line "preloaded-${module}" already-loaded
+            fi
+        fi
+    done <<'EOF'
+CONFIG_NF_TABLES:nf_tables:common
+CONFIG_NF_CONNTRACK:nf_conntrack:common
+CONFIG_NF_NAT:nf_nat:common
+CONFIG_NFT_NAT:nft_nat:nft
+CONFIG_NFT_NAT:nft_chain_nat:nft
+CONFIG_NFT_MASQ:nft_masq:nft
+CONFIG_NFT_COMPAT:nft_compat:common
+CONFIG_NETFILTER_XTABLES:x_tables:common
+CONFIG_NETFILTER_XT_MARK:xt_mark:common
+CONFIG_NETFILTER_XT_NAT:xt_nat:common
+CONFIG_NETFILTER_XT_TARGET_MASQUERADE:xt_MASQUERADE:common
+CONFIG_IP_NF_IPTABLES:ip_tables:ipv4
+CONFIG_IP_NF_NAT:iptable_nat:ipv4
+CONFIG_IP6_NF_IPTABLES:ip6_tables:ipv6
+CONFIG_IP6_NF_NAT:ip6table_nat:ipv6
+EOF
+    if [[ "$unknown_config" -ne 0 && "$allow_load" -eq 1 ]]; then
+        kernel_lock_fail "the running-kernel configuration could not be read"
+        return 1
+    fi
+    return 0
+}
+
+kernel_module_preload_gate() {
+    local module_control="${HARDEN_MODULES_DISABLED_PATH:-/proc/sys/kernel/modules_disabled}" before=""
+    kernel_lock_report_start || { printf 'ERROR: cannot create kernel module preload diagnostic report\n' >&2; return 1; }
+    before="$(tr -d '[:space:]' < "$module_control" 2>/dev/null || true)"
+    kernel_lock_report_line stage preload-before-tailscaled
+    kernel_lock_report_line modules-disabled-before "${before:-unknown}"
+    if [[ "$before" != 0 ]]; then
+        kernel_lock_fail "cannot preload Tailscale Netfilter prerequisites because kernel.modules_disabled is ${before:-unreadable}"
+        return 1
+    fi
+    preload_tailscale_kernel_modules || return 1
+    kernel_lock_report_line gate-result PRELOADED
+    kernel_lock_report_finish || return 1
+    printf 'OK: preloaded running-kernel Tailscale Netfilter/NAT prerequisites\n'
+    return 0
+}
+
+kernel_lock_gate() {
     local module_control="${HARDEN_MODULES_DISABLED_PATH:-/proc/sys/kernel/modules_disabled}"
-    local lock_unit="${HARDEN_MODULE_LOCK_UNIT:-/etc/systemd/system/kernel-module-lockdown.service}"
-    if [[ "$AGGRESSIVE" -ne 1 ]]; then
+    local before="" tailscale_state=inactive attempts interval attempt
+    kernel_lock_report_start || { printf 'ERROR: cannot create kernel module lock diagnostic report\n' >&2; return 1; }
+    before="$(tr -d '[:space:]' < "$module_control" 2>/dev/null || true)"
+    kernel_lock_report_line stage final-lock
+    kernel_lock_report_line modules-disabled-before "${before:-unknown}"
+    if systemctl is-active --quiet tailscaled.service 2>/dev/null; then tailscale_state=active; fi
+    kernel_lock_report_line tailscale-service "$tailscale_state"
+    if [[ "$before" == 1 ]]; then
+        preload_tailscale_kernel_modules 0 || true
+        kernel_lock_report_line module-preload skipped-already-locked
+        if [[ "$tailscale_state" == active ]]; then
+            if tailscale_kernel_runtime_ready; then
+                kernel_lock_report_line already-locked-runtime-check OK
+            else
+                kernel_lock_report_line already-locked-runtime-check "FAILED; reboot-repair-required; ${KERNEL_GATE_FAILURE:-unknown}"
+            fi
+        else
+            kernel_lock_report_line already-locked-runtime-check not-required-inactive
+        fi
+        kernel_lock_report_line gate-result already-locked-idempotent
+        kernel_lock_report_finish || return 1
+        printf 'INFO: kernel.modules_disabled is already 1; no module load was attempted\n'
         return 0
     fi
-    if [[ ! -e "$module_control" ]]; then
-        return 0
+    [[ "$before" == 0 ]] || { kernel_lock_fail "kernel.modules_disabled runtime value is ${before:-unreadable}"; return 1; }
+    if [[ "$tailscale_state" == active ]]; then
+        preload_tailscale_kernel_modules || return 1
+        attempts="${HARDEN_KERNEL_GATE_ATTEMPTS:-60}"
+        interval="${HARDEN_KERNEL_GATE_INTERVAL:-1}"
+        [[ "$attempts" =~ ^[1-9][0-9]*$ ]] || attempts=60
+        [[ "$interval" =~ ^[0-9]+([.][0-9]+)?$ ]] || interval=1
+        for ((attempt=1; attempt<=attempts; attempt++)); do
+            if tailscale_kernel_runtime_ready; then
+                kernel_lock_report_line runtime-attempt "$attempt"
+                break
+            fi
+            if ((attempt == attempts)); then
+                kernel_lock_fail "${KERNEL_GATE_FAILURE:-Tailscale runtime prerequisites remained unproven}"
+                return 1
+            fi
+            sleep "$interval"
+        done
+    elif systemctl is-failed --quiet tailscaled.service 2>/dev/null \
+        || systemctl is-failed --quiet kernel-module-netfilter-preload.service 2>/dev/null; then
+        kernel_lock_fail "Tailscale or its Netfilter preload prerequisite failed during this boot"
+        return 1
+    else
+        kernel_lock_report_line tailscale-runtime-check not-required-inactive
     fi
-    if [[ "$MODE" == "dry-run" ]]; then
-        log INFO "Would install, but not enable or start, the late kernel module lock unit until the final gate"
-        return 0
+    if ! sysctl -w kernel.modules_disabled=1 >/dev/null \
+        || [[ "$(tr -d '[:space:]' < "$module_control" 2>/dev/null || true)" != 1 ]]; then
+        kernel_lock_fail "final kernel.modules_disabled=1 write or verification failed"
+        return 1
     fi
-    install_managed_file "$lock_unit" 0644 <<'EOF'
+    kernel_lock_report_line modules-disabled-after 1
+    kernel_lock_report_line gate-result LOCKED
+    kernel_lock_report_finish || return 1
+    printf 'OK: verified runtime prerequisites and set kernel.modules_disabled=1\n'
+    return 0
+}
+
+render_kernel_module_lock_helper() {
+    printf '%s\n' '#!/usr/bin/env bash' 'set -Eeuo pipefail' "IFS=\$'\\n\\t'" 'umask 077'
+    declare -f kernel_config_value kernel_module_is_loaded kernel_lock_report_start \
+        kernel_lock_report_line kernel_lock_report_finish kernel_lock_fail \
+        tailscale_kernel_runtime_ready preload_tailscale_kernel_modules \
+        kernel_module_preload_gate kernel_lock_gate
+    printf '%s\n' 'case "${1:-}" in --preload) kernel_module_preload_gate ;; "") kernel_lock_gate ;; *) exit 64 ;; esac'
+}
+
+render_kernel_module_lock_unit() {
+    local module_control="$1" lock_helper="$2"
+    cat <<EOF
 [Unit]
-Description=Late irreversible kernel module loading lock
+Description=Late verified irreversible kernel module loading lock
 Documentation=man:sysctl(8)
 Wants=network-online.target
-After=network-online.target apparmor.service tailscaled.service server-hardening-firewall.service
+Requires=server-hardening-firewall.service
+After=network-online.target server-hardening-firewall.service apparmor.service kernel-module-netfilter-preload.service tailscaled.service
+ConditionPathExists=${module_control}
 
 [Service]
 Type=oneshot
-ExecStart=/usr/sbin/sysctl -w kernel.modules_disabled=1
+ExecStart=${lock_helper}
 RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
 EOF
-    if systemctl daemon-reload; then
-        if [[ "$(sysctl -n kernel.modules_disabled 2>/dev/null || true)" != "1" ]]; then
-            if ! systemctl disable kernel-module-lockdown.service >/dev/null 2>&1; then
-                record_skip "kernel.modules_disabled" "could not disable the late lock unit before final prerequisite validation"
-                return 1
-            fi
-        fi
-        record_change "Prepared the late kernel module loading lock unit without enabling or starting it before the final gate"
-    else
-        record_skip "kernel.modules_disabled" "late lock unit could not be loaded; runtime locking will be skipped"
+}
+
+render_kernel_module_preload_unit() {
+    local module_control="$1" lock_helper="$2"
+    cat <<EOF
+[Unit]
+Description=Preload running-kernel Netfilter/NAT modules before Tailscale
+Documentation=man:modprobe(8)
+After=systemd-modules-load.service
+Before=tailscaled.service
+ConditionPathExists=${module_control}
+
+[Service]
+Type=oneshot
+ExecStart=${lock_helper} --preload
+RemainAfterExit=yes
+EOF
+}
+
+render_tailscale_preload_dropin() {
+    cat <<'EOF'
+[Unit]
+Requires=kernel-module-netfilter-preload.service
+After=kernel-module-netfilter-preload.service
+EOF
+}
+
+rollback_kernel_module_lock_install() {
+    local lock_helper="$1" lock_unit="$2" preload_unit="$3" tailscale_dropin="$4"
+    transaction_restore "$tailscale_dropin" tailscaled-netfilter-preload.conf
+    transaction_restore "$preload_unit" kernel-module-netfilter-preload.service
+    transaction_restore "$lock_unit" kernel-module-lockdown.service
+    transaction_restore "$lock_helper" kernel-module-lockdown-helper
+    run_streamed systemctl daemon-reload || true
+}
+
+prepare_kernel_module_lock() {
+    local module_control="${HARDEN_MODULES_DISABLED_PATH:-/proc/sys/kernel/modules_disabled}"
+    local lock_unit="${HARDEN_MODULE_LOCK_UNIT:-/etc/systemd/system/kernel-module-lockdown.service}"
+    local lock_helper="${HARDEN_MODULE_LOCK_HELPER:-/usr/local/libexec/server-hardening/kernel-module-lockdown}"
+    local preload_unit="${HARDEN_MODULE_PRELOAD_UNIT:-/etc/systemd/system/kernel-module-netfilter-preload.service}"
+    local tailscale_dropin="${HARDEN_TAILSCALE_PRELOAD_DROPIN:-/etc/systemd/system/tailscaled.service.d/99-netfilter-module-preload.conf}"
+    local candidate changed=0 enabled_state="" tailscale_unit=0
+    if [[ "$AGGRESSIVE" -ne 1 || ! -e "$module_control" ]]; then
+        return 0
     fi
+    if [[ "$MODE" == "dry-run" ]]; then
+        log INFO "Would install the late prerequisite/preload verifier and lock unit without enabling or starting them before the final gate"
+        return 0
+    fi
+    transaction_copy "$lock_helper" kernel-module-lockdown-helper
+    transaction_copy "$lock_unit" kernel-module-lockdown.service
+    transaction_copy "$preload_unit" kernel-module-netfilter-preload.service
+    transaction_copy "$tailscale_dropin" tailscaled-netfilter-preload.conf
+    candidate="$(mktemp)"
+    render_kernel_module_lock_helper > "$candidate"
+    if ! install_managed_file "$lock_helper" 0755 < "$candidate"; then
+        rm -f -- "$candidate"
+        rollback_kernel_module_lock_install "$lock_helper" "$lock_unit" "$preload_unit" "$tailscale_dropin"
+        record_skip "kernel.modules_disabled" "late-lock helper installation failed and was rolled back"
+        return 1
+    fi
+    rm -f -- "$candidate"
+    [[ "$MANAGED_FILE_CHANGED" -eq 0 ]] || changed=1
+    candidate="$(mktemp --suffix=.service)"
+    render_kernel_module_lock_unit "$module_control" "$lock_helper" > "$candidate"
+    if ! systemd_verify_unit "$candidate"; then
+        rm -f -- "$candidate"
+        rollback_kernel_module_lock_install "$lock_helper" "$lock_unit" "$preload_unit" "$tailscale_dropin"
+        record_skip "kernel.modules_disabled" "candidate late-lock unit failed systemd-analyze verify"
+        return 1
+    fi
+    if ! install_managed_file "$lock_unit" 0644 < "$candidate"; then
+        rm -f -- "$candidate"
+        rollback_kernel_module_lock_install "$lock_helper" "$lock_unit" "$preload_unit" "$tailscale_dropin"
+        record_skip "kernel.modules_disabled" "late-lock unit installation failed and was rolled back"
+        return 1
+    fi
+    [[ "$MANAGED_FILE_CHANGED" -eq 0 ]] || changed=1
+    rm -f -- "$candidate"
+    if unit_file_exists tailscaled.service; then
+        tailscale_unit=1
+        candidate="$(mktemp --suffix=.service)"
+        render_kernel_module_preload_unit "$module_control" "$lock_helper" > "$candidate"
+        if ! systemd_verify_unit "$candidate"; then
+            rm -f -- "$candidate"
+            rollback_kernel_module_lock_install "$lock_helper" "$lock_unit" "$preload_unit" "$tailscale_dropin"
+            record_skip "kernel.modules_disabled" "candidate Tailscale Netfilter preload unit failed systemd-analyze verify"
+            return 1
+        fi
+        if ! install_managed_file "$preload_unit" 0644 < "$candidate"; then
+            rm -f -- "$candidate"
+            rollback_kernel_module_lock_install "$lock_helper" "$lock_unit" "$preload_unit" "$tailscale_dropin"
+            record_skip "kernel.modules_disabled" "Tailscale Netfilter preload unit installation failed and was rolled back"
+            return 1
+        fi
+        [[ "$MANAGED_FILE_CHANGED" -eq 0 ]] || changed=1
+        rm -f -- "$candidate"
+        candidate="$(mktemp)"
+        render_tailscale_preload_dropin > "$candidate"
+        if ! install_managed_file "$tailscale_dropin" 0644 < "$candidate"; then
+            rm -f -- "$candidate"
+            rollback_kernel_module_lock_install "$lock_helper" "$lock_unit" "$preload_unit" "$tailscale_dropin"
+            record_skip "kernel.modules_disabled" "Tailscale preload drop-in installation failed and was rolled back"
+            return 1
+        fi
+        rm -f -- "$candidate"
+        [[ "$MANAGED_FILE_CHANGED" -eq 0 ]] || changed=1
+    fi
+    if ! systemd_verify_unit "$lock_unit"; then
+        rollback_kernel_module_lock_install "$lock_helper" "$lock_unit" "$preload_unit" "$tailscale_dropin"
+        record_skip "kernel.modules_disabled" "installed late-lock unit failed systemd-analyze verify"
+        return 1
+    fi
+    if [[ "$tailscale_unit" -eq 1 ]] && { ! systemd_verify_unit "$preload_unit" \
+        || ! systemd_verify_unit tailscaled.service; }; then
+        rollback_kernel_module_lock_install "$lock_helper" "$lock_unit" "$preload_unit" "$tailscale_dropin"
+        record_skip "kernel.modules_disabled" "installed Tailscale preload unit/drop-in failed systemd-analyze verify"
+        return 1
+    fi
+    if [[ "$changed" -eq 1 ]] && ! run_streamed systemctl daemon-reload; then
+        rollback_kernel_module_lock_install "$lock_helper" "$lock_unit" "$preload_unit" "$tailscale_dropin"
+        record_skip "kernel.modules_disabled" "late lock unit could not be loaded; runtime locking will be skipped"
+        return 1
+    fi
+    if [[ "$(tr -d '[:space:]' < "$module_control" 2>/dev/null || true)" != 1 ]]; then
+        enabled_state="$(systemctl is-enabled kernel-module-lockdown.service 2>/dev/null || true)"
+        if [[ "$enabled_state" != disabled && "$enabled_state" != masked ]] \
+            && ! systemctl disable kernel-module-lockdown.service >/dev/null 2>&1; then
+            rollback_kernel_module_lock_install "$lock_helper" "$lock_unit" "$preload_unit" "$tailscale_dropin"
+            record_skip "kernel.modules_disabled" "could not disable the late lock unit before final prerequisite validation"
+            return 1
+        fi
+    fi
+    if [[ "$changed" -eq 1 ]]; then
+        record_change "Installed and verified deterministic pre-tailscaled Netfilter preload plus the Tailscale-aware late kernel module lock helper/unit"
+    else
+        log INFO "Late kernel module lock helper and unit are already current and verified"
+    fi
+    return 0
 }
 
 lock_kernel_modules_late() {
     local module_control="${HARDEN_MODULES_DISABLED_PATH:-/proc/sys/kernel/modules_disabled}"
     local lock_unit="${HARDEN_MODULE_LOCK_UNIT:-/etc/systemd/system/kernel-module-lockdown.service}"
+    local lock_helper="${HARDEN_MODULE_LOCK_HELPER:-/usr/local/libexec/server-hardening/kernel-module-lockdown}"
+    local report="${HARDEN_KERNEL_LOCK_REPORT:-/root/kernel-module-lockdown-report.txt}"
+    local enabled_state=""
     if [[ "$AGGRESSIVE" -ne 1 ]]; then
         record_skip "kernel.modules_disabled" "requires --aggressive because the change is irreversible until reboot"
         return 0
@@ -1276,7 +1940,7 @@ lock_kernel_modules_late() {
         return 0
     fi
     if [[ "$MODE" == "dry-run" ]]; then
-        log WARN "Would set kernel.modules_disabled=1 only at the final lock-down stage after module, network, firewall, AppArmor, validation, and AIDE work"
+        log WARN "Would preload only running-kernel Netfilter/NAT modules needed by active Tailscale, verify dual-stack runtime health, then set kernel.modules_disabled=1 at the final gate"
         return 0
     fi
     if [[ "$CURRENT_PHASE" -ne 17 || "$NETWORK_HARDENING_COMPLETED" -ne 1 \
@@ -1285,23 +1949,35 @@ lock_kernel_modules_late() {
         record_skip "kernel.modules_disabled" "final prerequisite gate failed (phase=${CURRENT_PHASE}, network=${NETWORK_HARDENING_COMPLETED}, firewall=${FIREWALL_COMPLETED}, AppArmor=${APPARMOR_COMPLETED}, validation=${VALIDATION_COMPLETED}, AIDE=${AIDE_STATUS})"
         return 1
     fi
-    [[ -f "$lock_unit" ]] \
-        || { record_skip "kernel.modules_disabled" "late lock unit preparation was not completed"; return 1; }
-    if [[ "$(sysctl -n kernel.modules_disabled 2>/dev/null || true)" == "1" ]]; then
-        systemctl enable kernel-module-lockdown.service >/dev/null 2>&1 || true
-        [[ "$(sysctl -n kernel.modules_disabled 2>/dev/null || true)" == "1" ]] || return 1
-        log INFO "Kernel module loading was already locked; verified runtime value 1 and retained the late-boot unit"
-        return 0
+    [[ -f "$lock_unit" && -x "$lock_helper" ]] \
+        || { record_skip "kernel.modules_disabled" "late lock unit/helper preparation was not completed"; return 1; }
+    enabled_state="$(systemctl is-enabled kernel-module-lockdown.service 2>/dev/null || true)"
+    if [[ "$enabled_state" != enabled ]] && ! run_streamed systemctl enable kernel-module-lockdown.service; then
+        record_skip "kernel.modules_disabled" "could not enable the verified late-boot unit"
+        return 1
     fi
-    log WARN "Final irreversible step: disabling further kernel module loading until reboot"
-    if systemctl enable kernel-module-lockdown.service \
-        && sysctl -w kernel.modules_disabled=1 \
-        && [[ "$(sysctl -n kernel.modules_disabled 2>/dev/null || true)" == "1" ]]; then
-        record_change "Set and verified kernel.modules_disabled=1 at the final prerequisite gate and enabled the late-boot unit"
-        return 0
+    log WARN "Final irreversible step: verifying Tailscale/netfilter prerequisites before disabling further kernel module loading until reboot"
+    if ! run_streamed kernel_lock_gate; then
+        [[ ! -f "$report" || -z "$BACKUP_DIR" ]] || cp -a -- "$report" "$BACKUP_DIR/kernel-module-lockdown-report.txt"
+        record_skip "kernel.modules_disabled" "the Tailscale/netfilter-aware final gate failed; module loading remains enabled and the failure is recorded in ${report}"
+        return 1
     fi
-    record_skip "kernel.modules_disabled" "the final runtime write failed; the failure was not hidden"
-    return 1
+    [[ ! -f "$report" || -z "$BACKUP_DIR" ]] || cp -a -- "$report" "$BACKUP_DIR/kernel-module-lockdown-report.txt"
+    if [[ "$(tr -d '[:space:]' < "$module_control" 2>/dev/null || true)" != 1 ]]; then
+        record_skip "kernel.modules_disabled" "the helper returned success but runtime verification is not 1"
+        return 1
+    fi
+    if grep -Fq 'gate-result=already-locked-idempotent' "$report" 2>/dev/null; then
+        if grep -Fq 'already-locked-runtime-check=FAILED; reboot-repair-required' "$report"; then
+            REBOOT_REQUIRED=1
+            log WARN "Kernel module loading is already locked but its Tailscale/Netfilter runtime needs repair; corrected boot units are installed and a controlled reboot is required without attempting modprobe"
+        else
+            log INFO "Kernel module loading was already locked; verified runtime value 1 without modprobe and retained the late-boot unit"
+        fi
+    else
+        record_change "Preloaded running-kernel Tailscale NAT prerequisites, validated dual-stack netfilter health, then set and verified kernel.modules_disabled=1"
+    fi
+    return 0
 }
 
 detect_ssh_context() {
@@ -1368,6 +2044,26 @@ supported_ssh_list() {
     printf '%s' "$output"
 }
 
+render_server_hardening_firewall_unit() {
+    cat <<'EOF'
+[Unit]
+Description=Server hardening owned nftables table
+Wants=network-pre.target
+Before=network-pre.target
+After=nftables.service
+
+[Service]
+Type=oneshot
+ExecStartPre=-/usr/sbin/nft delete table inet hardening_filter
+ExecStart=/usr/sbin/nft -f /etc/nftables.d/99-security-hardening.nft
+ExecReload=/bin/sh -c '/usr/sbin/nft delete table inet hardening_filter 2>/dev/null || true; exec /usr/sbin/nft -f /etc/nftables.d/99-security-hardening.nft'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
 configure_firewall() {
     if ! command -v nft >/dev/null 2>&1; then
         FIREWALL_STATUS="FAILED"
@@ -1393,7 +2089,7 @@ configure_firewall() {
         return 0
     fi
 
-    local candidate check_candidate own_before=""
+    local candidate check_candidate unit_candidate own_before="" unit_ready=0
     candidate="$(mktemp)"
     check_candidate="$(mktemp)"
     cat > "$candidate" <<EOF
@@ -1434,6 +2130,14 @@ EOF
     fi
     rm -f "$check_candidate"
 
+    unit_candidate="$(mktemp --suffix=.service)"
+    render_server_hardening_firewall_unit > "$unit_candidate"
+    if ! systemd_verify_unit "$unit_candidate"; then
+        rm -f -- "$candidate" "$unit_candidate"
+        FIREWALL_STATUS="FAILED"
+        die "Candidate server-hardening-firewall.service failed systemd-analyze verify; live firewall state is untouched"
+    fi
+
     transaction_copy /etc/nftables.d/99-security-hardening.nft nftables-hardening-table.nft
     transaction_copy /etc/systemd/system/server-hardening-firewall.service firewall-service
     if nft list table inet hardening_filter > "$BACKUP_DIR/nftables-hardening-table-before.nft" 2>/dev/null; then
@@ -1442,26 +2146,22 @@ EOF
     install -d -o root -g root -m 0755 /etc/nftables.d
     install -o root -g root -m 0600 "$candidate" /etc/nftables.d/99-security-hardening.nft
     rm -f "$candidate"
-    install_managed_file /etc/systemd/system/server-hardening-firewall.service 0644 <<'EOF'
-[Unit]
-Description=Server hardening owned nftables table
-Wants=network-pre.target
-Before=network-pre.target
-After=nftables.service
-
-[Service]
-Type=oneshot
-ExecStartPre=-/usr/sbin/nft delete table inet hardening_filter
-ExecStart=/usr/sbin/nft -f /etc/nftables.d/99-security-hardening.nft
-ExecReload=/bin/sh -c '/usr/sbin/nft delete table inet hardening_filter 2>/dev/null || true; exec /usr/sbin/nft -f /etc/nftables.d/99-security-hardening.nft'
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    run_streamed systemctl daemon-reload
-    nft delete table inet hardening_filter 2>/dev/null || true
-    if run_streamed nft -f /etc/nftables.d/99-security-hardening.nft \
+    if ! install_managed_file /etc/systemd/system/server-hardening-firewall.service 0644 < "$unit_candidate"; then
+        rm -f -- "$unit_candidate"
+        log ERROR "Could not install the verified server-hardening-firewall.service"
+    elif ! systemd_verify_unit /etc/systemd/system/server-hardening-firewall.service; then
+        rm -f -- "$unit_candidate"
+        log ERROR "Installed server-hardening-firewall.service failed systemd-analyze verify"
+    elif run_streamed systemctl daemon-reload; then
+        rm -f -- "$unit_candidate"
+        nft delete table inet hardening_filter 2>/dev/null || true
+        unit_ready=1
+    else
+        rm -f -- "$unit_candidate"
+        log ERROR "systemd daemon-reload failed after firewall service installation"
+    fi
+    if [[ "$unit_ready" -eq 1 ]] \
+        && run_streamed nft -f /etc/nftables.d/99-security-hardening.nft \
         && nft list chain inet hardening_filter input >/dev/null 2>&1 \
         && run_streamed systemctl enable server-hardening-firewall.service \
         && run_streamed systemctl restart server-hardening-firewall.service; then
@@ -1601,6 +2301,36 @@ EOF
     fi
 }
 
+verify_fail2ban_runtime() {
+    local attempts="${1:-1}" attempt ping_output="" jail_output="" report=""
+    if ! command -v fail2ban-client >/dev/null 2>&1; then
+        FAIL2BAN_STATUS="NOT AVAILABLE"
+        return 1
+    fi
+    [[ -z "$BACKUP_DIR" ]] || report="$BACKUP_DIR/fail2ban-runtime.txt"
+    for ((attempt=1; attempt<=attempts; attempt++)); do
+        ping_output="$(fail2ban-client ping 2>&1 || true)"
+        jail_output="$(fail2ban-client status sshd 2>&1 || true)"
+        if systemctl is-active --quiet fail2ban.service \
+            && grep -Eiq 'pong|server replied' <<<"$ping_output" \
+            && grep -Eiq 'status for the jail:[[:space:]]*sshd|jail.*sshd' <<<"$jail_output"; then
+            FAIL2BAN_STATUS="OK"
+            [[ -z "$report" ]] || {
+                printf 'verified=%s\nping=%s\n%s\n' "$(timestamp)" "$ping_output" "$jail_output" > "$report"
+                chmod 0600 "$report"
+            }
+            return 0
+        fi
+        ((attempt == attempts)) || sleep 1
+    done
+    FAIL2BAN_STATUS="FAILED"
+    [[ -z "$report" ]] || {
+        printf 'failed=%s\nping=%s\n%s\n' "$(timestamp)" "$ping_output" "$jail_output" > "$report"
+        chmod 0600 "$report"
+    }
+    return 1
+}
+
 configure_fail2ban() {
     if ! command -v fail2ban-client >/dev/null 2>&1 || [[ -z "$SSH_SERVICE" ]]; then
         FAIL2BAN_STATUS="NOT AVAILABLE"
@@ -1637,11 +2367,10 @@ EOF
     if run_streamed fail2ban-client -t \
         && run_streamed systemctl enable --now fail2ban.service \
         && run_streamed systemctl restart fail2ban.service; then
-        if fail2ban-client status sshd >/dev/null 2>&1; then
-            FAIL2BAN_STATUS="OK"
+        if verify_fail2ban_runtime 10; then
             record_change "Enabled and validated Fail2ban SSH jail using nftables"
         else
-            FAIL2BAN_STATUS="FAILED"
+            record_skip "DEB-0880" "Fail2ban started but its socket/sshd jail did not become verifiably ready; see ${BACKUP_DIR}/fail2ban-runtime.txt"
         fi
     else
         transaction_restore /etc/fail2ban/jail.local fail2ban-global.local
@@ -1845,22 +2574,29 @@ configure_faillock_stack() {
 }
 
 configure_account_aging() {
-    if [[ ! -r /etc/passwd ]]; then
-        record_skip "account aging" "/etc/passwd is unavailable"
+    local passwd_file="${HARDEN_PASSWD_FILE:-/etc/passwd}"
+    local login_defs="${HARDEN_LOGIN_DEFS:-/etc/login.defs}"
+    if [[ ! -r "$passwd_file" ]]; then
+        record_skip "account aging" "${passwd_file} is unavailable"
         return 0
     fi
     local uid_min
-    uid_min="$(awk '$1 == "UID_MIN" {print $2; exit}' /etc/login.defs 2>/dev/null || true)"
+    uid_min="$(awk '$1 == "UID_MIN" {print $2; exit}' "$login_defs" 2>/dev/null || true)"
     [[ "$uid_min" =~ ^[0-9]+$ ]] || uid_min=1000
-    local user uid shell shadow
+    local user uid shell shadow_line shadow_hash shadow_min shadow_max shadow_warn shadow_inactive
     while IFS=: read -r user _ uid _ _ _ shell; do
         ((uid >= uid_min)) || continue
         case "$shell" in */nologin|*/false) continue ;; esac
-        shadow="$(getent shadow "$user" 2>/dev/null | cut -d: -f2 || true)"
-        [[ -n "$shadow" && "$shadow" != '!'* && "$shadow" != '*'* ]] || continue
-        run chage --mindays 1 --maxdays 90 --warndays 14 --inactive 30 "$user"
+        shadow_line="$(getent shadow "$user" 2>/dev/null || true)"
+        IFS=: read -r _ shadow_hash _ shadow_min shadow_max shadow_warn shadow_inactive _ _ <<<"$shadow_line"
+        [[ -n "$shadow_hash" && "$shadow_hash" != '!'* && "$shadow_hash" != '*'* ]] || continue
+        if [[ "$shadow_min" == 1 && "$shadow_max" == 90 && "$shadow_warn" == 14 && "$shadow_inactive" == 30 ]]; then
+            log INFO "Account aging already current for ${user}"
+        else
+            run chage --mindays 1 --maxdays 90 --warndays 14 --inactive 30 "$user"
+        fi
         record_skip "AUTH-9282:${user}" "fixed account expiration is intentionally not set; password aging and a 30-day inactive period are enforced"
-    done < /etc/passwd
+    done < "$passwd_file"
 }
 
 configure_sudo() {
@@ -2084,8 +2820,9 @@ configure_process_accounting() {
 
 merge_mount_options() {
     local target="$1" additions="$2"
-    [[ -f /etc/fstab ]] || return 0
-    if ! awk -v target="$target" '$0 !~ /^[[:space:]]*#/ && NF >= 4 && $2 == target {found=1} END {exit !found}' /etc/fstab; then
+    local fstab="${HARDEN_FSTAB:-/etc/fstab}"
+    [[ -f "$fstab" ]] || return 0
+    if ! awk -v target="$target" '$0 !~ /^[[:space:]]*#/ && NF >= 4 && $2 == target {found=1} END {exit !found}' "$fstab"; then
         record_skip "mount:${target}" "not a distinct /etc/fstab mount; no risky repartition or synthetic mount was created"
         return 0
     fi
@@ -2096,7 +2833,7 @@ merge_mount_options() {
     local temporary backup
     temporary="$(mktemp)"
     backup="$(mktemp)"
-    cp -a /etc/fstab "$backup"
+    cp -a "$fstab" "$backup"
     awk -v target="$target" -v additions="$additions" '
         function hasopt(list, opt, n, a, i) {
             n=split(list,a,","); for(i=1;i<=n;i++) if(a[i]==opt) return 1; return 0
@@ -2106,15 +2843,23 @@ merge_mount_options() {
             print $1, $2, $3, $4, ($5==""?0:$5), ($6==""?0:$6); next
         }
         { print }
-    ' /etc/fstab > "$temporary"
+    ' "$fstab" > "$temporary"
     if command -v findmnt >/dev/null 2>&1 && findmnt --verify --tab-file "$temporary" >/dev/null; then
-        install -o root -g root -m 0644 "$temporary" /etc/fstab
+        if cmp -s "$temporary" "$fstab"; then
+            rm -f "$temporary" "$backup"
+            log INFO "Mount options for ${target} are already current; fstab and systemd state are unchanged"
+            return 0
+        fi
+        install -o root -g root -m 0644 "$temporary" "$fstab"
         record_change "Added ${additions} to ${target} mount options"
+        if ! run_streamed systemctl daemon-reload; then
+            log WARN "systemd daemon-reload failed after the validated fstab update for ${target}"
+        fi
         if mountpoint -q "$target"; then
             mount -o "remount,${additions}" "$target" || log WARN "Runtime remount of ${target} failed; fstab remains validated for the next reboot"
         fi
     else
-        cp -a "$backup" /etc/fstab
+        cp -a "$backup" "$fstab"
         log ROLLBACK "Rejected invalid fstab candidate for ${target}"
     fi
     rm -f "$temporary" "$backup"
@@ -2279,6 +3024,17 @@ disable_service() {
     fi
     SERVICE_MASK_REQUESTED["$service"]="$mask"
     local disable_output="" mask_output="" enabled_state="" active_state="" load_state=""
+    enabled_state="$(systemctl is-enabled "$service" 2>/dev/null || true)"
+    active_state="$(systemctl is-active "$service" 2>/dev/null || true)"
+    load_state="$(systemctl show "$service" -p LoadState --value 2>/dev/null || true)"
+    if [[ "$active_state" != active && "$active_state" != activating ]] \
+        && { [[ "$mask" -eq 0 && ( "$enabled_state" == disabled || "$enabled_state" == masked ) ]] \
+            || [[ "$mask" -eq 1 && ( "$enabled_state" == masked || "$load_state" == masked ) ]]; }; then
+        SERVICES_DISABLED+=("$service")
+        if [[ "$mask" -eq 1 ]]; then SERVICES_MASKED+=("$service"); fi
+        log INFO "Service already in requested inactive state: ${service} (enabled=${enabled_state:-unknown}, load=${load_state:-unknown})"
+        return 0
+    fi
     if ! disable_output="$(systemctl disable --now "$service" 2>&1)"; then
         log WARN "systemctl disable --now ${service} reported: ${disable_output//$'\n'/; }"
     fi
@@ -2352,6 +3108,94 @@ configure_startup_service_review() {
     chmod 0600 "$report"
     record_change "Verified multi-user.target and wrote startup-service inventory to ${report}"
     record_skip "BOOT-5180" "Lynis requires an operator determination of startup-service necessity; the exact enabled, dependent, and active inventories are in ${report}"
+    return 0
+}
+
+parse_apt_purge_packages() {
+    awk '$1 == "Purg" || $1 == "Remv" {print $2}' | sort -u
+}
+
+configure_headless_packagekit() {
+    local -a installed=() removals=() dependency_removals=()
+    local package simulation="" removal="" dependency_reason=""
+    declare -A requested=()
+    case "$OS_ID" in
+        ubuntu) log INFO "Applying Ubuntu headless PackageKit policy" ;;
+        debian) log INFO "Applying Debian headless PackageKit policy" ;;
+        *)
+            record_skip "PKGS-7394:PackageKit" "unsupported package policy platform ${OS_ID}; PackageKit was not changed"
+            return 0
+            ;;
+    esac
+    for package in packagekit packagekit-tools; do
+        if package_installed "$package"; then
+            installed+=("$package")
+            requested["$package"]=1
+        fi
+    done
+    if [[ "$MODE" == "dry-run" ]]; then
+        if ((${#installed[@]})); then
+            log INFO "Would simulate removal of headless PackageKit packages and preserve them unmasked if dependencies make removal unsafe (${OS_ID})"
+        else
+            log INFO "PackageKit is absent on this headless ${OS_ID} host; no service mask is needed"
+        fi
+        return 0
+    fi
+
+    # Remove stale harden.sh masks before auditing or removing the package. A masked
+    # D-Bus activatable service makes package auditors emit UnitMasked errors.
+    run_streamed systemctl unmask packagekit.service packagekit-offline-update.service \
+        packagekit-offline-update.timer || true
+    if ((${#installed[@]} == 0)); then
+        run_streamed systemctl daemon-reload || true
+        record_change "Verified PackageKit absent and removed stale service masks on headless ${OS_ID}"
+        return 0
+    fi
+    if ! apt-get check >/dev/null 2>&1; then
+        record_skip "PKGS-7394:PackageKit" "APT is not healthy before simulation; PackageKit was unmasked and retained"
+        return 0
+    fi
+    if command -v unattended-upgrade >/dev/null 2>&1 \
+        && ! unattended-upgrade --dry-run >/dev/null 2>&1; then
+        record_skip "PKGS-7394:PackageKit" "unattended-upgrades failed its pre-removal dry-run; PackageKit was unmasked and retained"
+        return 0
+    fi
+    simulation="$(LC_ALL=C apt-get -s purge "${installed[@]}" 2>&1)" || {
+        record_skip "PKGS-7394:PackageKit" "APT purge simulation failed; PackageKit was unmasked and retained"
+        return 0
+    }
+    mapfile -t removals < <(parse_apt_purge_packages <<<"$simulation")
+    if ((${#removals[@]} == 0)); then
+        record_skip "PKGS-7394:PackageKit" "APT simulation did not confirm a removable PackageKit package"
+        return 0
+    fi
+    for removal in "${removals[@]}"; do
+        [[ -n "${requested[$removal]+present}" ]] || dependency_removals+=("$removal")
+    done
+    if ((${#dependency_removals[@]})); then
+        printf -v dependency_reason '%s, ' "${dependency_removals[@]}"
+        dependency_reason="${dependency_reason%, }"
+        record_skip "PKGS-7394:PackageKit" "APT simulation would also purge dependency packages: ${dependency_reason}; PackageKit was unmasked and retained"
+        return 0
+    fi
+    if run_streamed env DEBIAN_FRONTEND=noninteractive apt-get purge -y "${installed[@]}"; then
+        PACKAGES_REMOVED+=("${installed[@]}")
+    else
+        record_skip "PKGS-7394:PackageKit" "simulated PackageKit purge failed; no service was masked"
+        return 0
+    fi
+    if ! run_streamed apt-get check; then
+        UPDATES_STATUS="FAILED"
+        record_skip "PKGS-7394:PackageKit" "APT failed validation after PackageKit removal"
+        return 0
+    fi
+    if command -v unattended-upgrade >/dev/null 2>&1 \
+        && ! run_streamed unattended-upgrade --dry-run; then
+        UPDATES_STATUS="FAILED"
+        record_skip "PKGS-7394:PackageKit" "unattended-upgrades failed validation after PackageKit removal"
+        return 0
+    fi
+    record_change "Safely purged headless PackageKit after dependency simulation and revalidated APT/unattended-upgrades (${OS_ID})"
     return 0
 }
 
@@ -2439,9 +3283,7 @@ disable_unneeded_services() {
     if ! systemctl is-active --quiet display-manager.service 2>/dev/null; then
         disable_service udisks2.service 1
         disable_service upower.service 1
-        disable_service packagekit.service 1
-        disable_service packagekit-offline-update.service 1
-        disable_service packagekit-offline-update.timer 1
+        configure_headless_packagekit
     else
         log INFO "Preserved udisks2, upower, and PackageKit because a display manager is active"
     fi
@@ -2469,6 +3311,18 @@ measure_service_exposure() {
         SYSTEMD_EXPOSURE_RESULT="$score"
     fi
     return 0
+}
+
+classify_systemd_exposure() {
+    local before="$1" after="$2" dropin_was_current="$3"
+    if awk -v before="$before" -v after="$after" 'BEGIN { exit !(after < before) }'; then
+        printf '%s\n' decreased
+    elif [[ "$dropin_was_current" -eq 1 ]] \
+        && awk -v before="$before" -v after="$after" 'BEGIN { exit !(after == before) }'; then
+        printf '%s\n' unchanged
+    else
+        printf '%s\n' not-decreased
+    fi
 }
 
 systemd_verify_unit() {
@@ -2515,7 +3369,8 @@ install_service_dropin() {
     local after_file="$BACKUP_DIR/systemd-security-${service//[^A-Za-z0-9_.-]/_}-after.txt"
     local preverify_file="$BACKUP_DIR/systemd-verify-${service//[^A-Za-z0-9_.-]/_}-pre-install.txt"
     local postverify_file="$BACKUP_DIR/systemd-verify-${service//[^A-Za-z0-9_.-]/_}-installed.txt"
-    local before="" after="" was_active=0 health_action="restart" exposure_line=""
+    local before="" after="" was_active=0 health_action="restart" exposure_line="" exposure_outcome=""
+    local dropin_was_current=0
     local dropin_stage="" verify_dir="" verify_unit=""
     if ! dropin_stage="$(mktemp)"; then
         log WARN "Could not create a staging file; skipped systemd hardening for ${service}"
@@ -2525,6 +3380,9 @@ install_service_dropin() {
         rm -f -- "$dropin_stage"
         log WARN "Could not stage the drop-in; skipped systemd hardening for ${service}"
         return 0
+    fi
+    if [[ -f "$destination" ]] && cmp -s "$dropin_stage" "$destination"; then
+        dropin_was_current=1
     fi
     if ! verify_dir="$(mktemp -d)"; then
         rm -f -- "$dropin_stage"
@@ -2595,8 +3453,11 @@ install_service_dropin() {
         printf -v exposure_line '%-32s %s -> %s' "$service" "$before" "$after"
         SERVICE_EXPOSURE_SUMMARY+=("$exposure_line")
         printf '%-36s %s -> %s\n' "$service" "$before" "$after" >> "$SYSTEMD_HARDENING_REPORT"
-        if awk -v before="$before" -v after="$after" 'BEGIN { exit !(after < before) }'; then
+        exposure_outcome="$(classify_systemd_exposure "$before" "$after" "$dropin_was_current")"
+        if [[ "$exposure_outcome" == decreased ]]; then
             record_change "Installed and health-tested systemd hardening for ${service}; exposure ${before} -> ${after}"
+        elif [[ "$exposure_outcome" == unchanged ]]; then
+            log OK "${service} drop-in is already active and passed health checks; exposure unchanged/already hardened (${before} -> ${after})"
         else
             log WARN "${service} passed health checks but exposure did not decrease (${before} -> ${after})"
         fi
@@ -2870,37 +3731,43 @@ EOF
 }
 
 configure_bootloader() {
+    local grub_dir="${HARDEN_GRUB_DIR:-/boot/grub}"
+    local grub_policy="${HARDEN_GRUB_POLICY:-/etc/default/grub.d/99-security-hardening.cfg}"
+    local legacy_auth="${HARDEN_GRUB_LEGACY_AUTH:-/etc/grub.d/01_hardening_users}"
     record_skip "BOOT-5122" "intentionally accepted: no GRUB password is configured to preserve unattended/reliable reboot capability."
-    if ! command -v update-grub >/dev/null 2>&1 || [[ ! -d /boot/grub ]]; then
+    if ! command -v update-grub >/dev/null 2>&1 || [[ ! -d "$grub_dir" ]]; then
         return 0
     fi
-    transaction_copy /etc/default/grub.d/99-security-hardening.cfg grub-hardening.cfg
-    local removed_managed_auth=0
-    if [[ -f /etc/grub.d/01_hardening_users ]] \
-        && grep -q '^# Managed by harden.sh' /etc/grub.d/01_hardening_users; then
-        transaction_copy /etc/grub.d/01_hardening_users grub-hardening-users
+    transaction_copy "$grub_policy" grub-hardening.cfg
+    local removed_managed_auth=0 grub_config_changed=0
+    if [[ -f "$legacy_auth" ]] \
+        && grep -q '^# Managed by harden.sh' "$legacy_auth"; then
+        transaction_copy "$legacy_auth" grub-hardening-users
         if [[ "$MODE" == "apply" ]]; then
-            rm -f -- /etc/grub.d/01_hardening_users
+            rm -f -- "$legacy_auth"
             removed_managed_auth=1
             record_change "Removed the legacy harden.sh GRUB authentication fragment"
         else
             log INFO "Would remove the legacy harden.sh GRUB authentication fragment"
         fi
     fi
-    install_managed_file /etc/default/grub.d/99-security-hardening.cfg 0600 <<'EOF'
+    install_managed_file "$grub_policy" 0600 <<'EOF'
 # Managed by harden.sh
 GRUB_DISABLE_RECOVERY="true"
 GRUB_DISABLE_OS_PROBER="true"
 EOF
+    [[ "$MANAGED_FILE_CHANGED" -eq 0 ]] || grub_config_changed=1
     if [[ "$MODE" == "apply" ]]; then
-        if run_streamed update-grub; then
-            chmod 0600 /boot/grub/grub.cfg
+        if [[ "$grub_config_changed" -eq 0 && "$removed_managed_auth" -eq 0 ]]; then
+            log INFO "Managed GRUB policy is unchanged; update-grub is not required"
+        elif run_streamed update-grub; then
+            chmod 0600 "$grub_dir/grub.cfg"
             REBOOT_REQUIRED=1
             record_change "Disabled GRUB recovery entries and OS probing without boot authentication; regenerated grub.cfg"
         else
-            transaction_restore /etc/default/grub.d/99-security-hardening.cfg grub-hardening.cfg
+            transaction_restore "$grub_policy" grub-hardening.cfg
             if [[ "$removed_managed_auth" -eq 1 ]]; then
-                transaction_restore /etc/grub.d/01_hardening_users grub-hardening-users
+                transaction_restore "$legacy_auth" grub-hardening-users
             fi
             run_streamed update-grub || true
             log ROLLBACK "GRUB regeneration failed; hardening fragment restored/removed"
@@ -2908,31 +3775,140 @@ EOF
     fi
 }
 
+compiler_command_path() {
+    command -v "$1" 2>/dev/null || true
+}
+
+dkms_is_in_use() {
+    local dkms_state_dir="${HARDEN_DKMS_STATE_DIR:-/var/lib/dkms}"
+    local status="" packages=""
+    if command -v dkms >/dev/null 2>&1; then
+        status="$(dkms status 2>/dev/null || true)"
+        [[ -z "$status" ]] || return 0
+    fi
+    packages="$(dpkg-query -W -f='${db:Status-Abbrev}\t${binary:Package}\n' '*-dkms' 2>/dev/null \
+        | awk '$1 ~ /^ii/ && $2 ~ /-dkms([:-]|$)/ {print $2}' || true)"
+    [[ -z "$packages" ]] || return 0
+    if [[ -d "$dkms_state_dir" ]] \
+        && find "$dkms_state_dir" -mindepth 2 -maxdepth 2 -type d -print -quit 2>/dev/null | grep -q .; then
+        return 0
+    fi
+    return 1
+}
+
 restrict_compilers() {
-    local -a tools=(cc gcc g++ c++ clang clang++ cpp make as ld ld.bfd ld.gold)
-    local -a candidates=()
-    local tool path real mode owner group
-    local changed=0 nullglob_was_set=0
+    # Lynis 3.1.6 sets COMPILER_INSTALLED only for these five binary names.
+    local -a lynis_tools=(as cc clang g++ gcc)
+    local -a restriction_tools=(cc gcc g++ c++ clang clang++ cpp make as ld ld.bfd ld.gold)
+    local -a candidates=() lynis_paths=() owner_packages=() removals=() unsafe_removals=()
+    local tool path real mode owner group owner_id group_id package simulation="" unsafe_reason="" unsafe_list=""
+    local restricted_owner="${HARDEN_TEST_OWNER:-root}" restricted_group="${HARDEN_TEST_GROUP:-root}"
+    local restricted_uid restricted_gid
+    local compiler_usr_root="${HARDEN_COMPILER_USR_ROOT:-/usr}"
+    local compiler_local_root="${HARDEN_COMPILER_LOCAL_ROOT:-/usr/local}"
+    if [[ "$restricted_owner" =~ ^[0-9]+$ ]]; then restricted_uid="$restricted_owner"; else restricted_uid="$(id -u "$restricted_owner")"; fi
+    if [[ "$restricted_group" =~ ^[0-9]+$ ]]; then restricted_gid="$restricted_group"; else restricted_gid="$(getent group "$restricted_group" | awk -F: 'NR == 1 {print $3}')"; fi
+    local changed=0 nullglob_was_set=0 purge_completed=0
     declare -A seen_compilers=()
+    declare -A seen_packages=()
     if [[ "$MODE" == "apply" && -n "$BACKUP_DIR" ]] && command -v lynis >/dev/null 2>&1; then
         lynis show details HRDN-7222 > "$BACKUP_DIR/lynis-HRDN-7222-details.txt" 2>&1 || true
         chmod 0600 "$BACKUP_DIR/lynis-HRDN-7222-details.txt"
     fi
-    for tool in "${tools[@]}"; do
-        path="$(command -v "$tool" 2>/dev/null || true)"
+    for tool in "${lynis_tools[@]}"; do
+        path="$(compiler_command_path "$tool")"
+        [[ -z "$path" ]] || lynis_paths+=("$path")
+    done
+    for tool in "${restriction_tools[@]}"; do
+        path="$(compiler_command_path "$tool")"
         [[ -z "$path" ]] || candidates+=("$path")
     done
     shopt -q nullglob && nullglob_was_set=1
     shopt -s nullglob
     candidates+=(
-        /usr/bin/gcc-[0-9]* /usr/bin/g++-[0-9]* /usr/bin/cpp-[0-9]*
-        /usr/bin/clang-[0-9]* /usr/bin/clang++-[0-9]*
-        /usr/bin/*-linux-gnu-gcc /usr/bin/*-linux-gnu-gcc-[0-9]*
-        /usr/bin/*-linux-gnu-g++ /usr/bin/*-linux-gnu-g++-[0-9]*
-        /usr/bin/*-linux-gnu-as /usr/bin/*-linux-gnu-ld /usr/bin/*-linux-gnu-ld.*
-        /usr/local/bin/gcc* /usr/local/bin/g++* /usr/local/bin/clang* /usr/local/bin/cc /usr/local/bin/c++
+        "${compiler_usr_root}"/bin/gcc-[0-9]* "${compiler_usr_root}"/bin/g++-[0-9]* "${compiler_usr_root}"/bin/cpp-[0-9]*
+        "${compiler_usr_root}"/bin/clang-[0-9]* "${compiler_usr_root}"/bin/clang++-[0-9]*
+        "${compiler_usr_root}"/bin/*-linux-gnu-gcc "${compiler_usr_root}"/bin/*-linux-gnu-gcc-[0-9]*
+        "${compiler_usr_root}"/bin/*-linux-gnu-g++ "${compiler_usr_root}"/bin/*-linux-gnu-g++-[0-9]*
+        "${compiler_usr_root}"/bin/*-linux-gnu-as "${compiler_usr_root}"/bin/*-linux-gnu-ld "${compiler_usr_root}"/bin/*-linux-gnu-ld.*
+        "${compiler_local_root}"/bin/gcc* "${compiler_local_root}"/bin/g++* "${compiler_local_root}"/bin/clang*
+        "${compiler_local_root}"/bin/cc "${compiler_local_root}"/bin/c++
     )
     [[ "$nullglob_was_set" -eq 1 ]] || shopt -u nullglob
+
+    if [[ "$MODE" == "apply" && -n "$BACKUP_DIR" ]]; then
+        : > "$BACKUP_DIR/compiler-toolchain-inventory.txt"
+        chmod 0600 "$BACKUP_DIR/compiler-toolchain-inventory.txt"
+    fi
+    for path in "${lynis_paths[@]}"; do
+        real="$(readlink -f "$path" 2>/dev/null || true)"
+        [[ -f "$real" ]] || continue
+        package="$(dpkg-query -S "$real" "$path" 2>/dev/null | awk -F: 'NR == 1 {print $1}' | sed 's/:.*$//' || true)"
+        if [[ "$MODE" == "apply" && -n "$BACKUP_DIR" ]]; then
+            printf 'lynis-binary=%s\treal=%s\tpackage=%s\n' "$path" "$real" "${package:-unmanaged}" >> "$BACKUP_DIR/compiler-toolchain-inventory.txt"
+        fi
+        if [[ -n "$package" && -z "${seen_packages[$package]+present}" ]]; then
+            seen_packages["$package"]=1
+            owner_packages+=("$package")
+        fi
+    done
+
+    if [[ "$AGGRESSIVE" -eq 1 && ${#owner_packages[@]} -gt 0 ]]; then
+        if [[ "$MODE" == "dry-run" ]]; then
+            log INFO "Would simulate purge of Lynis-detected compiler owner packages: ${owner_packages[*]}"
+        elif simulation="$(LC_ALL=C apt-get -s purge "${owner_packages[@]}" 2>&1)"; then
+            mapfile -t removals < <(parse_apt_purge_packages <<<"$simulation")
+            if dkms_is_in_use; then
+                unsafe_reason="active DKMS modules or installed *-dkms packages require the build toolchain"
+            fi
+            for package in "${removals[@]}"; do
+                case "$package" in
+                    gcc|gcc-[0-9]*|g++|g++-[0-9]*|clang|clang-[0-9]*|binutils|binutils-*|build-essential|cpp|cpp-[0-9]*) ;;
+                    *) unsafe_removals+=("$package") ;;
+                esac
+            done
+            if ((${#unsafe_removals[@]})); then
+                printf -v unsafe_list '%s, ' "${unsafe_removals[@]}"
+                unsafe_list="${unsafe_list%, }"
+                unsafe_reason="APT simulation would also purge non-toolchain/dependent packages: ${unsafe_list}"
+            fi
+            if [[ -z "$unsafe_reason" && ${#removals[@]} -gt 0 ]] \
+                && run_streamed env DEBIAN_FRONTEND=noninteractive apt-get purge -y "${owner_packages[@]}"; then
+                PACKAGES_REMOVED+=("${owner_packages[@]}")
+                purge_completed=1
+                if run_streamed apt-get check; then
+                    record_change "Removed safely dispensable Lynis-detected compiler packages after APT dependency simulation: ${owner_packages[*]}"
+                else
+                    unsafe_reason="toolchain packages were removed but post-purge APT validation failed"
+                fi
+            elif [[ -z "$unsafe_reason" ]]; then
+                unsafe_reason="simulated toolchain purge failed"
+            fi
+        else
+            unsafe_reason="APT simulation failed"
+        fi
+    fi
+    if [[ -n "$unsafe_reason" ]]; then
+        record_skip "HRDN-7220" "compiler packages retained: ${unsafe_reason}; binaries are restricted root-only and inventory is in ${BACKUP_DIR:-planned}/compiler-toolchain-inventory.txt"
+    fi
+
+    candidates=()
+    for tool in "${restriction_tools[@]}"; do
+        path="$(compiler_command_path "$tool")"
+        [[ -z "$path" ]] || candidates+=("$path")
+    done
+    nullglob_was_set=0
+    shopt -q nullglob && nullglob_was_set=1
+    shopt -s nullglob
+    candidates+=(
+        "${compiler_usr_root}"/bin/gcc-[0-9]* "${compiler_usr_root}"/bin/g++-[0-9]* "${compiler_usr_root}"/bin/cpp-[0-9]*
+        "${compiler_usr_root}"/bin/clang-[0-9]* "${compiler_usr_root}"/bin/clang++-[0-9]*
+        "${compiler_usr_root}"/bin/*-linux-gnu-gcc "${compiler_usr_root}"/bin/*-linux-gnu-gcc-[0-9]*
+        "${compiler_usr_root}"/bin/*-linux-gnu-g++ "${compiler_usr_root}"/bin/*-linux-gnu-g++-[0-9]*
+        "${compiler_usr_root}"/bin/*-linux-gnu-as "${compiler_usr_root}"/bin/*-linux-gnu-ld "${compiler_usr_root}"/bin/*-linux-gnu-ld.*
+    )
+    [[ "$nullglob_was_set" -eq 1 ]] || shopt -u nullglob
+    seen_compilers=()
     for path in "${candidates[@]}"; do
         [[ -e "$path" || -L "$path" ]] || continue
         real="$(readlink -f "$path" 2>/dev/null || true)"
@@ -2940,41 +3916,77 @@ restrict_compilers() {
         [[ -z "${seen_compilers[$real]+present}" ]] || continue
         seen_compilers["$real"]=1
         if [[ "$AGGRESSIVE" -eq 1 ]]; then
-            run chown root:root "$real"
-            run chmod 0750 "$real"
+            mode="$(stat -c '%a' "$real" 2>/dev/null || true)"
+            owner_id="$(stat -c '%u' "$real" 2>/dev/null || true)"
+            group_id="$(stat -c '%g' "$real" 2>/dev/null || true)"
+            if [[ "$owner_id" != "$restricted_uid" || "$group_id" != "$restricted_gid" ]]; then
+                run chown "${restricted_owner}:${restricted_group}" "$real"
+                changed=1
+            fi
+            if [[ "$mode" != 750 ]]; then
+                run chmod 0750 "$real"
+                changed=1
+            fi
             if [[ "$MODE" == "apply" ]]; then
                 mode="$(stat -c '%a' "$real" 2>/dev/null || true)"
                 owner="$(stat -c '%U' "$real" 2>/dev/null || true)"
                 group="$(stat -c '%G' "$real" 2>/dev/null || true)"
-                if [[ "$mode" != "750" || "$owner" != "root" || "$group" != "root" ]]; then
+                owner_id="$(stat -c '%u' "$real" 2>/dev/null || true)"
+                group_id="$(stat -c '%g' "$real" 2>/dev/null || true)"
+                if [[ "$mode" != "750" || "$owner_id" != "$restricted_uid" || "$group_id" != "$restricted_gid" ]]; then
                     die "Compiler restriction verification failed for ${real}: ${owner:-?}:${group:-?} ${mode:-?}"
                 fi
                 printf '%s\t%s:%s\t%s\n' "$real" "$owner" "$group" "$mode" >> "$BACKUP_DIR/compiler-hardening.txt"
+                if [[ "$mode" == 750 && "$owner_id" == "$restricted_uid" && "$group_id" == "$restricted_gid" ]]; then
+                    log INFO "Compiler restriction already current for ${real}"
+                fi
             fi
-            changed=1
         else
             record_skip "HRDN-7222:${real}" "compiler exists; use --aggressive to restrict execution to root"
         fi
     done
     if [[ "$changed" -eq 1 ]]; then
-        record_change "Restricted all discovered compiler, assembler, linker, and make binaries to root:root 0750"
+        record_change "Restricted remaining compiler, assembler, linker, and make binaries to root:root 0750 (safe purge completed: ${purge_completed})"
     elif [[ "$AGGRESSIVE" -eq 1 ]]; then
-        log INFO "No installed compiler/linker binaries were discovered"
+        log INFO "No compiler ownership/mode changes were required"
     fi
     return 0
 }
 
 configure_malware_scanner() {
     if command -v rkhunter >/dev/null 2>&1; then
-        [[ -f /etc/default/rkhunter ]] || {
-            if [[ "$MODE" == "apply" ]]; then install -o root -g root -m 0644 /dev/null /etc/default/rkhunter; fi
+        local baseline_changed=0 property_db="${HARDEN_RKHUNTER_PROPERTY_DB:-/var/lib/rkhunter/db/rkhunter.dat}"
+        local defaults_file="${HARDEN_RKHUNTER_DEFAULTS:-/etc/default/rkhunter}"
+        local dpkg_status="${HARDEN_DPKG_STATUS:-/var/lib/dpkg/status}"
+        local pending_marker="${HARDEN_RKHUNTER_PENDING_MARKER:-/var/lib/rkhunter/db/.harden-propupd-required}"
+        [[ -f "$defaults_file" ]] || {
+            if [[ "$MODE" == "apply" ]]; then
+                install -o root -g root -m 0644 /dev/null "$defaults_file"
+                baseline_changed=1
+            fi
         }
-        replace_setting /etc/default/rkhunter CRON_DAILY_RUN '"true"' '='
-        replace_setting /etc/default/rkhunter CRON_DB_UPDATE '"true"' '='
-        replace_setting /etc/default/rkhunter APT_AUTOGEN '"true"' '='
+        replace_setting "$defaults_file" CRON_DAILY_RUN '"true"' '='
+        [[ "$MANAGED_SETTING_CHANGED" -eq 0 ]] || baseline_changed=1
+        replace_setting "$defaults_file" CRON_DB_UPDATE '"true"' '='
+        [[ "$MANAGED_SETTING_CHANGED" -eq 0 ]] || baseline_changed=1
+        replace_setting "$defaults_file" APT_AUTOGEN '"true"' '='
+        [[ "$MANAGED_SETTING_CHANGED" -eq 0 ]] || baseline_changed=1
         if [[ "$MODE" == "apply" ]]; then
-            run_streamed rkhunter --propupd || true
-            record_change "Enabled daily rkhunter checks and updated the trusted property baseline"
+            if [[ "$baseline_changed" -eq 1 || ! -s "$property_db" || "$dpkg_status" -nt "$property_db" || -e "$pending_marker" ]]; then
+                if [[ ! -d "$(dirname -- "$pending_marker")" ]]; then
+                    install -d -o root -g root -m 0700 "$(dirname -- "$pending_marker")"
+                fi
+                : > "$pending_marker"
+                chmod 0600 "$pending_marker"
+                if run_streamed rkhunter --propupd; then
+                    rm -f -- "$pending_marker"
+                    record_change "Enabled daily rkhunter checks and updated the trusted property baseline after a relevant configuration/package change"
+                else
+                    record_skip "HRDN-7230:rkhunter" "rkhunter property baseline update failed"
+                fi
+            else
+                log INFO "rkhunter configuration and package property baseline are unchanged; --propupd is not required"
+            fi
         fi
     elif command -v chkrootkit >/dev/null 2>&1; then
         [[ -f /etc/chkrootkit.conf ]] || {
@@ -3055,6 +4067,51 @@ validate_aide_service_context() {
     return 0
 }
 
+install_aide_primary_sha2_group() {
+    local runtime_config="$1" temporary mode owner group
+    if awk '
+        /^# BEGIN harden[.]sh SHA-2 group$/ {managed=1}
+        managed && /^HardenSHA2 = p\+ftype\+i\+l\+n\+u\+g\+s\+b\+m\+c\+sha256\+sha512$/ {valid=1}
+        /^# END harden[.]sh SHA-2 group$/ && managed {complete=1; managed=0}
+        END {exit !(valid && complete)}
+    ' "$runtime_config"; then
+        return 1
+    fi
+    temporary="$(mktemp)"
+    awk '
+        function print_group() {
+            print "# BEGIN harden.sh SHA-2 group"
+            print "# Kept in the primary runtime config because AIDE and Lynis 3.1.6 both evaluate this effective definition."
+            print "HardenSHA2 = p+ftype+i+l+n+u+g+s+b+m+c+sha256+sha512"
+            print "# END harden.sh SHA-2 group"
+            print ""
+            inserted=1
+        }
+        /^# BEGIN harden[.]sh SHA-2 group$/ {managed=1; next}
+        /^# END harden[.]sh SHA-2 group$/ {managed=0; next}
+        managed {next}
+        /^[[:space:]]*HardenSHA2[[:space:]]*=/ {next}
+        /^@@(x_)?include[[:space:]]+/ && !inserted {print_group()}
+        {print}
+        END {
+            if (!inserted) {
+                print ""
+                print_group()
+            }
+        }
+    ' "$runtime_config" > "$temporary"
+    if cmp -s "$temporary" "$runtime_config"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+    mode="$(stat -c '%a' "$runtime_config" 2>/dev/null || printf 0644)"
+    owner="$(stat -c '%U' "$runtime_config" 2>/dev/null || printf root)"
+    group="$(stat -c '%G' "$runtime_config" 2>/dev/null || printf root)"
+    install -o "$owner" -g "$group" -m "$mode" "$temporary" "$runtime_config"
+    rm -f -- "$temporary"
+    return 0
+}
+
 configure_aide() {
     if [[ "$MODE" == "dry-run" ]]; then
         log INFO "Would validate the distribution AIDE runtime, add SHA256+SHA512 policy, atomically activate a missing or policy-obsolete baseline, verify aide --check, and only then enable its timer"
@@ -3077,14 +4134,15 @@ configure_aide() {
     local database_path="" database_out_path="" aide_check_output="" aide_check_rc=0
     local aide_policy="${aide_etc_dir}/aide.conf.d/99_harden_sha2"
     local aide_policy_changed=0 aide_config_changed=0 baseline_required=0
-    local policy_content="" candidate="" version_output="" active_tmp=""
+    local policy_content="" candidate="" version_output="" active_tmp="" fint_evidence=""
     local database_owner="" database_group="" database_parent=""
     local policy_digest="" policy_stamp="" stamp_tmp=""
     aide_raw="$(command -v aide 2>/dev/null || true)"
-    for candidate in "${aide_etc_dir}/aide.conf" /etc/aide.conf /usr/local/etc/aide.conf; do
+    # Match Lynis 3.1.6 FINT-4315/FINT-4402 search order exactly: its last
+    # existing config wins (/etc, /etc/aide, then /usr/local/etc).
+    for candidate in /etc/aide.conf "${aide_etc_dir}/aide.conf" /usr/local/etc/aide.conf; do
         if [[ -s "$candidate" ]]; then
             aide_config="$candidate"
-            break
         fi
     done
     if [[ -z "$aide_raw" || -z "$aide_config" ]]; then
@@ -3095,8 +4153,7 @@ configure_aide() {
     fi
     run_streamed systemctl stop aide-check.timer dailyaidecheck.timer \
         aide-check.service dailyaidecheck.service || true
-    policy_content='# Managed by harden.sh: SHA-2 integrity policy v1.1.3
-HardenSHA2 = p+ftype+i+l+n+u+g+s+b+m+c+sha256+sha512
+    policy_content='# Managed by harden.sh: SHA-2 integrity paths v1.1.3
 =/etc/passwd HardenSHA2
 =/etc/group HardenSHA2
 =/etc/shadow HardenSHA2
@@ -3112,10 +4169,14 @@ HardenSHA2 = p+ftype+i+l+n+u+g+s+b+m+c+sha256+sha512
     transaction_copy "$aide_policy" aide-sha2-policy
     printf '%s\n' "$policy_content" | install_managed_file "$aide_policy" 0644 "$managed_owner" "$managed_group"
     runtime_config="$aide_config"
+    transaction_copy "$runtime_config" aide-runtime-config
+    if install_aide_primary_sha2_group "$runtime_config"; then
+        aide_config_changed=1
+        record_change "Installed the effective HardenSHA2 group in primary AIDE runtime config ${runtime_config}"
+    fi
     if ! awk -v directory="${aide_etc_dir}/aide.conf.d" \
         '$1 ~ /^@@(x_)?include$/ && $2 == directory {found=1} END {exit !found}' "$runtime_config" \
         && ! grep -Fqx "@@include ${aide_policy}" "$runtime_config"; then
-        transaction_copy "$runtime_config" aide-runtime-config
         printf '\n@@include %s\n' "$aide_policy" >> "$runtime_config"
         aide_config_changed=1
     fi
@@ -3134,6 +4195,20 @@ HardenSHA2 = p+ftype+i+l+n+u+g+s+b+m+c+sha256+sha512
         return 0
     fi
     chmod 0600 "$BACKUP_DIR/aide-config-check.txt"
+    fint_evidence="$BACKUP_DIR/aide-lynis-FINT-4402-evidence.txt"
+    {
+        printf 'Lynis 3.1.6 FINT-4402-compatible effective primary configuration evidence\n'
+        printf 'runtime_config=%s\n' "$runtime_config"
+        awk '!/^[[:space:]]*#/ && /= .*(sha256|sha512)/ {print}' "$runtime_config"
+        printf 'aide_config_check=success\n'
+    } > "$fint_evidence"
+    chmod 0600 "$fint_evidence"
+    if ! awk '!/^[[:space:]]*#/ && /= .*(sha256|sha512)/ {found=1} END {exit !found}' "$runtime_config"; then
+        AIDE_STATUS="FAILED"
+        systemctl disable --now aide-check.timer dailyaidecheck.timer >/dev/null 2>&1 || true
+        record_skip "FINT-4402" "effective primary config passed AIDE but did not expose its SHA-2 group to Lynis 3.1.6; see ${fint_evidence}"
+        return 0
+    fi
     database_path="$(aide_runtime_path "$runtime_config" database_in 2>/dev/null || true)"
     [[ -n "$database_path" ]] || database_path="$(aide_runtime_path "$runtime_config" database 2>/dev/null || true)"
     database_out_path="$(aide_runtime_path "$runtime_config" database_out 2>/dev/null || true)"
@@ -3147,7 +4222,7 @@ HardenSHA2 = p+ftype+i+l+n+u+g+s+b+m+c+sha256+sha512
         "${aide_state_dir}"/*:"${aide_state_dir}"/*) ;;
         *) log WARN "AIDE runtime uses distribution-defined database paths outside ${aide_state_dir}: ${database_path}, ${database_out_path}" ;;
     esac
-    policy_digest="$(sha256sum "$aide_policy" | awk '{print $1}')"
+    policy_digest="$(sha256sum "$runtime_config" "$aide_policy" | sha256sum | awk '{print $1}')"
     policy_stamp="${database_path}.harden-policy.sha256"
     if unit_file_exists dailyaidecheck.timer; then
         aide_timer=dailyaidecheck.timer
@@ -3341,12 +4416,15 @@ remediate_deleted_open_files() {
 }
 
 diagnose_iowait_processes() {
+    local stage="${1:-validation}"
     if [[ "$MODE" == "dry-run" ]]; then
-        log INFO "Would inventory uninterruptible IO-wait processes for PROC-3614 without terminating them"
+        log INFO "Would inventory PID/unit/stat/wchan/command for PROC-3614 (${stage}) without terminating processes"
         return 0
     fi
-    local report=/root/hardening-iowait-processes.txt ps_output="" rc=0 blocked=""
-    if ps_output="$(ps -eo pid=,ppid=,state=,comm=,wchan:32=,args= 2>&1)"; then
+    local report="${HARDEN_IOWAIT_REPORT:-/root/hardening-iowait-processes.txt}"
+    local ps_output="" rc=0 blocked="" pid stat wchan comm command unit classification
+    local current_pids="" persistent=0
+    if ps_output="$(ps -eo pid=,stat=,wchan:32=,comm=,args= 2>&1)"; then
         rc=0
     else
         rc=$?
@@ -3355,18 +4433,45 @@ diagnose_iowait_processes() {
         log WARN "ps failed while diagnosing PROC-3614 (exit ${rc})"
         return 0
     fi
-    blocked="$(awk '$3 ~ /^D/ {print}' <<<"$ps_output")"
+    blocked="$(awk '$2 ~ /^D/ {print}' <<<"$ps_output")"
+    current_pids="$(awk '$2 ~ /^D/ {print $1}' <<<"$ps_output")"
     {
-        printf 'IO-wait process inventory generated %s\n' "$(timestamp)"
-        printf '%s\n' 'PID PPID STATE COMMAND WCHAN ARGS'
-        if [[ -n "$blocked" ]]; then printf '%s\n' "$blocked"; else printf '%s\n' 'none'; fi
-    } > "$report"
+        printf '\n=== PROC-3614 snapshot: %s at %s ===\n' "$stage" "$(timestamp)"
+        printf '%s\n' 'PID UNIT STAT WCHAN COMMAND CLASSIFICATION'
+        if [[ -n "$blocked" ]]; then
+            while IFS=$' \t' read -r pid stat wchan comm command; do
+                [[ -n "$pid" ]] || continue
+                unit="$(systemd_unit_for_pid "$pid" 2>/dev/null || true)"
+                [[ -n "$unit" ]] || unit="none"
+                classification="new/transient-candidate"
+                if grep -Fxq "$pid" <<<"$IOWAIT_PREVIOUS_PIDS"; then
+                    classification="persistent-across-snapshots"
+                    persistent=1
+                fi
+                printf '%s\t%s\t%s\t%s\t%s %s\t%s\n' "$pid" "$unit" "$stat" "$wchan" "$comm" "$command" "$classification"
+                printf '%s\n' "-- /proc/${pid}/io --"
+                sed -n '1,20p' "/proc/${pid}/io" 2>/dev/null || true
+                printf '%s\n' "-- /proc/${pid}/fd targets (device/filesystem evidence) --"
+                find "/proc/${pid}/fd" -maxdepth 1 -type l -printf '%f -> %l\n' 2>/dev/null || true
+            done <<<"$blocked"
+        else
+            printf '%s\n' 'none'
+            if [[ -n "$IOWAIT_PREVIOUS_PIDS" ]]; then
+                printf 'classification=previous D-state PIDs resolved; transient IO wait\n'
+            fi
+        fi
+    } >> "$report"
     chmod 0600 "$report"
     if [[ -n "$blocked" ]]; then
-        record_skip "PROC-3614" "processes in uninterruptible IO wait were documented in ${report}; none were killed without a proven safe cause"
+        if [[ "$persistent" -eq 1 ]]; then
+            record_skip "PROC-3614" "persistent D-state processes were observed across snapshots; PID/unit/stat/wchan/command evidence is in ${report}; none were killed"
+        else
+            record_skip "PROC-3614" "new D-state processes were documented for recheck in ${report}; none were killed"
+        fi
     else
-        record_change "PROC-3614 check found no processes in uninterruptible IO wait"
+        record_change "PROC-3614 ${stage} check found no processes in uninterruptible IO wait"
     fi
+    IOWAIT_PREVIOUS_PIDS="$current_pids"
     return 0
 }
 
@@ -3476,6 +4581,54 @@ run_lynis() {
     return 0
 }
 
+extract_lynis_score() {
+    local report="$1" data="$2" score=""
+    if [[ -s "$report" ]]; then
+        score="$(sed $'s/\033\\[[0-9;]*[[:alpha:]]//g' "$report" | awk '
+            /Hardening index[[:space:]]*:/ {
+                line=$0
+                sub(/^.*Hardening index[[:space:]]*:[[:space:]]*/, "", line)
+                if (match(line, /[0-9]+/)) value=substr(line, RSTART, RLENGTH)
+            }
+            END {print value}
+        ')"
+    fi
+    if [[ -z "$score" && -s "$data" ]]; then
+        score="$(awk -F= '$1 == "hardening_index" {value=$2} END {print value}' "$data")"
+    fi
+    [[ "$score" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$score"
+}
+
+capture_lynis_baseline() {
+    local report="${HARDEN_LYNIS_BASELINE_REPORT:-/root/lynis-before-hardening.txt}"
+    local data="${HARDEN_LYNIS_BASELINE_DATA:-/root/lynis-before-hardening-report.dat}"
+    local score=""
+    if [[ "$MODE" == "dry-run" ]]; then
+        LYNIS_BEFORE="N/A (dry-run; NOT RUN)"
+        log INFO "Dry run: pre-hardening Lynis baseline is NOT RUN because Lynis would write runtime reports"
+        return 0
+    fi
+    if ! command -v lynis >/dev/null 2>&1; then
+        LYNIS_BEFORE="N/A (Lynis unavailable)"
+        record_skip "Lynis baseline" "lynis is not installed before package hardening; no package was installed merely to obtain a baseline"
+        return 0
+    fi
+    if ! run_lynis "$report" "pre-hardening baseline"; then
+        LYNIS_BEFORE="FAILED"
+        log WARN "Pre-hardening Lynis baseline failed; its separate report was retained"
+        return 0
+    fi
+    if score="$(extract_lynis_score "$report" "$data")"; then
+        LYNIS_BEFORE="$score"
+        log OK "Measured pre-hardening Lynis baseline: ${LYNIS_BEFORE}"
+    else
+        LYNIS_BEFORE="PARSE ERROR"
+        log WARN "Could not parse the pre-hardening Lynis score from ${report} or ${data}"
+    fi
+    return 0
+}
+
 second_optimization_pass() {
     if [[ "$MODE" == "dry-run" ]]; then
         log INFO "Would parse first-pass Test IDs, re-assert safe controls, then run Lynis a second time"
@@ -3515,11 +4668,14 @@ second_optimization_pass() {
 }
 
 extract_lynis_summary() {
-    local report=/root/lynis-after-hardening.txt
+    local report="${HARDEN_LYNIS_FINAL_REPORT:-/root/lynis-after-hardening.txt}"
+    local data="${HARDEN_LYNIS_FINAL_DATA:-/root/lynis-after-hardening-report.dat}"
+    local diagnostic="${HARDEN_LYNIS_PARSE_DIAGNOSTIC:-/root/lynis-summary-parse-diagnostics.txt}"
     if [[ "$MODE" == "dry-run" ]]; then
         LYNIS_AFTER="N/A (dry-run)"
         LYNIS_WARNINGS="N/A"
         LYNIS_SUGGESTIONS="N/A"
+        LYNIS_PARSE_STATUS="N/A"
         log INFO "Dry run: skipping Lynis summary extraction because no report is written"
         return 0
     fi
@@ -3527,16 +4683,40 @@ extract_lynis_summary() {
         LYNIS_AFTER="unknown"
         LYNIS_WARNINGS="unknown"
         LYNIS_SUGGESTIONS="unknown"
+        LYNIS_PARSE_STATUS="REPORT MISSING"
         log WARN "Final Lynis report is absent; summary values remain unknown"
         return 0
     fi
-    LYNIS_AFTER="$(awk '/Hardening index[[:space:]]*:/ {for (i=1; i<=NF; i++) if ($i ~ /^[0-9]+$/) value=$i} END {print value}' "$report")"
-    [[ -n "$LYNIS_AFTER" ]] || LYNIS_AFTER="unknown"
-    LYNIS_WARNINGS="$(awk '/Warnings \([0-9]+\)/ {line=$0; sub(/^.*Warnings \(/,"",line); sub(/\).*$/,"",line); value=line} END {print value}' "$report")"
+    LYNIS_AFTER="$(extract_lynis_score "$report" "$data" || true)"
+    LYNIS_WARNINGS="$(sed $'s/\033\\[[0-9;]*[[:alpha:]]//g' "$report" | awk '
+        /Warnings[[:space:]]*\([0-9]+\)/ {line=$0; sub(/^.*Warnings[[:space:]]*\(/,"",line); sub(/\).*$/,"",line); value=line}
+        END {print value}
+    ')"
     if grep -q 'Great, no warnings' "$report"; then LYNIS_WARNINGS=0; fi
-    [[ -n "$LYNIS_WARNINGS" ]] || LYNIS_WARNINGS="unknown"
-    LYNIS_SUGGESTIONS="$(awk '/Suggestions \([0-9]+\)/ {line=$0; sub(/^.*Suggestions \(/,"",line); sub(/\).*$/,"",line); value=line} END {print value}' "$report")"
-    [[ -n "$LYNIS_SUGGESTIONS" ]] || LYNIS_SUGGESTIONS="unknown"
+    [[ -n "$LYNIS_WARNINGS" || ! -s "$data" ]] || LYNIS_WARNINGS="$(grep -c '^warning\[\]=' "$data" || true)"
+    LYNIS_SUGGESTIONS="$(sed $'s/\033\\[[0-9;]*[[:alpha:]]//g' "$report" | awk '
+        /Suggestions[[:space:]]*\([0-9]+\)/ {line=$0; sub(/^.*Suggestions[[:space:]]*\(/,"",line); sub(/\).*$/,"",line); value=line}
+        /Suggestions[[:space:]]*:[[:space:]]*[0-9]+/ {line=$0; sub(/^.*Suggestions[[:space:]]*:[[:space:]]*/,"",line); if (match(line, /^[0-9]+/)) value=substr(line,RSTART,RLENGTH)}
+        END {print value}
+    ')"
+    [[ -n "$LYNIS_SUGGESTIONS" || ! -s "$data" ]] || LYNIS_SUGGESTIONS="$(grep -c '^suggestion\[\]=' "$data" || true)"
+    if [[ "$LYNIS_AFTER" =~ ^[0-9]+$ && "$LYNIS_WARNINGS" =~ ^[0-9]+$ \
+        && "$LYNIS_SUGGESTIONS" =~ ^[0-9]+$ ]]; then
+        LYNIS_PARSE_STATUS="OK"
+        rm -f -- "$diagnostic"
+    else
+        [[ "$LYNIS_AFTER" =~ ^[0-9]+$ ]] || LYNIS_AFTER="PARSE ERROR"
+        [[ "$LYNIS_WARNINGS" =~ ^[0-9]+$ ]] || LYNIS_WARNINGS="PARSE ERROR"
+        [[ "$LYNIS_SUGGESTIONS" =~ ^[0-9]+$ ]] || LYNIS_SUGGESTIONS="PARSE ERROR"
+        LYNIS_PARSE_STATUS="FAILED"
+        {
+            printf 'Lynis summary parse failure at %s\n' "$(timestamp)"
+            grep -E 'Hardening index|Warnings|Suggestions|Great, no warnings' "$report" || true
+            [[ ! -s "$data" ]] || grep -E '^(hardening_index|warning\[\]|suggestion\[\])=' "$data" || true
+        } > "$diagnostic"
+        chmod 0600 "$diagnostic"
+        log WARN "Final Lynis summary parse failed; see ${diagnostic}"
+    fi
     return 0
 }
 
@@ -3667,10 +4847,11 @@ Fail2ban           : ${FAIL2BAN_STATUS}
 Remote Logging     : ${REMOTE_LOG_STATUS}
 Automatic Updates  : ${UPDATES_STATUS}
 
-Lynis Score Before : ${SOURCE_LYNIS_INDEX}
+Lynis Score Before : ${LYNIS_BEFORE}
 Lynis Score After  : ${LYNIS_AFTER}
 Warnings           : ${LYNIS_WARNINGS}
 Suggestions        : ${LYNIS_SUGGESTIONS}
+Lynis Parse Status : ${LYNIS_PARSE_STATUS}
 
 Packages installed : ${PACKAGES_INSTALLED[*]:-none}
 Packages removed   : ${PACKAGES_REMOVED[*]:-none}
@@ -3720,6 +4901,7 @@ main() {
     log INFO "Server hardening ${SCRIPT_VERSION} started"
     [[ "$MODE" == "dry-run" ]] && log INFO "Dry run: no backup, log file, or system state will be changed"
     detect_os
+    capture_lynis_baseline
 
     phase 02 18 "Backup"
     backup_config
@@ -3781,7 +4963,7 @@ main() {
 
     phase 13 18 "Validation"
     remediate_deleted_open_files
-    diagnose_iowait_processes
+    diagnose_iowait_processes "validation-baseline"
     run_validation
 
     phase 14 18 "Lynis Pass 1"
@@ -3797,9 +4979,16 @@ main() {
     fi
 
     phase 17 18 "Final Lockdown and Lynis"
+    diagnose_iowait_processes "pre-final-lynis"
     lock_kernel_modules_late
     run_lynis /root/lynis-after-hardening.txt "final pass"
     FINAL_LYNIS_COMPLETED=1
+    if grep -q '\[PROC-3614\]' /root/lynis-after-hardening.txt 2>/dev/null; then
+        log WARN "Final Lynis reported PROC-3614; waiting briefly for a second non-destructive D-state snapshot"
+        sleep 2
+        diagnose_iowait_processes "post-finding-recheck"
+    fi
+    verify_fail2ban_runtime 3 || true
     extract_lynis_summary
     write_open_findings_report
 

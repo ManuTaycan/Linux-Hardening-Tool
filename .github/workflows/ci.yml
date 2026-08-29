@@ -19,7 +19,7 @@ jobs:
       - name: Install ShellCheck
         run: |
           sudo apt-get update
-          sudo apt-get install --yes shellcheck
+          sudo apt-get install --yes shellcheck nftables
       - name: Check whitespace
         run: ./scripts/ci-whitespace-check.sh
       - name: Run safe local checks

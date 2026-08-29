@@ -33,11 +33,32 @@ meldet einen unvollständigen Lauf sichtbar und liefert dann keinen Exit 0.
 
 ## Validierung und Abschluss
 
-Phase 13 sammelt Validierungsdaten. Phase 14 und 17 führen Lynis aus; Phase 16
-stellt sicher, dass die AIDE-Konfiguration, eine nichtleere Datenbank, ein
+Im Apply-Modus erfasst Phase 01 vor den Hardening-Änderungen eine separate
+Lynis-Baseline einschließlich `report.dat`; im Dry-Run bleibt dieser schreibende
+Scan aus. Phase 13 sammelt Validierungsdaten. Phase 14 und 17 führen die beiden
+Post-Hardening-Lynis-Läufe aus; Phase 16 stellt sicher, dass die
+AIDE-Konfiguration, eine nichtleere Datenbank, ein
 lesbarer Check und der Timer vor dem finalen Lynis-Lauf vorhanden sind. Ein
 erfolgreicher Apply-Lauf benötigt Phase 18 sowie erfolgreiche Validation-,
 Final-Lynis- und Summary-Gates.
+
+Der aggressive Kernelmodul-Lock bleibt der letzte irreversible Schritt in
+Phase 17. Ein Tailscale-Drop-in zieht beim Boot zuerst
+`kernel-module-netfilter-preload.service` ein und ordnet diese vor
+`tailscaled.service`; Apply, Preload-Unit und `kernel-module-lockdown.service`
+verwenden denselben Helper. Bei aktivem Tailscale klassifiziert er relevante laufende Kernel-
+Features als builtin/module/unavailable, lädt nur vorhandene `=m`-Module und
+prüft danach Firewall-Service, iptables/ip6tables-nft, NAT-POSTROUTING,
+Tailscale-Ketten/-Hooks, Backend und ausschließlich passende Router-/Netfilter-
+Healthmeldungen. Erst dann wird `kernel.modules_disabled=1` geschrieben. Eine
+fehlende Voraussetzung lässt den Wert 0 und die Boot-Unit fehlschlagen; der
+Diagnosebericht liegt unter `/root/kernel-module-lockdown-report.txt`.
+
+Die Unit verlangt den owned Firewall-Service und läuft nach Network-online,
+Firewall, AppArmor und einem gegebenenfalls mitgestarteten tailscaled. Diese
+Ordnung allein gilt nicht als Readiness-Beweis: Der Helper wartet begrenzt auf
+die konkreten Runtime-Prädikate. Er liest keine Tailscale-Prefs und führt weder
+`tailscale up` noch `tailscale set` aus.
 
 ## Dienste
 
