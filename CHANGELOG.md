@@ -23,6 +23,24 @@ für 1.1.3 wird erst nach dem vollständigen Zielsystemtest erstellt.
 - The irreversible `kernel.modules_disabled=1` write is guarded by the final
   phase-17 network, firewall, AppArmor, validation, and AIDE prerequisites and
   is verified after the write.
+- The late kernel-module lock now closes the confirmed Tailscale boot race:
+  it classifies the running kernel's Netfilter/NAT features, preloads only
+  present modular IPv4/IPv6 components, waits on observable iptables-nft,
+  Tailscale-chain, backend, and router/netfilter-health readiness, and only
+  then performs the irreversible write. The same verified helper runs during
+  Apply and boot; a failed prerequisite leaves module loading enabled, fails
+  the unit visibly, and writes a secret-free diagnostic report.
+- Kernel-lock helper, preload unit, late-lock unit and Tailscale drop-in are
+  transaction-backed and rolled back together if candidate/installed unit
+  verification or daemon reload fails. The owned firewall unit is rendered
+  once and verified before installation as well as after installation.
+- Hosts already locked by an earlier run receive the corrected boot units
+  without an impossible live `modprobe`; recovery of missing modules is
+  explicitly deferred to the next controlled reboot.
+- Converged runs avoid unnecessary `update-initramfs`, `update-grub`, fstab
+  daemon reloads, compiler ownership/mode writes, account-aging changes,
+  rkhunter property rebuilds, and service disable/mask calls. Reboot-required
+  is set by managed initramfs/GRUB work only when its input actually changed.
 - CI prüft den committed Base-to-Head-Diff auf Whitespace und testet den
   Installer in einem temporären Zielpfad.
 - `--install-path` bezeichnet jetzt die ausführbare Zieldatei statt eines

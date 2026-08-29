@@ -272,14 +272,33 @@ EOF
 }
 
 run_kernel_gate_test() {
-    local case_root="$test_root/kernel"
-    local mock_bin="$case_root/bin"
-    local control="$case_root/modules_disabled"
-    local unit="$case_root/kernel-module-lockdown.service"
-    local writes="$case_root/writes"
-    install -d "$mock_bin"
+    local case_root="$test_root/kernel" mock_bin="$test_root/kernel/bin"
+    local control="$case_root/modules_disabled" unit="$case_root/kernel-module-lockdown.service"
+    local helper="$case_root/kernel-module-lockdown" writes="$case_root/writes"
+    local module_log="$case_root/modprobe.log" command_log="$case_root/commands.log"
+    local kernel_config="$case_root/kernel.config" sys_modules="$case_root/sys-module"
+    local report="$case_root/kernel-module-lockdown-report.txt"
+    install -d "$mock_bin" "$sys_modules" "$case_root/backup"
     printf '0\n' > "$control"
     printf '[Service]\n' > "$unit"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$helper"
+    chmod 0755 "$helper"
+    cat > "$kernel_config" <<'EOF'
+CONFIG_NF_TABLES=y
+CONFIG_NF_CONNTRACK=m
+CONFIG_NF_NAT=m
+CONFIG_NFT_NAT=m
+CONFIG_NFT_MASQ=m
+CONFIG_NFT_COMPAT=m
+CONFIG_NETFILTER_XTABLES=m
+CONFIG_NETFILTER_XT_MARK=m
+CONFIG_NETFILTER_XT_NAT=m
+CONFIG_NETFILTER_XT_TARGET_MASQUERADE=m
+CONFIG_IP_NF_IPTABLES=y
+CONFIG_IP_NF_NAT=m
+CONFIG_IP6_NF_IPTABLES=y
+# CONFIG_IP6_NF_NAT is not set
+EOF
     cat > "$mock_bin/sysctl" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -295,15 +314,298 @@ fi
 EOF
     cat > "$mock_bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
+set -Eeuo pipefail
+printf 'systemctl %s\n' "$*" >> "$KERNEL_COMMAND_LOG"
+case "${1:-}" in
+    is-active)
+        service="${*: -1}"
+        if [[ "$service" == tailscaled.service ]]; then
+            [[ "${KERNEL_TAILSCALE_ACTIVE:-1}" -eq 1 ]]
+        else
+            [[ "${KERNEL_FIREWALL_ACTIVE:-1}" -eq 1 ]]
+        fi
+        ;;
+    is-enabled) printf 'disabled\n' ;;
+    is-failed)
+        service="${*: -1}"
+        [[ "$service" == kernel-module-netfilter-preload.service && "${KERNEL_PRELOAD_FAILED:-0}" -eq 1 ]]
+        ;;
+    enable|disable|daemon-reload) exit 0 ;;
+    *) exit 0 ;;
+esac
+EOF
+    cat > "$mock_bin/modprobe" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+module="${1:-}"
+printf '%s\n' "$module" >> "$KERNEL_MODPROBE_LOG"
+[[ "$module" != "${KERNEL_MODPROBE_FAIL:-}" ]] || exit 1
+mkdir -p "$HARDEN_SYS_MODULE_ROOT/${module//-/_}"
+EOF
+    for command in iptables ip6tables; do
+        cat > "$mock_bin/$command" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+name="$(basename "$0")"
+printf '%s %s\n' "$name" "$*" >> "$KERNEL_COMMAND_LOG"
+if [[ "${1:-}" == --version ]]; then
+    printf '%s v1.8.11 (nf_tables)\n' "$name"
+    exit 0
+fi
+if [[ "${KERNEL_MISSING_POSTROUTING:-0}" -eq 1 && " $* " == *' -t nat -S POSTROUTING '* ]]; then
+    exit 1
+fi
+if [[ "${KERNEL_MISSING_IPV6_POSTROUTING:-0}" -eq 1 && "$name" == ip6tables \
+    && " $* " == *' -t nat -S POSTROUTING '* ]]; then
+    exit 1
+fi
+if [[ "$name" == iptables && " $* " == *' -t nat -S POSTROUTING '* \
+    && -n "${KERNEL_POSTROUTING_READY_FILE:-}" ]]; then
+    count="$(cat "$KERNEL_POSTROUTING_READY_FILE" 2>/dev/null || printf '0')"
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$KERNEL_POSTROUTING_READY_FILE"
+    if ((count <= ${KERNEL_POSTROUTING_FAILURES:-0})); then
+        exit 1
+    fi
+fi
+if [[ "${KERNEL_MISSING_TS_CHAINS:-0}" -eq 1 && " $* " == *' ts-'* ]]; then
+    exit 1
+fi
+if [[ " $* " == *' -t nat -S ts-postrouting '* ]]; then
+    printf '%s\n' '-N ts-postrouting'
+    [[ "${KERNEL_MISSING_MASQUERADE:-0}" -eq 1 ]] \
+        || printf '%s\n' '-A ts-postrouting -m mark --mark 0x40000/0xff0000 -j MASQUERADE'
+fi
 exit 0
 EOF
-    chmod +x "$mock_bin/sysctl" "$mock_bin/systemctl"
+        chmod 0755 "$mock_bin/$command"
+    done
+    cat > "$mock_bin/tailscale" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+printf 'tailscale %s\n' "$*" >> "$KERNEL_COMMAND_LOG"
+[[ "${1:-}" == status && "${2:-}" == --json ]] || exit 64
+if [[ "${KERNEL_TAILSCALE_HEALTH_ERROR:-0}" -eq 1 ]]; then
+    printf '%s\n' '{"BackendState":"Running","Health":["router: netfilter setup failed"]}'
+elif [[ "${KERNEL_TAILSCALE_UNRELATED_WARNING:-0}" -eq 1 ]]; then
+    printf '%s\n' '{"BackendState":"Running","Self":{"PrimaryRoutes":["10.0.0.0/8","fd00::/64"]},"Health":["Some peers are advertising routes but --accept-routes is false."]}'
+else
+    printf '%s\n' '{"BackendState":"Running","Self":{"PrimaryRoutes":["10.0.0.0/8","fd00::/64"]},"Health":[]}'
+fi
+EOF
+    cat > "$mock_bin/python3" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+input="$(cat)"
+grep -Fq '"BackendState":"Running"' <<<"$input" && printf 'backend=Running\n' || printf 'backend=Unknown\n'
+grep -Fq '10.0.0.0/8' <<<"$input" && printf 'router-v4=1\n' || printf 'router-v4=0\n'
+grep -Fq 'fd00::/64' <<<"$input" && printf 'router-v6=1\n' || printf 'router-v6=0\n'
+grep -Eqi 'router|netfilter|firewall|iptables|nftables|masquerad|postrouting|forwarding' <<<"$input" \
+    && printf 'health-problem=1\n' || true
+EOF
+    chmod +x "$mock_bin/sysctl" "$mock_bin/systemctl" "$mock_bin/modprobe" "$mock_bin/tailscale" "$mock_bin/python3"
+
+    : > "$module_log"
+    : > "$command_log"
     env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_MODULES_DISABLED_PATH="$control" \
-        HARDEN_MODULE_LOCK_UNIT="$unit" KERNEL_WRITE_COUNT="$writes" bash -c '
+        HARDEN_KERNEL_CONFIG="$kernel_config" HARDEN_SYS_MODULE_ROOT="$sys_modules" \
+        HARDEN_PROC_MODULES="$case_root/no-proc-modules" HARDEN_KERNEL_LOCK_REPORT="$report" \
+        HARDEN_KERNEL_GATE_ATTEMPTS=1 HARDEN_KERNEL_GATE_INTERVAL=0 KERNEL_WRITE_COUNT="$writes" \
+        KERNEL_MODPROBE_LOG="$module_log" KERNEL_COMMAND_LOG="$command_log" bash -c '
+            source "$1/harden.sh"
+            trap - ERR EXIT
+            kernel_module_preload_gate
+            [[ "$(< "$2")" == 0 ]]
+            grep -Fq "stage=preload-before-tailscaled" "$4"
+            grep -Fq "gate-result=PRELOADED" "$4"
+            preload_count="$(wc -l < "$3")"
+            kernel_lock_gate
+            [[ "$(< "$2")" == 1 ]]
+            [[ "$(wc -l < "$3")" == "$preload_count" ]]
+            grep -Fxq nf_nat "$3"
+            grep -Fxq nft_nat "$3"
+            grep -Fxq nft_chain_nat "$3"
+            grep -Fxq nft_masq "$3"
+            grep -Fxq iptable_nat "$3"
+            [[ "$(grep -Fxc xt_mark "$3")" == 1 ]]
+            ! grep -Fxq nf_tables "$3"
+            ! grep -Fxq ip6table_nat "$3"
+            grep -Fq "CONFIG_NF_TABLES=builtin" "$4"
+            grep -Fq "CONFIG_NF_NAT=module" "$4"
+            grep -Fq "CONFIG_IP6_NF_NAT=unavailable" "$4"
+            grep -Fq "ipv4-nat-postrouting=OK" "$4"
+            grep -Fq "ipv6-nat-postrouting=OK" "$4"
+            grep -Fq "gate-result=LOCKED" "$4"
+            grep -Fq "iptables --version" "$5"
+            grep -Fq "ip6tables --version" "$5"
+            [[ "$(grep -Fxc "tailscale status --json" "$5")" == 1 ]]
+            ! grep -Eq "tailscale (up|set)([[:space:]]|$)" "$5"
+        ' _ "$repo_root" "$control" "$module_log" "$report" "$command_log" \
+        || fail "active Tailscale modular/builtin/unavailable preload and dual-stack runtime gate failed"
+
+    rm -rf -- "$sys_modules"
+    install -d "$sys_modules"
+    printf '0\n' > "$control"
+    : > "$module_log"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_MODULES_DISABLED_PATH="$control" \
+        HARDEN_KERNEL_CONFIG="$kernel_config" HARDEN_SYS_MODULE_ROOT="$sys_modules" \
+        HARDEN_PROC_MODULES="$case_root/no-proc-modules" HARDEN_KERNEL_LOCK_REPORT="$report" \
+        HARDEN_KERNEL_GATE_ATTEMPTS=1 KERNEL_WRITE_COUNT="$writes" KERNEL_MODPROBE_LOG="$module_log" \
+        KERNEL_COMMAND_LOG="$command_log" KERNEL_MODPROBE_FAIL=nft_masq bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            if kernel_lock_gate; then exit 1; fi
+            [[ "$(< "$2")" == 0 ]]
+            grep -Fq "modprobe nft_masq failed" "$3"
+            grep -Fq "gate-result=BLOCKED" "$3"
+        ' _ "$repo_root" "$control" "$report" || fail "modprobe failure did not block the irreversible lock"
+
+    for failure in postrouting ipv6-postrouting health masquerade; do
+        rm -rf -- "$sys_modules"
+        install -d "$sys_modules"
+        printf '0\n' > "$control"
+        : > "$module_log"
+        missing=0; missing_ipv6=0; health=0; masquerade=0
+        case "$failure" in
+            postrouting) missing=1 ;;
+            ipv6-postrouting) missing_ipv6=1 ;;
+            health) health=1 ;;
+            masquerade) masquerade=1 ;;
+        esac
+        env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_MODULES_DISABLED_PATH="$control" \
+            HARDEN_KERNEL_CONFIG="$kernel_config" HARDEN_SYS_MODULE_ROOT="$sys_modules" \
+            HARDEN_PROC_MODULES="$case_root/no-proc-modules" HARDEN_KERNEL_LOCK_REPORT="$report" \
+            HARDEN_KERNEL_GATE_ATTEMPTS=1 KERNEL_WRITE_COUNT="$writes" KERNEL_MODPROBE_LOG="$module_log" \
+            KERNEL_COMMAND_LOG="$command_log" KERNEL_MISSING_POSTROUTING="$missing" \
+            KERNEL_MISSING_IPV6_POSTROUTING="$missing_ipv6" \
+            KERNEL_TAILSCALE_HEALTH_ERROR="$health" KERNEL_MISSING_MASQUERADE="$masquerade" bash -c '
+                source "$1/harden.sh"; trap - ERR EXIT
+                if kernel_lock_gate; then exit 1; fi
+                [[ "$(< "$2")" == 0 ]]
+                grep -Fq "gate-result=BLOCKED" "$3"
+            ' _ "$repo_root" "$control" "$report" || fail "${failure} failure did not block the irreversible lock"
+    done
+
+    rm -rf -- "$sys_modules"
+    install -d "$sys_modules"
+    printf '0\n' > "$control"
+    : > "$module_log"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_MODULES_DISABLED_PATH="$control" \
+        HARDEN_KERNEL_CONFIG="$kernel_config" HARDEN_SYS_MODULE_ROOT="$sys_modules" \
+        HARDEN_KERNEL_LOCK_REPORT="$report" HARDEN_KERNEL_GATE_ATTEMPTS=1 HARDEN_KERNEL_GATE_INTERVAL=0 \
+        KERNEL_WRITE_COUNT="$writes" KERNEL_MODPROBE_LOG="$module_log" KERNEL_COMMAND_LOG="$command_log" \
+        KERNEL_TAILSCALE_UNRELATED_WARNING=1 bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            kernel_lock_gate
+            [[ "$(< "$2")" == 1 ]]
+            grep -Fq "tailscale-router-netfilter-health=clear" "$3"
+        ' _ "$repo_root" "$control" "$report" \
+        || fail "unrelated accept-routes health text incorrectly blocked the final lock"
+
+    rm -rf -- "$sys_modules"
+    install -d "$sys_modules"
+    printf '0\n' > "$control"
+    printf '0\n' > "$case_root/readiness-count"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_MODULES_DISABLED_PATH="$control" \
+        HARDEN_KERNEL_CONFIG="$kernel_config" HARDEN_SYS_MODULE_ROOT="$sys_modules" \
+        HARDEN_KERNEL_LOCK_REPORT="$report" HARDEN_KERNEL_GATE_ATTEMPTS=3 HARDEN_KERNEL_GATE_INTERVAL=0 \
+        KERNEL_WRITE_COUNT="$writes" KERNEL_MODPROBE_LOG="$module_log" KERNEL_COMMAND_LOG="$command_log" \
+        KERNEL_POSTROUTING_READY_FILE="$case_root/readiness-count" KERNEL_POSTROUTING_FAILURES=2 bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            kernel_lock_gate
+            [[ "$(< "$2")" == 1 ]]
+            [[ "$(< "$3")" == 3 ]]
+            grep -Fq "runtime-attempt=3" "$4"
+        ' _ "$repo_root" "$control" "$case_root/readiness-count" "$report" \
+        || fail "bounded readiness polling did not succeed when prerequisites became ready"
+
+    rm -rf -- "$sys_modules"
+    install -d "$sys_modules"
+    printf '0\n' > "$control"
+    printf '0\n' > "$case_root/readiness-count"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_MODULES_DISABLED_PATH="$control" \
+        HARDEN_KERNEL_CONFIG="$kernel_config" HARDEN_SYS_MODULE_ROOT="$sys_modules" \
+        HARDEN_KERNEL_LOCK_REPORT="$report" HARDEN_KERNEL_GATE_ATTEMPTS=2 HARDEN_KERNEL_GATE_INTERVAL=0 \
+        KERNEL_WRITE_COUNT="$writes" KERNEL_MODPROBE_LOG="$module_log" KERNEL_COMMAND_LOG="$command_log" \
+        KERNEL_POSTROUTING_READY_FILE="$case_root/readiness-count" KERNEL_POSTROUTING_FAILURES=99 bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            if kernel_lock_gate; then exit 1; fi
+            [[ "$(< "$2")" == 0 ]]
+            [[ "$(< "$3")" == 2 ]]
+            grep -Fq "gate-result=BLOCKED" "$4"
+        ' _ "$repo_root" "$control" "$case_root/readiness-count" "$report" \
+        || fail "readiness polling timeout did not leave module loading enabled"
+
+    rm -rf -- "$sys_modules"
+    install -d "$sys_modules"
+    printf '0\n' > "$control"
+    : > "$module_log"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_MODULES_DISABLED_PATH="$control" \
+        HARDEN_KERNEL_CONFIG="$kernel_config" HARDEN_SYS_MODULE_ROOT="$sys_modules" \
+        HARDEN_KERNEL_LOCK_REPORT="$report" KERNEL_WRITE_COUNT="$writes" \
+        KERNEL_MODPROBE_LOG="$module_log" KERNEL_COMMAND_LOG="$command_log" \
+        KERNEL_TAILSCALE_ACTIVE=0 bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            kernel_lock_gate
+            [[ "$(< "$2")" == 1 ]]
+            [[ ! -s "$3" ]]
+            grep -Fq "tailscale-runtime-check=not-required-inactive" "$4"
+        ' _ "$repo_root" "$control" "$module_log" "$report" || fail "inactive Tailscale no-preload lock path failed"
+
+    printf '0\n' > "$control"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_MODULES_DISABLED_PATH="$control" \
+        HARDEN_KERNEL_CONFIG="$kernel_config" HARDEN_SYS_MODULE_ROOT="$sys_modules" \
+        HARDEN_KERNEL_LOCK_REPORT="$report" KERNEL_WRITE_COUNT="$writes" \
+        KERNEL_MODPROBE_LOG="$module_log" KERNEL_COMMAND_LOG="$command_log" \
+        KERNEL_TAILSCALE_ACTIVE=0 KERNEL_PRELOAD_FAILED=1 bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            if kernel_lock_gate; then exit 1; fi
+            [[ "$(< "$2")" == 0 ]]
+            grep -Fq "Tailscale or its Netfilter preload prerequisite failed" "$3"
+        ' _ "$repo_root" "$control" "$report" || fail "failed boot preload was hidden by an inactive-Tailscale normal lock path"
+
+    printf '1\n' > "$control"
+    : > "$module_log"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_MODULES_DISABLED_PATH="$control" \
+        HARDEN_KERNEL_CONFIG="$kernel_config" HARDEN_SYS_MODULE_ROOT="$sys_modules" \
+        HARDEN_KERNEL_LOCK_REPORT="$report" KERNEL_WRITE_COUNT="$writes" \
+        KERNEL_MODPROBE_LOG="$module_log" KERNEL_COMMAND_LOG="$command_log" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            kernel_lock_gate
+            [[ "$(< "$2")" == 1 ]]
+            [[ ! -s "$3" ]]
+            grep -Fq "CONFIG_NF_NAT=module" "$4"
+            grep -Fq "already-locked-runtime-check=OK" "$4"
+            grep -Fq "gate-result=already-locked-idempotent" "$4"
+        ' _ "$repo_root" "$control" "$module_log" "$report" || fail "already-locked no-modprobe idempotent path failed"
+
+    printf '1\n' > "$control"
+    : > "$module_log"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_MODULES_DISABLED_PATH="$control" \
+        HARDEN_KERNEL_CONFIG="$kernel_config" HARDEN_SYS_MODULE_ROOT="$sys_modules" \
+        HARDEN_KERNEL_LOCK_REPORT="$report" KERNEL_WRITE_COUNT="$writes" \
+        KERNEL_MODPROBE_LOG="$module_log" KERNEL_COMMAND_LOG="$command_log" \
+        KERNEL_MISSING_POSTROUTING=1 bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            kernel_lock_gate
+            [[ "$(< "$2")" == 1 ]]
+            [[ ! -s "$3" ]]
+            grep -Fq "already-locked-runtime-check=FAILED; reboot-repair-required" "$4"
+            grep -Fq "gate-result=already-locked-idempotent" "$4"
+        ' _ "$repo_root" "$control" "$module_log" "$report" \
+        || fail "already-locked broken runtime was not diagnosed without an impossible live repair"
+
+    printf '0\n' > "$control"
+    : > "$writes"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_MODULES_DISABLED_PATH="$control" \
+        HARDEN_MODULE_LOCK_UNIT="$unit" HARDEN_MODULE_LOCK_HELPER="$helper" \
+        HARDEN_KERNEL_CONFIG="$kernel_config" HARDEN_SYS_MODULE_ROOT="$sys_modules" \
+        HARDEN_KERNEL_LOCK_REPORT="$report" HARDEN_KERNEL_GATE_ATTEMPTS=1 KERNEL_WRITE_COUNT="$writes" \
+        KERNEL_MODPROBE_LOG="$module_log" KERNEL_COMMAND_LOG="$command_log" KERNEL_TAILSCALE_ACTIVE=0 bash -c '
             source "$1/harden.sh"
             trap - ERR EXIT
             MODE=apply
             AGGRESSIVE=1
+            BACKUP_DIR="$5"
             CHANGE_LOG="$4"
             : > "$CHANGE_LOG"
             CURRENT_PHASE=16
@@ -319,7 +621,118 @@ EOF
             [[ "$(< "$2")" == 1 ]]
             lock_kernel_modules_late
             [[ "$(wc -l < "$3")" == 1 ]]
-        ' _ "$repo_root" "$control" "$writes" "$case_root/changes.tsv" || fail "final kernel.modules_disabled gate or idempotent path failed"
+        ' _ "$repo_root" "$control" "$writes" "$case_root/changes.tsv" "$case_root/backup" \
+        || fail "final phase-17 kernel.modules_disabled gate or idempotent path failed"
+
+    local prep_root="$case_root/prepare" prep_backup="$case_root/prepare-backup"
+    install -d "$prep_root/tailscaled.service.d" "$prep_backup"
+    printf '1\n' > "$control"
+    : > "$module_log"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_MODULES_DISABLED_PATH="$control" \
+        HARDEN_MODULE_LOCK_HELPER="$prep_root/kernel-module-lockdown" \
+        HARDEN_MODULE_LOCK_UNIT="$prep_root/kernel-module-lockdown.service" \
+        HARDEN_MODULE_PRELOAD_UNIT="$prep_root/kernel-module-netfilter-preload.service" \
+        HARDEN_TAILSCALE_PRELOAD_DROPIN="$prep_root/tailscaled.service.d/99-netfilter-module-preload.conf" \
+        KERNEL_MODPROBE_LOG="$module_log" KERNEL_COMMAND_LOG="$command_log" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; AGGRESSIVE=1; BACKUP_DIR="$2"; CHANGE_LOG="$2/changes.tsv"; : > "$CHANGE_LOG"
+            install_managed_file() {
+                local destination="$1" mode="$2"
+                mkdir -p -- "$(dirname -- "$destination")"
+                MANAGED_FILE_CHANGED=1
+                cat > "$destination"
+                chmod "$mode" "$destination"
+            }
+            systemd_verify_unit() { return 0; }
+            unit_file_exists() { [[ "$1" == tailscaled.service ]]; }
+            run_streamed() { "$@"; }
+            prepare_kernel_module_lock
+            [[ -x "$HARDEN_MODULE_LOCK_HELPER" ]]
+            [[ -f "$HARDEN_MODULE_LOCK_UNIT" && -f "$HARDEN_MODULE_PRELOAD_UNIT" ]]
+            [[ -f "$HARDEN_TAILSCALE_PRELOAD_DROPIN" ]]
+        ' _ "$repo_root" "$prep_backup" \
+        || fail "already-locked host did not install and verify patched boot helper/units"
+    [[ ! -s "$module_log" ]] || fail "already-locked preparation attempted modprobe instead of deferring repair to reboot"
+
+    local rollback_root="$case_root/rollback" rollback_backup="$case_root/rollback-backup"
+    install -d "$rollback_root/tailscaled.service.d" "$rollback_backup"
+    printf 'old-helper\n' > "$rollback_root/kernel-module-lockdown"
+    printf 'old-lock\n' > "$rollback_root/kernel-module-lockdown.service"
+    printf 'old-preload\n' > "$rollback_root/kernel-module-netfilter-preload.service"
+    printf 'old-dropin\n' > "$rollback_root/tailscaled.service.d/99-netfilter-module-preload.conf"
+    printf '0\n' > "$control"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_MODULES_DISABLED_PATH="$control" \
+        HARDEN_MODULE_LOCK_HELPER="$rollback_root/kernel-module-lockdown" \
+        HARDEN_MODULE_LOCK_UNIT="$rollback_root/kernel-module-lockdown.service" \
+        HARDEN_MODULE_PRELOAD_UNIT="$rollback_root/kernel-module-netfilter-preload.service" \
+        HARDEN_TAILSCALE_PRELOAD_DROPIN="$rollback_root/tailscaled.service.d/99-netfilter-module-preload.conf" \
+        KERNEL_COMMAND_LOG="$command_log" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; AGGRESSIVE=1; BACKUP_DIR="$2"; CHANGE_LOG="$2/changes.tsv"; : > "$CHANGE_LOG"
+            install_managed_file() {
+                local destination="$1" mode="$2"
+                MANAGED_FILE_CHANGED=1
+                cat > "$destination"
+                chmod "$mode" "$destination"
+            }
+            systemd_verify_unit() { return 1; }
+            run_streamed() { "$@"; }
+            if prepare_kernel_module_lock; then exit 1; fi
+            grep -Fxq old-helper "$HARDEN_MODULE_LOCK_HELPER"
+            grep -Fxq old-lock "$HARDEN_MODULE_LOCK_UNIT"
+            grep -Fxq old-preload "$HARDEN_MODULE_PRELOAD_UNIT"
+            grep -Fxq old-dropin "$HARDEN_TAILSCALE_PRELOAD_DROPIN"
+            [[ -f "$BACKUP_DIR/transactions/kernel-module-lockdown-helper" ]]
+            [[ -f "$BACKUP_DIR/transactions/kernel-module-lockdown.service" ]]
+            [[ -f "$BACKUP_DIR/transactions/kernel-module-netfilter-preload.service" ]]
+            [[ -f "$BACKUP_DIR/transactions/tailscaled-netfilter-preload.conf" ]]
+        ' _ "$repo_root" "$rollback_backup" \
+        || fail "failed kernel helper/unit verification did not restore all transaction backups"
+
+    env HARDEN_SOURCE_ONLY=1 bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        helper="$(render_kernel_module_lock_helper)"
+        grep -Fq "kernel_lock_gate" <<<"$helper"
+        grep -Fq -- "--preload" <<<"$helper"
+        ! grep -Eq "tailscale (up|set)([[:space:]]|$)" <<<"$helper"
+        ! grep -Fq "sysctl -w kernel.modules_disabled=1" < <(sed -n "/^prepare_kernel_module_lock()/,/^}/p" "$1/harden.sh")
+        [[ "$(grep -Fc "sysctl -w kernel.modules_disabled=1" "$1/harden.sh")" == 1 ]]
+        grep -Fq "Requires=server-hardening-firewall.service" "$1/harden.sh"
+        grep -Fq "Before=tailscaled.service" "$1/harden.sh"
+        grep -Fq "Requires=kernel-module-netfilter-preload.service" "$1/harden.sh"
+        grep -Fq "After=network-online.target server-hardening-firewall.service apparmor.service kernel-module-netfilter-preload.service tailscaled.service" "$1/harden.sh"
+        grep -Fq "net.ipv4.conf.all.rp_filter" "$1/harden.sh"
+        grep -Fq "value=2" "$1/harden.sh"
+    ' _ "$repo_root" || fail "lock helper/unit ordering, Tailscale preference neutrality, or rp_filter preservation regressed"
+
+    if command -v systemd-analyze >/dev/null 2>&1; then
+        local verify_dir="$case_root/systemd-verify"
+        install -d "$verify_dir/tailscaled.service.d"
+        env HARDEN_SOURCE_ONLY=1 bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            render_kernel_module_lock_helper > "$2/kernel-module-lockdown"
+            chmod 0755 "$2/kernel-module-lockdown"
+            render_kernel_module_lock_unit /proc/sys/kernel/modules_disabled "$2/kernel-module-lockdown" \
+                > "$2/kernel-module-lockdown.service"
+            render_kernel_module_preload_unit /proc/sys/kernel/modules_disabled "$2/kernel-module-lockdown" \
+                > "$2/kernel-module-netfilter-preload.service"
+            render_server_hardening_firewall_unit > "$2/server-hardening-firewall.service"
+            render_tailscale_preload_dropin > "$2/tailscaled.service.d/99-netfilter-module-preload.conf"
+        ' _ "$repo_root" "$verify_dir" || fail "could not render the generated lock helper/unit fixture"
+        cat > "$verify_dir/tailscaled.service" <<'EOF'
+[Unit]
+Description=Regression fixture for Tailscale ordering
+[Service]
+Type=simple
+ExecStart=/bin/true
+EOF
+        SYSTEMD_UNIT_PATH="$verify_dir:/usr/local/lib/systemd/system:/usr/lib/systemd/system:/lib/systemd/system" \
+            systemd-analyze verify server-hardening-firewall.service \
+            kernel-module-netfilter-preload.service tailscaled.service kernel-module-lockdown.service \
+            || fail "systemd-analyze rejected the generated late-lock unit ordering"
+    else
+        printf 'INFO: systemd-analyze unavailable; generated-unit verify remains covered by Linux CI.\n'
+    fi
 }
 
 run_lynis_summary_tests() {
@@ -613,6 +1026,16 @@ EOF
             [[ "$(stat -c "%a" "$3/as")" == 750 ]]
             [[ "$(stat -c "%a" "$3/gcc")" == 750 ]]
             printf "%s\n" "${SKIPPED_FINDINGS[*]}" | grep -Fq "active DKMS modules or installed *-dkms packages"
+            run() {
+                if [[ "${1:-}" == chown || "${1:-}" == chmod ]]; then
+                    printf "unexpected-compiler-metadata-write %s\n" "$*" >> "$COMPILER_APT_LOG"
+                    return 99
+                fi
+                run_streamed "$@"
+            }
+            : > "$COMPILER_APT_LOG"
+            restrict_compilers
+            ! grep -Fq "unexpected-compiler-metadata-write" "$COMPILER_APT_LOG"
         ' _ "$repo_root" "$case_root" "$mock_bin" || fail "protected compiler dependency/root-only fallback regression failed"
 
     : > "$apt_log"
@@ -765,6 +1188,164 @@ run_systemd_idempotency_tests() {
     ' _ "$repo_root" || fail "systemd exposure idempotency classification failed"
 }
 
+run_runtime_noop_tests() {
+    local case_root="$test_root/runtime-noop"
+    local mock_bin="$case_root/bin"
+    local command_log="$case_root/commands.log"
+    install -d "$mock_bin" "$case_root/grub" "$case_root/default" "$case_root/rkhunter-db"
+    : > "$command_log"
+    cat > "$mock_bin/getent" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == shadow && "${2:-}" == alice ]]; then
+    printf 'alice:$6$hash:20000:%s:%s:%s:%s::\n' \
+        "${AGING_MIN:-1}" "${AGING_MAX:-90}" "${AGING_WARN:-14}" "${AGING_INACTIVE:-30}"
+else
+    command /usr/bin/getent "$@"
+fi
+EOF
+    cat > "$mock_bin/chage" <<'EOF'
+#!/usr/bin/env bash
+printf 'chage %s\n' "$*" >> "$NOOP_COMMAND_LOG"
+EOF
+    cat > "$mock_bin/findmnt" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+    cat > "$mock_bin/mountpoint" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+    cat > "$mock_bin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+    is-enabled) printf '%s\n' "${NOOP_ENABLED_STATE:-masked}" ;;
+    is-active) printf '%s\n' "${NOOP_ACTIVE_STATE:-inactive}"; [[ "${NOOP_ACTIVE_STATE:-inactive}" == active ]] ;;
+    show) printf '%s\n' "${NOOP_LOAD_STATE:-masked}" ;;
+    disable|mask) printf 'unexpected-systemctl %s\n' "$*" >> "$NOOP_COMMAND_LOG"; exit 91 ;;
+    *) printf 'systemctl %s\n' "$*" >> "$NOOP_COMMAND_LOG" ;;
+esac
+EOF
+    cat > "$mock_bin/update-grub" <<'EOF'
+#!/usr/bin/env bash
+printf 'update-grub\n' >> "$NOOP_COMMAND_LOG"
+EOF
+    cat > "$mock_bin/rkhunter" <<'EOF'
+#!/usr/bin/env bash
+printf 'rkhunter %s\n' "$*" >> "$NOOP_COMMAND_LOG"
+EOF
+    chmod +x "$mock_bin"/*
+    cat > "$case_root/passwd" <<'EOF'
+alice:x:1000:1000:Alice:/home/alice:/bin/bash
+EOF
+    printf 'UID_MIN 1000\n' > "$case_root/login.defs"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_PASSWD_FILE="$case_root/passwd" \
+        HARDEN_LOGIN_DEFS="$case_root/login.defs" NOOP_COMMAND_LOG="$command_log" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply
+            CHANGE_LOG="$2/changes.tsv"; : > "$CHANGE_LOG"
+            configure_account_aging
+            ! grep -Fq "chage " "$3"
+            AGING_MAX=30 configure_account_aging
+            [[ "$(grep -Fc "chage " "$3")" == 1 ]]
+        ' _ "$repo_root" "$case_root" "$command_log" || fail "account-aging no-op/delta regression failed"
+
+    printf '/dev/sda2 /boot ext4 defaults,nodev,nosuid,noexec 0 2\n' > "$case_root/fstab"
+    : > "$command_log"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_FSTAB="$case_root/fstab" \
+        NOOP_COMMAND_LOG="$command_log" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply
+            CHANGE_LOG="$2/changes.tsv"; : > "$CHANGE_LOG"
+            install() { command cp -- "${@: -2:1}" "${@: -1}"; }
+            merge_mount_options /boot nodev,nosuid,noexec
+            [[ ! -s "$3" ]]
+            printf "/dev/sda2 /boot ext4 defaults,nodev,nosuid 0 2\n" > "$4"
+            merge_mount_options /boot nodev,nosuid,noexec
+            [[ "$(grep -Fc "systemctl daemon-reload" "$3")" == 1 ]]
+            grep -Eq "defaults,nodev,nosuid,noexec|defaults,nosuid,nodev,noexec" "$4"
+            merge_mount_options /boot nodev,nosuid,noexec
+            [[ "$(grep -Fc "systemctl daemon-reload" "$3")" == 1 ]]
+        ' _ "$repo_root" "$case_root" "$command_log" "$case_root/fstab" \
+        || fail "fstab /boot no-op and change-triggered daemon-reload regression failed"
+
+    printf 'generated\n' > "$case_root/grub/grub.cfg"
+    : > "$command_log"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_GRUB_DIR="$case_root/grub" \
+        HARDEN_GRUB_POLICY="$case_root/default/99-security-hardening.cfg" \
+        HARDEN_GRUB_LEGACY_AUTH="$case_root/no-legacy-auth" NOOP_COMMAND_LOG="$command_log" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply
+            BACKUP_DIR="$2/backup"; install -d "$BACKUP_DIR"
+            CHANGE_LOG="$2/grub-changes.tsv"; : > "$CHANGE_LOG"
+            transaction_copy() { :; }
+            transaction_restore() { :; }
+            install_managed_file() {
+                local target="$1" temporary
+                MANAGED_FILE_CHANGED=0
+                temporary="$(mktemp)"; cat > "$temporary"
+                if [[ -f "$target" ]] && cmp -s "$temporary" "$target"; then rm -f "$temporary"; return 0; fi
+                command mkdir -p "$(dirname "$target")"; command cp "$temporary" "$target"; rm -f "$temporary"
+                MANAGED_FILE_CHANGED=1
+            }
+            configure_bootloader
+            [[ "$(grep -Fc update-grub "$3")" == 1 ]]
+            [[ "$REBOOT_REQUIRED" == 1 ]]
+            REBOOT_REQUIRED=0
+            configure_bootloader
+            [[ "$(grep -Fc update-grub "$3")" == 1 ]]
+            [[ "$REBOOT_REQUIRED" == 0 ]]
+        ' _ "$repo_root" "$case_root" "$command_log" || fail "GRUB no-op/update and reboot-required regression failed"
+
+    cat > "$case_root/default/rkhunter" <<'EOF'
+CRON_DAILY_RUN="true"
+CRON_DB_UPDATE="true"
+APT_AUTOGEN="true"
+EOF
+    printf 'package-state\n' > "$case_root/dpkg-status"
+    printf 'properties\n' > "$case_root/rkhunter-db/rkhunter.dat"
+    touch -t 202601010100 "$case_root/dpkg-status"
+    touch -t 202601010200 "$case_root/rkhunter-db/rkhunter.dat"
+    : > "$command_log"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_RKHUNTER_DEFAULTS="$case_root/default/rkhunter" \
+        HARDEN_RKHUNTER_PROPERTY_DB="$case_root/rkhunter-db/rkhunter.dat" \
+        HARDEN_RKHUNTER_PENDING_MARKER="$case_root/rkhunter-db/pending" \
+        HARDEN_DPKG_STATUS="$case_root/dpkg-status" NOOP_COMMAND_LOG="$command_log" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply
+            CHANGE_LOG="$2/rkhunter-changes.tsv"; : > "$CHANGE_LOG"
+            install() { command cp -- "${@: -2:1}" "${@: -1}"; }
+            configure_malware_scanner
+            ! grep -Fq "rkhunter --propupd" "$3"
+            sed -i "s/CRON_DB_UPDATE=\"true\"/CRON_DB_UPDATE=\"false\"/" "$4"
+            configure_malware_scanner
+            [[ "$(grep -Fc "rkhunter --propupd" "$3")" == 1 ]]
+            configure_malware_scanner
+            [[ "$(grep -Fc "rkhunter --propupd" "$3")" == 1 ]]
+        ' _ "$repo_root" "$case_root" "$command_log" "$case_root/default/rkhunter" \
+        || fail "rkhunter property-baseline no-op regression failed"
+
+    : > "$command_log"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 NOOP_COMMAND_LOG="$command_log" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        MODE=apply
+        unit_file_exists() { return 0; }
+        disable_service packagekit.service 1
+        [[ ! -s "$2" ]]
+        [[ "${SERVICES_DISABLED[*]}" == *packagekit.service* ]]
+        [[ "${SERVICES_MASKED[*]}" == *packagekit.service* ]]
+    ' _ "$repo_root" "$command_log" || fail "already-disabled/masked service no-op regression failed"
+
+    env HARDEN_SOURCE_ONLY=1 bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        kernel_section="$(sed -n "/^configure_kernel_modules()/,/^}/p" "$1/harden.sh")"
+        grub_section="$(sed -n "/^configure_bootloader()/,/^}/p" "$1/harden.sh")"
+        grep -Fq "INITRAMFS_POLICY_CHANGED" <<<"$kernel_section"
+        grep -Fq "Managed module policy is unchanged" <<<"$kernel_section"
+        grep -Fq "grub_config_changed" <<<"$grub_section"
+        [[ "$(grep -Fc "REBOOT_REQUIRED=1" "$1/harden.sh")" == 2 ]]
+    ' _ "$repo_root" || fail "initramfs/GRUB/reboot-required change gating regressed"
+}
+
 run_iowait_tests() {
     local case_root="$test_root/iowait" mock_bin="$test_root/iowait/bin" count="$test_root/iowait/count"
     install -d "$mock_bin"
@@ -801,6 +1382,12 @@ EOF
 }
 
 case "${HARDEN_REGRESSION_FILTER:-all}" in
+    kernel)
+        run_kernel_gate_test
+        ;;
+    noop)
+        run_runtime_noop_tests
+        ;;
     compiler)
         run_compiler_tests
         ;;
@@ -811,6 +1398,7 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
         run_compiler_tests
         run_binfmt_tests
         run_systemd_idempotency_tests
+        run_runtime_noop_tests
         run_iowait_tests
         ;;
     all)
@@ -823,6 +1411,7 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
         run_compiler_tests
         run_binfmt_tests
         run_systemd_idempotency_tests
+        run_runtime_noop_tests
         run_iowait_tests
         ;;
     *) fail "unknown HARDEN_REGRESSION_FILTER value" ;;

@@ -32,6 +32,43 @@ sudo cp /root/lynis-before-hardening-report.dat ./lynis-before-report.dat
 sudo cp /root/lynis-after-hardening.txt ./lynis-after.log
 ```
 
+### Ubuntu-26.04.1-Retest des Tailscale-/Kernelmodul-Locks
+
+Der bestätigte Boot-Race gilt erst nach einem vollständigen Apply plus Reboot
+als behoben. Verwende den geprüften PR-Commit und führe danach exakt diese
+Abnahme aus; `<TAILSCALE-PEER>` ist durch einen genehmigten Peer zu ersetzen.
+
+1. Gepatchten Commit bereitstellen, `sha256sum -c SHA256SUMS` prüfen und den
+   Apply direkt ohne externe `tee`-Pipe bis Phase 18 ausführen.
+2. System neu starten und die Rückkehr über die zweite SSH-/Recovery-Sitzung
+   bestätigen.
+3. `sysctl kernel.modules_disabled` muss `1` liefern; außerdem
+   `systemctl status kernel-module-lockdown.service --no-pager` prüfen.
+4. `lsmod | grep -E '(^|_)(nf_nat|nft_nat|nft_chain_nat|nft_masq|xt_MASQUERADE|iptable_nat|ip6table_nat)([[:space:]_]|$)'`
+   und `/root/kernel-module-lockdown-report.txt` mit der laufenden
+   Kernel-Konfiguration abgleichen.
+5. `iptables --version`, `ip6tables --version`,
+   `iptables -t nat -S POSTROUTING`, `ip6tables -t nat -S POSTROUTING` sowie
+   beide `-t nat -S ts-postrouting`-Ausgaben prüfen.
+6. `tailscale status` und
+   `tailscale status --json | jq '{BackendState,Health}'` müssen ohne aktuelle
+   Router-/Netfilter-Healthwarnung sein.
+7. `tailscale ping <TAILSCALE-PEER>` ausführen; keine `tailscale up/set`-
+   oder Preference-Änderung gehört zu diesem Test.
+8. `nft list table inet hardening_filter` und die Tailscale-eigenen Tabellen/
+   Chains prüfen.
+9. `systemctl --failed --no-pager` muss auf neue Hardening-/Tailscale-Fehler
+   geprüft werden.
+10. AIDE mit dem tatsächlich konfigurierten Check-Service und anschließendem
+    Timerstatus prüfen, z. B. `systemctl start dailyaidecheck.service` und
+    `systemctl status dailyaidecheck.service dailyaidecheck.timer --no-pager`.
+11. `apt-get check` muss erfolgreich sein.
+
+Schlägt das Netfilter-/Tailscale-Gate fehl, muss der Lock beim Apply bzw. beim
+nächsten Boot mit noch schreibbarem Control bei 0 bleiben und die Unit darf
+nicht erfolgreich erscheinen. Sichere dann Diagnosebericht und Journal, ohne
+Tailscale-Prefs automatisch zu verändern.
+
 Für die Findings #4, #12, #17, #18, #19 und #20 zusätzlich prüfen:
 
 - `aide-lynis-FINT-4402-evidence.txt`, AIDE-Konfigurationsprüfung,

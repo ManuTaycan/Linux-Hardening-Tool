@@ -72,6 +72,24 @@ blind killen oder Storage zurücksetzen.
 Diese aggressive Einstellung ist bis zum Reboot irreversibel. Teste benötigte
 Kernelmodule vorher und stelle bei Problemen per Reboot/Snapshot wieder her.
 
+Bei aktivem Tailscale setzt der späte Lock den Wert nur nach erfolgreicher
+Netfilter-/NAT-Vorladung und Dual-Stack-Runtimeprüfung. Prüfe bei einer
+fehlgeschlagenen `kernel-module-lockdown.service` zuerst
+`/root/kernel-module-lockdown-report.txt` und
+`journalctl -u kernel-module-lockdown.service -b`. Ein fehlgeschlagenes Gate
+ist absichtlich kein Erfolg: `kernel.modules_disabled` bleibt 0, damit der
+Systemzugriff erhalten und eine gezielte Reparatur möglich bleibt. Das Gate
+ändert keine Tailscale-Routen, Exit-Node-, Accept-Routes- oder Advertise-Routes-
+Einstellungen. Ist der Wert bereits 1, erfolgen keine `modprobe`-Versuche.
+Auf einem bereits fehlerhaft gesperrten Host installiert ein aktualisierter
+Apply-Lauf zwar den korrigierten Helper, die Preload-/Lock-Units und das
+Tailscale-Drop-in, kann fehlende Module im laufenden Kernel aber absichtlich
+nicht nachladen. Die Runtime-Reparatur wird erst nach einem kontrollierten
+Reboot wirksam: Die neue Preload-Unit läuft vor `tailscaled.service`, danach
+validiert die späte Lock-Unit denselben Gate-Pfad. Ein anschließender zweiter
+Apply-Lauf muss den bereits gesetzten Wert ohne `modprobe` idempotent
+bestätigen.
+
 ## Lauf endet vor Phase 18
 
 Der EXIT-Trap meldet die aktuelle Phase. Lies `/var/log/server-hardening.log`,

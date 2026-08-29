@@ -70,6 +70,9 @@ FIREWALL_COMPLETED=0
 APPARMOR_COMPLETED=0
 SYSTEMD_EXPOSURE_RESULT=""
 IOWAIT_PREVIOUS_PIDS=""
+MANAGED_FILE_CHANGED=0
+MANAGED_SETTING_CHANGED=0
+INITRAMFS_POLICY_CHANGED=0
 
 readonly COLOR_RESET=$'\033[0m'
 readonly COLOR_DIM=$'\033[2m'
@@ -485,6 +488,7 @@ transaction_restore() {
 
 install_managed_file() {
     local destination="$1" mode="${2:-0644}" owner="${3:-root}" group="${4:-root}"
+    MANAGED_FILE_CHANGED=0
     if [[ "$MODE" == "dry-run" ]]; then
         cat >/dev/null || return 1
         log INFO "Would install managed file ${destination} (${owner}:${group} ${mode})"
@@ -507,12 +511,14 @@ install_managed_file() {
         return 1
     fi
     rm -f -- "$temporary" || return 1
+    MANAGED_FILE_CHANGED=1
     record_change "Installed managed file ${destination}"
     return 0
 }
 
 replace_setting() {
     local file="$1" key="$2" value="$3" separator="${4:- }"
+    MANAGED_SETTING_CHANGED=0
     if [[ "$MODE" == "dry-run" ]]; then
         log INFO "Would set ${key}${separator}${value} in ${file}"
         return 0
@@ -528,8 +534,14 @@ replace_setting() {
         { print }
         END { if (!done) print key sep value }
     ' "$file" > "$temporary"
+    if cmp -s "$temporary" "$file"; then
+        rm -f "$temporary"
+        log INFO "Setting already current: ${key} in ${file}"
+        return 0
+    fi
     install -o root -g root -m "$(stat -c '%a' "$file" 2>/dev/null || printf 0644)" "$temporary" "$file"
     rm -f "$temporary"
+    MANAGED_SETTING_CHANGED=1
     record_change "Set ${key} in ${file}"
 }
 
@@ -1371,6 +1383,9 @@ configure_binfmt_misc() {
 install binfmt_misc /bin/false
 blacklist binfmt_misc
 EOF
+    if [[ "$MANAGED_FILE_CHANGED" -eq 1 ]]; then
+        INITRAMFS_POLICY_CHANGED=1
+    fi
     if unit_file_exists systemd-binfmt.service; then
         disable_service systemd-binfmt.service 1
     fi
@@ -1418,10 +1433,16 @@ configure_kernel_modules() {
     else
         record_skip "USB-1000" "USB storage blocking requires --aggressive after verifying console and storage dependencies"
     fi
+    INITRAMFS_POLICY_CHANGED=0
     printf '%s\n' "$content" | install_managed_file /etc/modprobe.d/99-security-hardening.conf 0644
+    if [[ "$MANAGED_FILE_CHANGED" -eq 1 ]]; then
+        INITRAMFS_POLICY_CHANGED=1
+    fi
     configure_binfmt_misc
     if [[ "$MODE" == "apply" ]]; then
-        if command -v update-initramfs >/dev/null 2>&1; then
+        if [[ "$INITRAMFS_POLICY_CHANGED" -ne 1 ]]; then
+            log INFO "Managed module policy is unchanged; update-initramfs is not required"
+        elif command -v update-initramfs >/dev/null 2>&1; then
             if run_streamed update-initramfs -u; then
                 REBOOT_REQUIRED=1
             else
@@ -1433,50 +1454,483 @@ configure_kernel_modules() {
     fi
 }
 
-prepare_kernel_module_lock() {
+kernel_config_value() {
+    local symbol="$1" config_file="${HARDEN_KERNEL_CONFIG:-/boot/config-$(uname -r)}"
+    local value=""
+    if [[ -r "$config_file" ]]; then
+        value="$(awk -F= -v symbol="$symbol" '$1 == symbol {value=$2} END {print value}' "$config_file")"
+    elif [[ -r "${HARDEN_PROC_CONFIG:-/proc/config.gz}" ]] && command -v gzip >/dev/null 2>&1; then
+        value="$(gzip -cd "${HARDEN_PROC_CONFIG:-/proc/config.gz}" 2>/dev/null \
+            | awk -F= -v symbol="$symbol" '$1 == symbol {value=$2} END {print value}')"
+    else
+        printf '%s\n' unknown
+        return 0
+    fi
+    case "$value" in
+        y) printf '%s\n' builtin ;;
+        m) printf '%s\n' module ;;
+        *) printf '%s\n' unavailable ;;
+    esac
+    return 0
+}
+
+kernel_module_is_loaded() {
+    local module="${1//-/_}" sys_module_root="${HARDEN_SYS_MODULE_ROOT:-/sys/module}"
+    local proc_modules="${HARDEN_PROC_MODULES:-/proc/modules}"
+    [[ -d "$sys_module_root/$module" ]] && return 0
+    [[ -r "$proc_modules" ]] \
+        && awk -v module="$module" '$1 == module {found=1} END {exit !found}' "$proc_modules"
+}
+
+kernel_lock_report_start() {
+    local report="${HARDEN_KERNEL_LOCK_REPORT:-/root/kernel-module-lockdown-report.txt}"
+    local parent
+    parent="$(dirname -- "$report")"
+    if [[ ! -d "$parent" ]]; then
+        install -d -m 0700 "$parent" || return 1
+    fi
+    KERNEL_LOCK_REPORT_WORK="${report}.tmp.$$"
+    : > "$KERNEL_LOCK_REPORT_WORK" || return 1
+    chmod 0600 "$KERNEL_LOCK_REPORT_WORK" || return 1
+    printf 'kernel-module-lockdown diagnostic\ngenerated=%s\nkernel=%s\n' \
+        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$(uname -r)" >> "$KERNEL_LOCK_REPORT_WORK"
+    return 0
+}
+
+kernel_lock_report_line() {
+    printf '%s=%s\n' "$1" "$2" >> "$KERNEL_LOCK_REPORT_WORK"
+}
+
+kernel_lock_report_finish() {
+    local report="${HARDEN_KERNEL_LOCK_REPORT:-/root/kernel-module-lockdown-report.txt}"
+    mv -f -- "$KERNEL_LOCK_REPORT_WORK" "$report"
+    chmod 0600 "$report"
+}
+
+kernel_lock_fail() {
+    local reason="$1"
+    kernel_lock_report_line gate-result "BLOCKED"
+    kernel_lock_report_line gate-error "$reason"
+    kernel_lock_report_finish || true
+    printf 'ERROR: kernel module lock blocked: %s\n' "$reason" >&2
+    return 1
+}
+
+tailscale_kernel_runtime_ready() {
+    local family command version summary backend chain_output="" health_problem=0 router_v4=0 router_v6=0
+    local ipv4_masquerade=0 ipv6_masquerade=0
+    KERNEL_GATE_FAILURE=""
+    if ! systemctl is-active --quiet server-hardening-firewall.service 2>/dev/null; then
+        KERNEL_GATE_FAILURE="server-hardening-firewall.service is not active"
+        return 1
+    fi
+    kernel_lock_report_line firewall-service active
+    if ! systemctl is-active --quiet tailscaled.service 2>/dev/null; then
+        KERNEL_GATE_FAILURE="tailscaled.service stopped before the final lock gate"
+        return 1
+    fi
+    for family in ipv4 ipv6; do
+        if [[ "$family" == ipv4 ]]; then command=iptables; else command=ip6tables; fi
+        if ! command -v "$command" >/dev/null 2>&1; then
+            KERNEL_GATE_FAILURE="${command} is unavailable"
+            return 1
+        fi
+        version="$($command --version 2>/dev/null || true)"
+        kernel_lock_report_line "${family}-iptables-backend" "${version:-unavailable}"
+        if [[ "$version" != *nf_tables* ]]; then
+            KERNEL_GATE_FAILURE="${command} is not using the nf_tables backend"
+            return 1
+        fi
+        if ! "$command" -w -t nat -S POSTROUTING >/dev/null 2>&1; then
+            KERNEL_GATE_FAILURE="${family} nat/POSTROUTING is unavailable"
+            return 1
+        fi
+        kernel_lock_report_line "${family}-nat-postrouting" OK
+        chain_output="$($command -w -t nat -S ts-postrouting 2>/dev/null || true)"
+        if ! "$command" -w -t filter -S ts-input >/dev/null 2>&1 \
+            || ! "$command" -w -t filter -S ts-forward >/dev/null 2>&1 \
+            || [[ -z "$chain_output" ]] \
+            || ! "$command" -w -t filter -C INPUT -j ts-input >/dev/null 2>&1 \
+            || ! "$command" -w -t filter -C FORWARD -j ts-forward >/dev/null 2>&1 \
+            || ! "$command" -w -t nat -C POSTROUTING -j ts-postrouting >/dev/null 2>&1; then
+            KERNEL_GATE_FAILURE="${family} Tailscale netfilter chains or hooks are incomplete"
+            return 1
+        fi
+        kernel_lock_report_line "${family}-tailscale-chains" OK
+        if grep -Fq MASQUERADE <<<"$chain_output"; then
+            if [[ "$family" == ipv4 ]]; then ipv4_masquerade=1; else ipv6_masquerade=1; fi
+        fi
+    done
+    if ! command -v tailscale >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+        KERNEL_GATE_FAILURE="tailscale status or the Python JSON parser is unavailable"
+        return 1
+    fi
+    if ! summary="$(tailscale status --json 2>/dev/null | python3 -c '
+import json, re, sys
+import ipaddress
+data = json.load(sys.stdin)
+print("backend=" + str(data.get("BackendState", "")))
+node = data.get("Self") or {}
+routes = node.get("PrimaryRoutes") or []
+router4 = bool(node.get("ExitNodeOption"))
+router6 = bool(node.get("ExitNodeOption"))
+for route in routes:
+    try:
+        network = ipaddress.ip_network(str(route), strict=False)
+        router4 = router4 or network.version == 4
+        router6 = router6 or network.version == 6
+    except ValueError:
+        pass
+print("router-v4=" + ("1" if router4 else "0"))
+print("router-v6=" + ("1" if router6 else "0"))
+for item in data.get("Health") or []:
+    if re.search(r"router|netfilter|firewall|iptables|nftables|masquerad|postrouting|forwarding", str(item), re.I):
+        print("health-problem=1")
+')"; then
+        KERNEL_GATE_FAILURE="tailscale status --json could not be parsed"
+        return 1
+    fi
+    backend="$(awk -F= '$1 == "backend" {print substr($0, index($0, "=") + 1)}' <<<"$summary")"
+    grep -Fxq 'health-problem=1' <<<"$summary" && health_problem=1
+    grep -Fxq 'router-v4=1' <<<"$summary" && router_v4=1
+    grep -Fxq 'router-v6=1' <<<"$summary" && router_v6=1
+    kernel_lock_report_line tailscale-backend-state "${backend:-unknown}"
+    kernel_lock_report_line tailscale-router-role "ipv4=${router_v4};ipv6=${router_v6}"
+    kernel_lock_report_line tailscale-router-netfilter-health "$([[ "$health_problem" -eq 0 ]] && printf clear || printf warning)"
+    if [[ "$backend" != Running ]]; then
+        KERNEL_GATE_FAILURE="Tailscale backend state is ${backend:-unknown}, not Running"
+        return 1
+    fi
+    if [[ "$health_problem" -ne 0 ]]; then
+        KERNEL_GATE_FAILURE="Tailscale reports a current router/netfilter health warning"
+        return 1
+    fi
+    if [[ "$router_v4" -eq 1 && "$ipv4_masquerade" -ne 1 ]]; then
+        KERNEL_GATE_FAILURE="IPv4 Tailscale router role lacks a MASQUERADE rule in nat/ts-postrouting"
+        return 1
+    fi
+    if [[ "$router_v6" -eq 1 && "$ipv6_masquerade" -ne 1 ]]; then
+        KERNEL_GATE_FAILURE="IPv6 Tailscale router role lacks a MASQUERADE rule in nat/ts-postrouting"
+        return 1
+    fi
+    kernel_lock_report_line tailscale-router-masquerade "ipv4=${ipv4_masquerade};ipv6=${ipv6_masquerade}"
+    return 0
+}
+
+preload_tailscale_kernel_modules() {
+    local allow_load="${1:-1}" symbol module scope state loaded
+    local unknown_config=0
+    declare -A seen_modules=()
+    while IFS=: read -r symbol module scope; do
+        [[ -n "$symbol" ]] || continue
+        state="$(kernel_config_value "$symbol")"
+        loaded=no
+        kernel_module_is_loaded "$module" && loaded=yes
+        kernel_lock_report_line "$symbol" "${state};module=${module};scope=${scope};loaded=${loaded}"
+        if [[ "$state" == unknown ]]; then
+            unknown_config=1
+            continue
+        fi
+        if [[ "$state" == module && -z "${seen_modules[$module]+present}" ]]; then
+            seen_modules["$module"]=1
+            if [[ "$loaded" == no ]]; then
+                if [[ "$allow_load" -ne 1 ]]; then
+                    kernel_lock_report_line "preloaded-${module}" blocked-already-locked
+                    continue
+                fi
+                if ! modprobe "$module"; then
+                    kernel_lock_fail "modprobe ${module} failed for ${symbol}"
+                    return 1
+                fi
+                if ! kernel_module_is_loaded "$module"; then
+                    kernel_lock_fail "${module} did not become loaded after modprobe"
+                    return 1
+                fi
+                kernel_lock_report_line "preloaded-${module}" yes
+            else
+                kernel_lock_report_line "preloaded-${module}" already-loaded
+            fi
+        fi
+    done <<'EOF'
+CONFIG_NF_TABLES:nf_tables:common
+CONFIG_NF_CONNTRACK:nf_conntrack:common
+CONFIG_NF_NAT:nf_nat:common
+CONFIG_NFT_NAT:nft_nat:nft
+CONFIG_NFT_NAT:nft_chain_nat:nft
+CONFIG_NFT_MASQ:nft_masq:nft
+CONFIG_NFT_COMPAT:nft_compat:common
+CONFIG_NETFILTER_XTABLES:x_tables:common
+CONFIG_NETFILTER_XT_MARK:xt_mark:common
+CONFIG_NETFILTER_XT_NAT:xt_nat:common
+CONFIG_NETFILTER_XT_TARGET_MASQUERADE:xt_MASQUERADE:common
+CONFIG_IP_NF_IPTABLES:ip_tables:ipv4
+CONFIG_IP_NF_NAT:iptable_nat:ipv4
+CONFIG_IP6_NF_IPTABLES:ip6_tables:ipv6
+CONFIG_IP6_NF_NAT:ip6table_nat:ipv6
+EOF
+    if [[ "$unknown_config" -ne 0 && "$allow_load" -eq 1 ]]; then
+        kernel_lock_fail "the running-kernel configuration could not be read"
+        return 1
+    fi
+    return 0
+}
+
+kernel_module_preload_gate() {
+    local module_control="${HARDEN_MODULES_DISABLED_PATH:-/proc/sys/kernel/modules_disabled}" before=""
+    kernel_lock_report_start || { printf 'ERROR: cannot create kernel module preload diagnostic report\n' >&2; return 1; }
+    before="$(tr -d '[:space:]' < "$module_control" 2>/dev/null || true)"
+    kernel_lock_report_line stage preload-before-tailscaled
+    kernel_lock_report_line modules-disabled-before "${before:-unknown}"
+    if [[ "$before" != 0 ]]; then
+        kernel_lock_fail "cannot preload Tailscale Netfilter prerequisites because kernel.modules_disabled is ${before:-unreadable}"
+        return 1
+    fi
+    preload_tailscale_kernel_modules || return 1
+    kernel_lock_report_line gate-result PRELOADED
+    kernel_lock_report_finish || return 1
+    printf 'OK: preloaded running-kernel Tailscale Netfilter/NAT prerequisites\n'
+    return 0
+}
+
+kernel_lock_gate() {
     local module_control="${HARDEN_MODULES_DISABLED_PATH:-/proc/sys/kernel/modules_disabled}"
-    local lock_unit="${HARDEN_MODULE_LOCK_UNIT:-/etc/systemd/system/kernel-module-lockdown.service}"
-    if [[ "$AGGRESSIVE" -ne 1 ]]; then
+    local before="" tailscale_state=inactive attempts interval attempt
+    kernel_lock_report_start || { printf 'ERROR: cannot create kernel module lock diagnostic report\n' >&2; return 1; }
+    before="$(tr -d '[:space:]' < "$module_control" 2>/dev/null || true)"
+    kernel_lock_report_line stage final-lock
+    kernel_lock_report_line modules-disabled-before "${before:-unknown}"
+    if systemctl is-active --quiet tailscaled.service 2>/dev/null; then tailscale_state=active; fi
+    kernel_lock_report_line tailscale-service "$tailscale_state"
+    if [[ "$before" == 1 ]]; then
+        preload_tailscale_kernel_modules 0 || true
+        kernel_lock_report_line module-preload skipped-already-locked
+        if [[ "$tailscale_state" == active ]]; then
+            if tailscale_kernel_runtime_ready; then
+                kernel_lock_report_line already-locked-runtime-check OK
+            else
+                kernel_lock_report_line already-locked-runtime-check "FAILED; reboot-repair-required; ${KERNEL_GATE_FAILURE:-unknown}"
+            fi
+        else
+            kernel_lock_report_line already-locked-runtime-check not-required-inactive
+        fi
+        kernel_lock_report_line gate-result already-locked-idempotent
+        kernel_lock_report_finish || return 1
+        printf 'INFO: kernel.modules_disabled is already 1; no module load was attempted\n'
         return 0
     fi
-    if [[ ! -e "$module_control" ]]; then
-        return 0
+    [[ "$before" == 0 ]] || { kernel_lock_fail "kernel.modules_disabled runtime value is ${before:-unreadable}"; return 1; }
+    if [[ "$tailscale_state" == active ]]; then
+        preload_tailscale_kernel_modules || return 1
+        attempts="${HARDEN_KERNEL_GATE_ATTEMPTS:-60}"
+        interval="${HARDEN_KERNEL_GATE_INTERVAL:-1}"
+        [[ "$attempts" =~ ^[1-9][0-9]*$ ]] || attempts=60
+        [[ "$interval" =~ ^[0-9]+([.][0-9]+)?$ ]] || interval=1
+        for ((attempt=1; attempt<=attempts; attempt++)); do
+            if tailscale_kernel_runtime_ready; then
+                kernel_lock_report_line runtime-attempt "$attempt"
+                break
+            fi
+            if ((attempt == attempts)); then
+                kernel_lock_fail "${KERNEL_GATE_FAILURE:-Tailscale runtime prerequisites remained unproven}"
+                return 1
+            fi
+            sleep "$interval"
+        done
+    elif systemctl is-failed --quiet tailscaled.service 2>/dev/null \
+        || systemctl is-failed --quiet kernel-module-netfilter-preload.service 2>/dev/null; then
+        kernel_lock_fail "Tailscale or its Netfilter preload prerequisite failed during this boot"
+        return 1
+    else
+        kernel_lock_report_line tailscale-runtime-check not-required-inactive
     fi
-    if [[ "$MODE" == "dry-run" ]]; then
-        log INFO "Would install, but not enable or start, the late kernel module lock unit until the final gate"
-        return 0
+    if ! sysctl -w kernel.modules_disabled=1 >/dev/null \
+        || [[ "$(tr -d '[:space:]' < "$module_control" 2>/dev/null || true)" != 1 ]]; then
+        kernel_lock_fail "final kernel.modules_disabled=1 write or verification failed"
+        return 1
     fi
-    install_managed_file "$lock_unit" 0644 <<'EOF'
+    kernel_lock_report_line modules-disabled-after 1
+    kernel_lock_report_line gate-result LOCKED
+    kernel_lock_report_finish || return 1
+    printf 'OK: verified runtime prerequisites and set kernel.modules_disabled=1\n'
+    return 0
+}
+
+render_kernel_module_lock_helper() {
+    printf '%s\n' '#!/usr/bin/env bash' 'set -Eeuo pipefail' "IFS=\$'\\n\\t'" 'umask 077'
+    declare -f kernel_config_value kernel_module_is_loaded kernel_lock_report_start \
+        kernel_lock_report_line kernel_lock_report_finish kernel_lock_fail \
+        tailscale_kernel_runtime_ready preload_tailscale_kernel_modules \
+        kernel_module_preload_gate kernel_lock_gate
+    printf '%s\n' 'case "${1:-}" in --preload) kernel_module_preload_gate ;; "") kernel_lock_gate ;; *) exit 64 ;; esac'
+}
+
+render_kernel_module_lock_unit() {
+    local module_control="$1" lock_helper="$2"
+    cat <<EOF
 [Unit]
-Description=Late irreversible kernel module loading lock
+Description=Late verified irreversible kernel module loading lock
 Documentation=man:sysctl(8)
 Wants=network-online.target
-After=network-online.target apparmor.service tailscaled.service server-hardening-firewall.service
+Requires=server-hardening-firewall.service
+After=network-online.target server-hardening-firewall.service apparmor.service kernel-module-netfilter-preload.service tailscaled.service
+ConditionPathExists=${module_control}
 
 [Service]
 Type=oneshot
-ExecStart=/usr/sbin/sysctl -w kernel.modules_disabled=1
+ExecStart=${lock_helper}
 RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
 EOF
-    if systemctl daemon-reload; then
-        if [[ "$(sysctl -n kernel.modules_disabled 2>/dev/null || true)" != "1" ]]; then
-            if ! systemctl disable kernel-module-lockdown.service >/dev/null 2>&1; then
-                record_skip "kernel.modules_disabled" "could not disable the late lock unit before final prerequisite validation"
-                return 1
-            fi
-        fi
-        record_change "Prepared the late kernel module loading lock unit without enabling or starting it before the final gate"
-    else
-        record_skip "kernel.modules_disabled" "late lock unit could not be loaded; runtime locking will be skipped"
+}
+
+render_kernel_module_preload_unit() {
+    local module_control="$1" lock_helper="$2"
+    cat <<EOF
+[Unit]
+Description=Preload running-kernel Netfilter/NAT modules before Tailscale
+Documentation=man:modprobe(8)
+After=systemd-modules-load.service
+Before=tailscaled.service
+ConditionPathExists=${module_control}
+
+[Service]
+Type=oneshot
+ExecStart=${lock_helper} --preload
+RemainAfterExit=yes
+EOF
+}
+
+render_tailscale_preload_dropin() {
+    cat <<'EOF'
+[Unit]
+Requires=kernel-module-netfilter-preload.service
+After=kernel-module-netfilter-preload.service
+EOF
+}
+
+rollback_kernel_module_lock_install() {
+    local lock_helper="$1" lock_unit="$2" preload_unit="$3" tailscale_dropin="$4"
+    transaction_restore "$tailscale_dropin" tailscaled-netfilter-preload.conf
+    transaction_restore "$preload_unit" kernel-module-netfilter-preload.service
+    transaction_restore "$lock_unit" kernel-module-lockdown.service
+    transaction_restore "$lock_helper" kernel-module-lockdown-helper
+    run_streamed systemctl daemon-reload || true
+}
+
+prepare_kernel_module_lock() {
+    local module_control="${HARDEN_MODULES_DISABLED_PATH:-/proc/sys/kernel/modules_disabled}"
+    local lock_unit="${HARDEN_MODULE_LOCK_UNIT:-/etc/systemd/system/kernel-module-lockdown.service}"
+    local lock_helper="${HARDEN_MODULE_LOCK_HELPER:-/usr/local/libexec/server-hardening/kernel-module-lockdown}"
+    local preload_unit="${HARDEN_MODULE_PRELOAD_UNIT:-/etc/systemd/system/kernel-module-netfilter-preload.service}"
+    local tailscale_dropin="${HARDEN_TAILSCALE_PRELOAD_DROPIN:-/etc/systemd/system/tailscaled.service.d/99-netfilter-module-preload.conf}"
+    local candidate changed=0 enabled_state="" tailscale_unit=0
+    if [[ "$AGGRESSIVE" -ne 1 || ! -e "$module_control" ]]; then
+        return 0
     fi
+    if [[ "$MODE" == "dry-run" ]]; then
+        log INFO "Would install the late prerequisite/preload verifier and lock unit without enabling or starting them before the final gate"
+        return 0
+    fi
+    transaction_copy "$lock_helper" kernel-module-lockdown-helper
+    transaction_copy "$lock_unit" kernel-module-lockdown.service
+    transaction_copy "$preload_unit" kernel-module-netfilter-preload.service
+    transaction_copy "$tailscale_dropin" tailscaled-netfilter-preload.conf
+    candidate="$(mktemp)"
+    render_kernel_module_lock_helper > "$candidate"
+    if ! install_managed_file "$lock_helper" 0755 < "$candidate"; then
+        rm -f -- "$candidate"
+        rollback_kernel_module_lock_install "$lock_helper" "$lock_unit" "$preload_unit" "$tailscale_dropin"
+        record_skip "kernel.modules_disabled" "late-lock helper installation failed and was rolled back"
+        return 1
+    fi
+    rm -f -- "$candidate"
+    [[ "$MANAGED_FILE_CHANGED" -eq 0 ]] || changed=1
+    candidate="$(mktemp --suffix=.service)"
+    render_kernel_module_lock_unit "$module_control" "$lock_helper" > "$candidate"
+    if ! systemd_verify_unit "$candidate"; then
+        rm -f -- "$candidate"
+        rollback_kernel_module_lock_install "$lock_helper" "$lock_unit" "$preload_unit" "$tailscale_dropin"
+        record_skip "kernel.modules_disabled" "candidate late-lock unit failed systemd-analyze verify"
+        return 1
+    fi
+    if ! install_managed_file "$lock_unit" 0644 < "$candidate"; then
+        rm -f -- "$candidate"
+        rollback_kernel_module_lock_install "$lock_helper" "$lock_unit" "$preload_unit" "$tailscale_dropin"
+        record_skip "kernel.modules_disabled" "late-lock unit installation failed and was rolled back"
+        return 1
+    fi
+    [[ "$MANAGED_FILE_CHANGED" -eq 0 ]] || changed=1
+    rm -f -- "$candidate"
+    if unit_file_exists tailscaled.service; then
+        tailscale_unit=1
+        candidate="$(mktemp --suffix=.service)"
+        render_kernel_module_preload_unit "$module_control" "$lock_helper" > "$candidate"
+        if ! systemd_verify_unit "$candidate"; then
+            rm -f -- "$candidate"
+            rollback_kernel_module_lock_install "$lock_helper" "$lock_unit" "$preload_unit" "$tailscale_dropin"
+            record_skip "kernel.modules_disabled" "candidate Tailscale Netfilter preload unit failed systemd-analyze verify"
+            return 1
+        fi
+        if ! install_managed_file "$preload_unit" 0644 < "$candidate"; then
+            rm -f -- "$candidate"
+            rollback_kernel_module_lock_install "$lock_helper" "$lock_unit" "$preload_unit" "$tailscale_dropin"
+            record_skip "kernel.modules_disabled" "Tailscale Netfilter preload unit installation failed and was rolled back"
+            return 1
+        fi
+        [[ "$MANAGED_FILE_CHANGED" -eq 0 ]] || changed=1
+        rm -f -- "$candidate"
+        candidate="$(mktemp)"
+        render_tailscale_preload_dropin > "$candidate"
+        if ! install_managed_file "$tailscale_dropin" 0644 < "$candidate"; then
+            rm -f -- "$candidate"
+            rollback_kernel_module_lock_install "$lock_helper" "$lock_unit" "$preload_unit" "$tailscale_dropin"
+            record_skip "kernel.modules_disabled" "Tailscale preload drop-in installation failed and was rolled back"
+            return 1
+        fi
+        rm -f -- "$candidate"
+        [[ "$MANAGED_FILE_CHANGED" -eq 0 ]] || changed=1
+    fi
+    if ! systemd_verify_unit "$lock_unit"; then
+        rollback_kernel_module_lock_install "$lock_helper" "$lock_unit" "$preload_unit" "$tailscale_dropin"
+        record_skip "kernel.modules_disabled" "installed late-lock unit failed systemd-analyze verify"
+        return 1
+    fi
+    if [[ "$tailscale_unit" -eq 1 ]] && { ! systemd_verify_unit "$preload_unit" \
+        || ! systemd_verify_unit tailscaled.service; }; then
+        rollback_kernel_module_lock_install "$lock_helper" "$lock_unit" "$preload_unit" "$tailscale_dropin"
+        record_skip "kernel.modules_disabled" "installed Tailscale preload unit/drop-in failed systemd-analyze verify"
+        return 1
+    fi
+    if [[ "$changed" -eq 1 ]] && ! run_streamed systemctl daemon-reload; then
+        rollback_kernel_module_lock_install "$lock_helper" "$lock_unit" "$preload_unit" "$tailscale_dropin"
+        record_skip "kernel.modules_disabled" "late lock unit could not be loaded; runtime locking will be skipped"
+        return 1
+    fi
+    if [[ "$(tr -d '[:space:]' < "$module_control" 2>/dev/null || true)" != 1 ]]; then
+        enabled_state="$(systemctl is-enabled kernel-module-lockdown.service 2>/dev/null || true)"
+        if [[ "$enabled_state" != disabled && "$enabled_state" != masked ]] \
+            && ! systemctl disable kernel-module-lockdown.service >/dev/null 2>&1; then
+            rollback_kernel_module_lock_install "$lock_helper" "$lock_unit" "$preload_unit" "$tailscale_dropin"
+            record_skip "kernel.modules_disabled" "could not disable the late lock unit before final prerequisite validation"
+            return 1
+        fi
+    fi
+    if [[ "$changed" -eq 1 ]]; then
+        record_change "Installed and verified deterministic pre-tailscaled Netfilter preload plus the Tailscale-aware late kernel module lock helper/unit"
+    else
+        log INFO "Late kernel module lock helper and unit are already current and verified"
+    fi
+    return 0
 }
 
 lock_kernel_modules_late() {
     local module_control="${HARDEN_MODULES_DISABLED_PATH:-/proc/sys/kernel/modules_disabled}"
     local lock_unit="${HARDEN_MODULE_LOCK_UNIT:-/etc/systemd/system/kernel-module-lockdown.service}"
+    local lock_helper="${HARDEN_MODULE_LOCK_HELPER:-/usr/local/libexec/server-hardening/kernel-module-lockdown}"
+    local report="${HARDEN_KERNEL_LOCK_REPORT:-/root/kernel-module-lockdown-report.txt}"
+    local enabled_state=""
     if [[ "$AGGRESSIVE" -ne 1 ]]; then
         record_skip "kernel.modules_disabled" "requires --aggressive because the change is irreversible until reboot"
         return 0
@@ -1486,7 +1940,7 @@ lock_kernel_modules_late() {
         return 0
     fi
     if [[ "$MODE" == "dry-run" ]]; then
-        log WARN "Would set kernel.modules_disabled=1 only at the final lock-down stage after module, network, firewall, AppArmor, validation, and AIDE work"
+        log WARN "Would preload only running-kernel Netfilter/NAT modules needed by active Tailscale, verify dual-stack runtime health, then set kernel.modules_disabled=1 at the final gate"
         return 0
     fi
     if [[ "$CURRENT_PHASE" -ne 17 || "$NETWORK_HARDENING_COMPLETED" -ne 1 \
@@ -1495,23 +1949,30 @@ lock_kernel_modules_late() {
         record_skip "kernel.modules_disabled" "final prerequisite gate failed (phase=${CURRENT_PHASE}, network=${NETWORK_HARDENING_COMPLETED}, firewall=${FIREWALL_COMPLETED}, AppArmor=${APPARMOR_COMPLETED}, validation=${VALIDATION_COMPLETED}, AIDE=${AIDE_STATUS})"
         return 1
     fi
-    [[ -f "$lock_unit" ]] \
-        || { record_skip "kernel.modules_disabled" "late lock unit preparation was not completed"; return 1; }
-    if [[ "$(sysctl -n kernel.modules_disabled 2>/dev/null || true)" == "1" ]]; then
-        systemctl enable kernel-module-lockdown.service >/dev/null 2>&1 || true
-        [[ "$(sysctl -n kernel.modules_disabled 2>/dev/null || true)" == "1" ]] || return 1
-        log INFO "Kernel module loading was already locked; verified runtime value 1 and retained the late-boot unit"
-        return 0
+    [[ -f "$lock_unit" && -x "$lock_helper" ]] \
+        || { record_skip "kernel.modules_disabled" "late lock unit/helper preparation was not completed"; return 1; }
+    enabled_state="$(systemctl is-enabled kernel-module-lockdown.service 2>/dev/null || true)"
+    if [[ "$enabled_state" != enabled ]] && ! run_streamed systemctl enable kernel-module-lockdown.service; then
+        record_skip "kernel.modules_disabled" "could not enable the verified late-boot unit"
+        return 1
     fi
-    log WARN "Final irreversible step: disabling further kernel module loading until reboot"
-    if systemctl enable kernel-module-lockdown.service \
-        && sysctl -w kernel.modules_disabled=1 \
-        && [[ "$(sysctl -n kernel.modules_disabled 2>/dev/null || true)" == "1" ]]; then
-        record_change "Set and verified kernel.modules_disabled=1 at the final prerequisite gate and enabled the late-boot unit"
-        return 0
+    log WARN "Final irreversible step: verifying Tailscale/netfilter prerequisites before disabling further kernel module loading until reboot"
+    if ! run_streamed kernel_lock_gate; then
+        [[ ! -f "$report" || -z "$BACKUP_DIR" ]] || cp -a -- "$report" "$BACKUP_DIR/kernel-module-lockdown-report.txt"
+        record_skip "kernel.modules_disabled" "the Tailscale/netfilter-aware final gate failed; module loading remains enabled and the failure is recorded in ${report}"
+        return 1
     fi
-    record_skip "kernel.modules_disabled" "the final runtime write failed; the failure was not hidden"
-    return 1
+    [[ ! -f "$report" || -z "$BACKUP_DIR" ]] || cp -a -- "$report" "$BACKUP_DIR/kernel-module-lockdown-report.txt"
+    if [[ "$(tr -d '[:space:]' < "$module_control" 2>/dev/null || true)" != 1 ]]; then
+        record_skip "kernel.modules_disabled" "the helper returned success but runtime verification is not 1"
+        return 1
+    fi
+    if grep -Fq 'gate-result=already-locked-idempotent' "$report" 2>/dev/null; then
+        log INFO "Kernel module loading was already locked; verified runtime value 1 without modprobe and retained the late-boot unit"
+    else
+        record_change "Preloaded running-kernel Tailscale NAT prerequisites, validated dual-stack netfilter health, then set and verified kernel.modules_disabled=1"
+    fi
+    return 0
 }
 
 detect_ssh_context() {
@@ -1578,6 +2039,26 @@ supported_ssh_list() {
     printf '%s' "$output"
 }
 
+render_server_hardening_firewall_unit() {
+    cat <<'EOF'
+[Unit]
+Description=Server hardening owned nftables table
+Wants=network-pre.target
+Before=network-pre.target
+After=nftables.service
+
+[Service]
+Type=oneshot
+ExecStartPre=-/usr/sbin/nft delete table inet hardening_filter
+ExecStart=/usr/sbin/nft -f /etc/nftables.d/99-security-hardening.nft
+ExecReload=/bin/sh -c '/usr/sbin/nft delete table inet hardening_filter 2>/dev/null || true; exec /usr/sbin/nft -f /etc/nftables.d/99-security-hardening.nft'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
 configure_firewall() {
     if ! command -v nft >/dev/null 2>&1; then
         FIREWALL_STATUS="FAILED"
@@ -1603,7 +2084,7 @@ configure_firewall() {
         return 0
     fi
 
-    local candidate check_candidate own_before=""
+    local candidate check_candidate unit_candidate own_before="" unit_ready=0
     candidate="$(mktemp)"
     check_candidate="$(mktemp)"
     cat > "$candidate" <<EOF
@@ -1644,6 +2125,14 @@ EOF
     fi
     rm -f "$check_candidate"
 
+    unit_candidate="$(mktemp --suffix=.service)"
+    render_server_hardening_firewall_unit > "$unit_candidate"
+    if ! systemd_verify_unit "$unit_candidate"; then
+        rm -f -- "$candidate" "$unit_candidate"
+        FIREWALL_STATUS="FAILED"
+        die "Candidate server-hardening-firewall.service failed systemd-analyze verify; live firewall state is untouched"
+    fi
+
     transaction_copy /etc/nftables.d/99-security-hardening.nft nftables-hardening-table.nft
     transaction_copy /etc/systemd/system/server-hardening-firewall.service firewall-service
     if nft list table inet hardening_filter > "$BACKUP_DIR/nftables-hardening-table-before.nft" 2>/dev/null; then
@@ -1652,26 +2141,22 @@ EOF
     install -d -o root -g root -m 0755 /etc/nftables.d
     install -o root -g root -m 0600 "$candidate" /etc/nftables.d/99-security-hardening.nft
     rm -f "$candidate"
-    install_managed_file /etc/systemd/system/server-hardening-firewall.service 0644 <<'EOF'
-[Unit]
-Description=Server hardening owned nftables table
-Wants=network-pre.target
-Before=network-pre.target
-After=nftables.service
-
-[Service]
-Type=oneshot
-ExecStartPre=-/usr/sbin/nft delete table inet hardening_filter
-ExecStart=/usr/sbin/nft -f /etc/nftables.d/99-security-hardening.nft
-ExecReload=/bin/sh -c '/usr/sbin/nft delete table inet hardening_filter 2>/dev/null || true; exec /usr/sbin/nft -f /etc/nftables.d/99-security-hardening.nft'
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    run_streamed systemctl daemon-reload
-    nft delete table inet hardening_filter 2>/dev/null || true
-    if run_streamed nft -f /etc/nftables.d/99-security-hardening.nft \
+    if ! install_managed_file /etc/systemd/system/server-hardening-firewall.service 0644 < "$unit_candidate"; then
+        rm -f -- "$unit_candidate"
+        log ERROR "Could not install the verified server-hardening-firewall.service"
+    elif ! systemd_verify_unit /etc/systemd/system/server-hardening-firewall.service; then
+        rm -f -- "$unit_candidate"
+        log ERROR "Installed server-hardening-firewall.service failed systemd-analyze verify"
+    elif run_streamed systemctl daemon-reload; then
+        rm -f -- "$unit_candidate"
+        nft delete table inet hardening_filter 2>/dev/null || true
+        unit_ready=1
+    else
+        rm -f -- "$unit_candidate"
+        log ERROR "systemd daemon-reload failed after firewall service installation"
+    fi
+    if [[ "$unit_ready" -eq 1 ]] \
+        && run_streamed nft -f /etc/nftables.d/99-security-hardening.nft \
         && nft list chain inet hardening_filter input >/dev/null 2>&1 \
         && run_streamed systemctl enable server-hardening-firewall.service \
         && run_streamed systemctl restart server-hardening-firewall.service; then
@@ -2084,22 +2569,29 @@ configure_faillock_stack() {
 }
 
 configure_account_aging() {
-    if [[ ! -r /etc/passwd ]]; then
-        record_skip "account aging" "/etc/passwd is unavailable"
+    local passwd_file="${HARDEN_PASSWD_FILE:-/etc/passwd}"
+    local login_defs="${HARDEN_LOGIN_DEFS:-/etc/login.defs}"
+    if [[ ! -r "$passwd_file" ]]; then
+        record_skip "account aging" "${passwd_file} is unavailable"
         return 0
     fi
     local uid_min
-    uid_min="$(awk '$1 == "UID_MIN" {print $2; exit}' /etc/login.defs 2>/dev/null || true)"
+    uid_min="$(awk '$1 == "UID_MIN" {print $2; exit}' "$login_defs" 2>/dev/null || true)"
     [[ "$uid_min" =~ ^[0-9]+$ ]] || uid_min=1000
-    local user uid shell shadow
+    local user uid shell shadow_line shadow_hash shadow_min shadow_max shadow_warn shadow_inactive
     while IFS=: read -r user _ uid _ _ _ shell; do
         ((uid >= uid_min)) || continue
         case "$shell" in */nologin|*/false) continue ;; esac
-        shadow="$(getent shadow "$user" 2>/dev/null | cut -d: -f2 || true)"
-        [[ -n "$shadow" && "$shadow" != '!'* && "$shadow" != '*'* ]] || continue
-        run chage --mindays 1 --maxdays 90 --warndays 14 --inactive 30 "$user"
+        shadow_line="$(getent shadow "$user" 2>/dev/null || true)"
+        IFS=: read -r _ shadow_hash _ shadow_min shadow_max shadow_warn shadow_inactive _ _ <<<"$shadow_line"
+        [[ -n "$shadow_hash" && "$shadow_hash" != '!'* && "$shadow_hash" != '*'* ]] || continue
+        if [[ "$shadow_min" == 1 && "$shadow_max" == 90 && "$shadow_warn" == 14 && "$shadow_inactive" == 30 ]]; then
+            log INFO "Account aging already current for ${user}"
+        else
+            run chage --mindays 1 --maxdays 90 --warndays 14 --inactive 30 "$user"
+        fi
         record_skip "AUTH-9282:${user}" "fixed account expiration is intentionally not set; password aging and a 30-day inactive period are enforced"
-    done < /etc/passwd
+    done < "$passwd_file"
 }
 
 configure_sudo() {
@@ -2323,8 +2815,9 @@ configure_process_accounting() {
 
 merge_mount_options() {
     local target="$1" additions="$2"
-    [[ -f /etc/fstab ]] || return 0
-    if ! awk -v target="$target" '$0 !~ /^[[:space:]]*#/ && NF >= 4 && $2 == target {found=1} END {exit !found}' /etc/fstab; then
+    local fstab="${HARDEN_FSTAB:-/etc/fstab}"
+    [[ -f "$fstab" ]] || return 0
+    if ! awk -v target="$target" '$0 !~ /^[[:space:]]*#/ && NF >= 4 && $2 == target {found=1} END {exit !found}' "$fstab"; then
         record_skip "mount:${target}" "not a distinct /etc/fstab mount; no risky repartition or synthetic mount was created"
         return 0
     fi
@@ -2335,7 +2828,7 @@ merge_mount_options() {
     local temporary backup
     temporary="$(mktemp)"
     backup="$(mktemp)"
-    cp -a /etc/fstab "$backup"
+    cp -a "$fstab" "$backup"
     awk -v target="$target" -v additions="$additions" '
         function hasopt(list, opt, n, a, i) {
             n=split(list,a,","); for(i=1;i<=n;i++) if(a[i]==opt) return 1; return 0
@@ -2345,15 +2838,23 @@ merge_mount_options() {
             print $1, $2, $3, $4, ($5==""?0:$5), ($6==""?0:$6); next
         }
         { print }
-    ' /etc/fstab > "$temporary"
+    ' "$fstab" > "$temporary"
     if command -v findmnt >/dev/null 2>&1 && findmnt --verify --tab-file "$temporary" >/dev/null; then
-        install -o root -g root -m 0644 "$temporary" /etc/fstab
+        if cmp -s "$temporary" "$fstab"; then
+            rm -f "$temporary" "$backup"
+            log INFO "Mount options for ${target} are already current; fstab and systemd state are unchanged"
+            return 0
+        fi
+        install -o root -g root -m 0644 "$temporary" "$fstab"
         record_change "Added ${additions} to ${target} mount options"
+        if ! run_streamed systemctl daemon-reload; then
+            log WARN "systemd daemon-reload failed after the validated fstab update for ${target}"
+        fi
         if mountpoint -q "$target"; then
             mount -o "remount,${additions}" "$target" || log WARN "Runtime remount of ${target} failed; fstab remains validated for the next reboot"
         fi
     else
-        cp -a "$backup" /etc/fstab
+        cp -a "$backup" "$fstab"
         log ROLLBACK "Rejected invalid fstab candidate for ${target}"
     fi
     rm -f "$temporary" "$backup"
@@ -2518,6 +3019,17 @@ disable_service() {
     fi
     SERVICE_MASK_REQUESTED["$service"]="$mask"
     local disable_output="" mask_output="" enabled_state="" active_state="" load_state=""
+    enabled_state="$(systemctl is-enabled "$service" 2>/dev/null || true)"
+    active_state="$(systemctl is-active "$service" 2>/dev/null || true)"
+    load_state="$(systemctl show "$service" -p LoadState --value 2>/dev/null || true)"
+    if [[ "$active_state" != active && "$active_state" != activating ]] \
+        && { [[ "$mask" -eq 0 && ( "$enabled_state" == disabled || "$enabled_state" == masked ) ]] \
+            || [[ "$mask" -eq 1 && ( "$enabled_state" == masked || "$load_state" == masked ) ]]; }; then
+        SERVICES_DISABLED+=("$service")
+        if [[ "$mask" -eq 1 ]]; then SERVICES_MASKED+=("$service"); fi
+        log INFO "Service already in requested inactive state: ${service} (enabled=${enabled_state:-unknown}, load=${load_state:-unknown})"
+        return 0
+    fi
     if ! disable_output="$(systemctl disable --now "$service" 2>&1)"; then
         log WARN "systemctl disable --now ${service} reported: ${disable_output//$'\n'/; }"
     fi
@@ -3214,37 +3726,43 @@ EOF
 }
 
 configure_bootloader() {
+    local grub_dir="${HARDEN_GRUB_DIR:-/boot/grub}"
+    local grub_policy="${HARDEN_GRUB_POLICY:-/etc/default/grub.d/99-security-hardening.cfg}"
+    local legacy_auth="${HARDEN_GRUB_LEGACY_AUTH:-/etc/grub.d/01_hardening_users}"
     record_skip "BOOT-5122" "intentionally accepted: no GRUB password is configured to preserve unattended/reliable reboot capability."
-    if ! command -v update-grub >/dev/null 2>&1 || [[ ! -d /boot/grub ]]; then
+    if ! command -v update-grub >/dev/null 2>&1 || [[ ! -d "$grub_dir" ]]; then
         return 0
     fi
-    transaction_copy /etc/default/grub.d/99-security-hardening.cfg grub-hardening.cfg
-    local removed_managed_auth=0
-    if [[ -f /etc/grub.d/01_hardening_users ]] \
-        && grep -q '^# Managed by harden.sh' /etc/grub.d/01_hardening_users; then
-        transaction_copy /etc/grub.d/01_hardening_users grub-hardening-users
+    transaction_copy "$grub_policy" grub-hardening.cfg
+    local removed_managed_auth=0 grub_config_changed=0
+    if [[ -f "$legacy_auth" ]] \
+        && grep -q '^# Managed by harden.sh' "$legacy_auth"; then
+        transaction_copy "$legacy_auth" grub-hardening-users
         if [[ "$MODE" == "apply" ]]; then
-            rm -f -- /etc/grub.d/01_hardening_users
+            rm -f -- "$legacy_auth"
             removed_managed_auth=1
             record_change "Removed the legacy harden.sh GRUB authentication fragment"
         else
             log INFO "Would remove the legacy harden.sh GRUB authentication fragment"
         fi
     fi
-    install_managed_file /etc/default/grub.d/99-security-hardening.cfg 0600 <<'EOF'
+    install_managed_file "$grub_policy" 0600 <<'EOF'
 # Managed by harden.sh
 GRUB_DISABLE_RECOVERY="true"
 GRUB_DISABLE_OS_PROBER="true"
 EOF
+    [[ "$MANAGED_FILE_CHANGED" -eq 0 ]] || grub_config_changed=1
     if [[ "$MODE" == "apply" ]]; then
-        if run_streamed update-grub; then
-            chmod 0600 /boot/grub/grub.cfg
+        if [[ "$grub_config_changed" -eq 0 && "$removed_managed_auth" -eq 0 ]]; then
+            log INFO "Managed GRUB policy is unchanged; update-grub is not required"
+        elif run_streamed update-grub; then
+            chmod 0600 "$grub_dir/grub.cfg"
             REBOOT_REQUIRED=1
             record_change "Disabled GRUB recovery entries and OS probing without boot authentication; regenerated grub.cfg"
         else
-            transaction_restore /etc/default/grub.d/99-security-hardening.cfg grub-hardening.cfg
+            transaction_restore "$grub_policy" grub-hardening.cfg
             if [[ "$removed_managed_auth" -eq 1 ]]; then
-                transaction_restore /etc/grub.d/01_hardening_users grub-hardening-users
+                transaction_restore "$legacy_auth" grub-hardening-users
             fi
             run_streamed update-grub || true
             log ROLLBACK "GRUB regeneration failed; hardening fragment restored/removed"
@@ -3393,8 +3911,17 @@ restrict_compilers() {
         [[ -z "${seen_compilers[$real]+present}" ]] || continue
         seen_compilers["$real"]=1
         if [[ "$AGGRESSIVE" -eq 1 ]]; then
-            run chown "${restricted_owner}:${restricted_group}" "$real"
-            run chmod 0750 "$real"
+            mode="$(stat -c '%a' "$real" 2>/dev/null || true)"
+            owner_id="$(stat -c '%u' "$real" 2>/dev/null || true)"
+            group_id="$(stat -c '%g' "$real" 2>/dev/null || true)"
+            if [[ "$owner_id" != "$restricted_uid" || "$group_id" != "$restricted_gid" ]]; then
+                run chown "${restricted_owner}:${restricted_group}" "$real"
+                changed=1
+            fi
+            if [[ "$mode" != 750 ]]; then
+                run chmod 0750 "$real"
+                changed=1
+            fi
             if [[ "$MODE" == "apply" ]]; then
                 mode="$(stat -c '%a' "$real" 2>/dev/null || true)"
                 owner="$(stat -c '%U' "$real" 2>/dev/null || true)"
@@ -3405,8 +3932,10 @@ restrict_compilers() {
                     die "Compiler restriction verification failed for ${real}: ${owner:-?}:${group:-?} ${mode:-?}"
                 fi
                 printf '%s\t%s:%s\t%s\n' "$real" "$owner" "$group" "$mode" >> "$BACKUP_DIR/compiler-hardening.txt"
+                if [[ "$mode" == 750 && "$owner_id" == "$restricted_uid" && "$group_id" == "$restricted_gid" ]]; then
+                    log INFO "Compiler restriction already current for ${real}"
+                fi
             fi
-            changed=1
         else
             record_skip "HRDN-7222:${real}" "compiler exists; use --aggressive to restrict execution to root"
         fi
@@ -3414,22 +3943,45 @@ restrict_compilers() {
     if [[ "$changed" -eq 1 ]]; then
         record_change "Restricted remaining compiler, assembler, linker, and make binaries to root:root 0750 (safe purge completed: ${purge_completed})"
     elif [[ "$AGGRESSIVE" -eq 1 ]]; then
-        log INFO "No installed compiler/linker binaries were discovered"
+        log INFO "No compiler ownership/mode changes were required"
     fi
     return 0
 }
 
 configure_malware_scanner() {
     if command -v rkhunter >/dev/null 2>&1; then
-        [[ -f /etc/default/rkhunter ]] || {
-            if [[ "$MODE" == "apply" ]]; then install -o root -g root -m 0644 /dev/null /etc/default/rkhunter; fi
+        local baseline_changed=0 property_db="${HARDEN_RKHUNTER_PROPERTY_DB:-/var/lib/rkhunter/db/rkhunter.dat}"
+        local defaults_file="${HARDEN_RKHUNTER_DEFAULTS:-/etc/default/rkhunter}"
+        local dpkg_status="${HARDEN_DPKG_STATUS:-/var/lib/dpkg/status}"
+        local pending_marker="${HARDEN_RKHUNTER_PENDING_MARKER:-/var/lib/rkhunter/db/.harden-propupd-required}"
+        [[ -f "$defaults_file" ]] || {
+            if [[ "$MODE" == "apply" ]]; then
+                install -o root -g root -m 0644 /dev/null "$defaults_file"
+                baseline_changed=1
+            fi
         }
-        replace_setting /etc/default/rkhunter CRON_DAILY_RUN '"true"' '='
-        replace_setting /etc/default/rkhunter CRON_DB_UPDATE '"true"' '='
-        replace_setting /etc/default/rkhunter APT_AUTOGEN '"true"' '='
+        replace_setting "$defaults_file" CRON_DAILY_RUN '"true"' '='
+        [[ "$MANAGED_SETTING_CHANGED" -eq 0 ]] || baseline_changed=1
+        replace_setting "$defaults_file" CRON_DB_UPDATE '"true"' '='
+        [[ "$MANAGED_SETTING_CHANGED" -eq 0 ]] || baseline_changed=1
+        replace_setting "$defaults_file" APT_AUTOGEN '"true"' '='
+        [[ "$MANAGED_SETTING_CHANGED" -eq 0 ]] || baseline_changed=1
         if [[ "$MODE" == "apply" ]]; then
-            run_streamed rkhunter --propupd || true
-            record_change "Enabled daily rkhunter checks and updated the trusted property baseline"
+            if [[ "$baseline_changed" -eq 1 || ! -s "$property_db" || "$dpkg_status" -nt "$property_db" || -e "$pending_marker" ]]; then
+                if [[ ! -d "$(dirname -- "$pending_marker")" ]]; then
+                    install -d -o root -g root -m 0700 "$(dirname -- "$pending_marker")"
+                fi
+                : > "$pending_marker"
+                chmod 0600 "$pending_marker"
+                if run_streamed rkhunter --propupd; then
+                    rm -f -- "$pending_marker"
+                    record_change "Enabled daily rkhunter checks and updated the trusted property baseline after a relevant configuration/package change"
+                else
+                    record_skip "HRDN-7230:rkhunter" "rkhunter property baseline update failed"
+                fi
+            else
+                log INFO "rkhunter configuration and package property baseline are unchanged; --propupd is not required"
+            fi
         fi
     elif command -v chkrootkit >/dev/null 2>&1; then
         [[ -f /etc/chkrootkit.conf ]] || {
