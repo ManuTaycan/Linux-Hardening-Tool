@@ -4595,8 +4595,8 @@ capture_deleted_open_files() {
 
 deleted_open_unit_class() {
     case "$1" in
-        rsyslog.service|fail2ban.service|cron.service|uuidd.service|networkd-dispatcher.service|acct.service) printf '%s\n' safe-service ;;
-        ssh.service|sshd.service|tailscaled.service|NetworkManager.service|systemd-networkd.service|networking.service|nftables.service|firewalld.service|systemd.service|dbus.service|systemd-journald.service|*.target) printf '%s\n' protected-service ;;
+        rsyslog.service|fail2ban.service|cron.service|uuidd.service|acct.service) printf '%s\n' safe-service ;;
+        ssh.service|sshd.service|tailscaled.service|NetworkManager.service|systemd-networkd.service|networkd-dispatcher.service|networking.service|nftables.service|firewalld.service|systemd.service|dbus.service|systemd-journald.service|*.target) printf '%s\n' protected-service ;;
         *) printf '%s\n' unknown-service ;;
     esac
 }
@@ -4612,6 +4612,7 @@ write_deleted_open_report() {
         printf '\n[before]\n'; [[ -s "$before" ]] && awk -F '\t' '{printf "pid=%s process=%s user=%s fd=%s type=%s links=%s file=%s\n",$1,$2,$3,$4,$5,$6,$7}' "$before" || printf 'none\n'
         printf '\n[decisions]\n'; [[ -s "$decisions" ]] && cat "$decisions" || printf 'none\n'
         printf '\n[after]\n'; [[ -s "$after" ]] && awk -F '\t' '{printf "pid=%s process=%s user=%s fd=%s type=%s links=%s file=%s\n",$1,$2,$3,$4,$5,$6,$7}' "$after" || printf 'none\n'
+        printf '\n[remaining-classification]\n'; grep '^after ' "$decisions" 2>/dev/null || printf 'none\n'
         printf '\nremaining-entries=%s\nreboot-required=%s\n' "$(wc -l < "$after")" "$REBOOT_REQUIRED"
     } > "$temporary"
     install -m 0600 "$temporary" "$report"
@@ -4619,7 +4620,7 @@ write_deleted_open_report() {
 }
 
 remediate_deleted_open_files() {
-    local before after decisions pid unit class restart_result remaining
+    local before after decisions pid process user fd type links file unit class restart_result remaining released
     if ! command -v lsof >/dev/null 2>&1; then
         DELETED_OPEN_FILES_STATUS="SKIPPED: lsof unavailable"
         [[ "$MODE" == apply ]] && record_skip "LOGG-2190" "lsof is unavailable"
@@ -4654,18 +4655,42 @@ remediate_deleted_open_files() {
             seen_units["$unit"]=1
         else
             printf 'pid=%s unit=%s classification=%s decision=no-action reason=default-deny\n' "$pid" "$unit" "$class" >> "$decisions"
-            [[ "$class" == protected-service ]] && REBOOT_REQUIRED=1
         fi
     done < "$before"
     for unit in "${!restart_units[@]}"; do
         restart_result=failed
         if run_streamed systemctl restart "$unit" && systemctl is-active --quiet "$unit"; then restart_result=healthy; fi
-        printf 'unit=%s restart-attempted=yes result=%s\n' "$unit" "$restart_result" >> "$decisions"
-        [[ "$restart_result" == healthy ]] && record_change "Restarted allowlisted safe service ${unit} once to release deleted open files" || log WARN "Safe deleted-file restart failed or remained unhealthy: ${unit}"
+        printf 'unit=%s restart-attempted=yes service-health=%s\n' "$unit" "$restart_result" >> "$decisions"
+        [[ "$restart_result" == healthy ]] || log WARN "Safe deleted-file restart failed or remained unhealthy: ${unit}"
     done
     capture_deleted_open_files "$after"
     chmod 0600 "$after"
     remaining="$(wc -l < "$after")"
+    declare -A after_units=()
+    while IFS=$'\t' read -r pid process user fd type links file; do
+        [[ -n "$pid" ]] || continue
+        unit="$(systemd_unit_for_pid "$pid" 2>/dev/null || true)"
+        class="$(deleted_open_unit_class "$unit")"
+        [[ -n "$unit" ]] || unit=unknown
+        after_units["$unit"]=1
+        if [[ "$class" == protected-service ]]; then
+            REBOOT_REQUIRED=1
+            printf 'after pid=%s process=%s unit=%s file=%s classification=protected-service decision=no-action reason=controlled-reboot-required-to-release-safely\n' "$pid" "$process" "$unit" "$file" >> "$decisions"
+        elif [[ "$class" == safe-service ]]; then
+            printf 'after pid=%s process=%s unit=%s file=%s classification=safe-service decision=no-second-restart reason=remaining-after-single-attempt\n' "$pid" "$process" "$unit" "$file" >> "$decisions"
+        else
+            printf 'after pid=%s process=%s unit=%s file=%s classification=unknown decision=no-action reason=manual-review-required\n' "$pid" "$process" "$unit" "$file" >> "$decisions"
+        fi
+    done < "$after"
+    for unit in "${!restart_units[@]}"; do
+        released=no
+        [[ -z "${after_units[$unit]+present}" ]] && released=yes
+        restart_result="$(awk -v unit="$unit" '$0 ~ "^unit=" unit " " {for (i=1;i<=NF;i++) if ($i ~ /^service-health=/) {sub(/^service-health=/,"",$i); print $i}}' "$decisions" | tail -n1)"
+        printf 'unit=%s service-health=%s deleted-file-released=%s\n' "$unit" "${restart_result:-failed}" "$released" >> "$decisions"
+        if [[ "$restart_result" == healthy && "$released" == yes ]]; then
+            record_change "Restarted allowlisted safe service ${unit} once; service-health=healthy and deleted-file-released=yes"
+        fi
+    done
     if [[ "$remaining" -eq 0 ]]; then
         DELETED_OPEN_FILES_STATUS="OK: inventory clear after targeted remediation"
         record_change "Confirmed that no deleted open files remain after targeted remediation"
