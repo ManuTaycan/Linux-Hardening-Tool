@@ -1423,6 +1423,7 @@ EOF
             source "$1/harden.sh"; trap - ERR EXIT
             MODE=apply; BACKUP_DIR="$2/backup"; mkdir -p "$BACKUP_DIR"; CHANGE_LOG="$2/changes.tsv"; : > "$CHANGE_LOG"
             log() { :; }; record_change() { :; }; record_skip() { :; }
+            original_btmp_hash="$(sha256sum "$HARDEN_BTMP_PATH")"
             configure_failed_login_logging
             [[ "$FAILED_LOGIN_STATUS" == OK* ]]
             [[ "$FAILED_LOGIN_SHADOW_STATUS" == OK* && "$FAILED_LOGIN_BTMP_STATUS" == OK* && "$FAILED_LOGIN_FTMP_STATUS" == OK* ]]
@@ -1432,6 +1433,7 @@ EOF
             grep -Fq "FTMP_FILE $HARDEN_BTMP_PATH" "$HARDEN_LOGIN_DEFS"
             grep -Fq "exists=yes" "$BACKUP_DIR/failed-login-btmp-metadata-before.txt"
             grep -Fq "content-rollback=never" "$BACKUP_DIR/failed-login-btmp-metadata-before.txt"
+            [[ "$original_btmp_hash" == "$(sha256sum "$HARDEN_BTMP_PATH")" ]]
             configure_interactive_shell_timeout
             [[ "$SHELL_TIMEOUT_STATUS" == "OK (interactive default 900s; override preserved)" ]]
             before_login="$(sha256sum "$HARDEN_LOGIN_DEFS")"; before_profile="$(sha256sum "$HARDEN_SHELL_TIMEOUT_PROFILE")"
@@ -1447,11 +1449,6 @@ EOF
         || fail "btmp content was added to transaction backup"
     ! sed -n '/backup_config()/,/^}/p' "$repo_root/harden.sh" | grep -Fq '/var/log/btmp' \
         || fail "btmp content was added to config backup"
-
-    local original_btmp_hash
-    original_btmp_hash="$(sha256sum "$case_root/log/btmp")"
-    [[ "$original_btmp_hash" == "$(sha256sum "$case_root/log/btmp")" ]] \
-        || fail "existing btmp content changed during apply"
 
     local broken_btmp="$case_root/broken-btmp"
     env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_LOGIN_DEFS="$case_root/login.defs" \
@@ -1474,7 +1471,7 @@ EOF
     printf 'new audit record after metadata capture\n' >> "$case_root/log/btmp"
     grep -Fq 'existing failed-login record' "$case_root/log/btmp" \
         && grep -Fq 'new audit record after metadata capture' "$case_root/log/btmp" \
-        || fail "metadata capture/rollback handling lost btmp audit data"
+        || fail "metadata-only capture/no-content-rollback handling lost btmp audit data"
 
     local missing="$case_root/missing-btmp"
     rm -f -- "$missing"

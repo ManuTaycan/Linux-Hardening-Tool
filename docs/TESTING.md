@@ -153,7 +153,8 @@ entbehrlichen Test-VM oder einem ausdrücklich freigegebenen Testkonto; niemals
 gegen Manu oder den Remote-Admin. Dabei muss die bestehende `pam_faillock`-
 Schwelle eingehalten werden. Anschließend `lastb -f /var/log/btmp` erneut
 prüfen. Wiederhole den Apply: `btmp`-Inhalt und Metadaten sowie die Timeout-Datei
-müssen unverändert bleiben, SSH-Remote-Kommandos dürfen weiterhin nicht durch
+müssen unverändert bleiben. Das Projekt verwendet ausschließlich metadata-only
+capture; ein btmp-Inhalts-Restore oder -Rollback findet nicht statt. SSH-Remote-Kommandos dürfen weiterhin nicht durch
 `TMOUT` beeinflusst werden.
 
 Für die Findings #4, #12, #17, #18, #19 und #20 zusätzlich prüfen:
