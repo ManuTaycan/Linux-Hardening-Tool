@@ -1404,6 +1404,7 @@ case "${DO_TEST_STATE:-empty}" in
  empty) exit 0 ;;
  safe-before) { [[ "${DO_TEST_RESTART:-1}" == 1 && "${DO_TEST_HEALTH:-1}" == 1 ]] && grep -Fq 'restart rsyslog.service' "${DO_TEST_LOG:-/dev/null}" 2>/dev/null; } || printf 'p4242\ncworker\nu100\nf5\ntREG\nk0\nn/var/log/test (deleted)\n' ;;
  protected) printf 'p22\ncsshd\nu0\nf3\ntREG\nk0\nn/tmp/key (deleted)\n' ;;
+ protected-clears) if [[ ! -e "${DO_TEST_MARKER:?}" ]]; then touch "$DO_TEST_MARKER"; printf 'p22\ncsshd\nu0\nf3\ntREG\nk0\nn/tmp/key (deleted)\n'; fi ;;
  unknown) printf 'p77\ncmystery\nu1000\nf4\ntREG\nk0\nn/tmp/x (deleted)\n' ;;
  multi) printf 'p4242\ncworker\nu100\nf5\ntREG\nk0\nn/tmp/a (deleted)\nf6\ntREG\nk0\nn/tmp/b (deleted)\n' ;;
 esac
@@ -1455,8 +1456,28 @@ EOF
             remediate_deleted_open_files
             ! grep -Fq "restart" "$DO_TEST_LOG"; [[ "$REBOOT_REQUIRED" == 1 ]]
         ' _ "$repo_root" "$one" || fail "tailscaled deleted-open owner was restarted"
-    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 DO_TEST_STATE=unknown DO_TEST_LOG="$one/log" bash -c '
-            source "$1/harden.sh"; trap - ERR EXIT; MODE=dry-run; BACKUP_DIR="$2"; REBOOT_REQUIRED=0
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_DELETED_OPEN_REPORT="$one/report" \
+        DO_TEST_STATE=protected DO_TEST_LOG="$one/log" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT; MODE=apply; BACKUP_DIR="$2"; CHANGE_LOG="$2/changes"; : > "$CHANGE_LOG"; : > "$DO_TEST_LOG"; REBOOT_REQUIRED=0
+            systemd_unit_for_pid() { printf "networkd-dispatcher.service\n"; }
+            remediate_deleted_open_files
+            ! grep -Fq "restart" "$DO_TEST_LOG"; [[ "$REBOOT_REQUIRED" == 1 ]]
+        ' _ "$repo_root" "$one" || fail "networkd-dispatcher deleted-open owner was restarted"
+    : > "$one/marker"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_DELETED_OPEN_REPORT="$one/report" \
+        DO_TEST_STATE=protected-clears DO_TEST_MARKER="$one/marker" DO_TEST_LOG="$one/log" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT; MODE=apply; BACKUP_DIR="$2"; CHANGE_LOG="$2/changes"; : > "$CHANGE_LOG"; : > "$DO_TEST_LOG"; REBOOT_REQUIRED=0
+            rm -f "$DO_TEST_MARKER"; systemd_unit_for_pid() { printf "sshd.service\n"; }; remediate_deleted_open_files
+            [[ "$REBOOT_REQUIRED" == 0 ]]
+        ' _ "$repo_root" "$one" || fail "disappeared protected Before finding requested an unnecessary reboot"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_DELETED_OPEN_REPORT="$one/report" \
+        DO_TEST_STATE=multi DO_TEST_LOG="$one/log" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT; MODE=apply; BACKUP_DIR="$2"; CHANGE_LOG="$2/changes"; : > "$CHANGE_LOG"; : > "$DO_TEST_LOG"; REBOOT_REQUIRED=0
+            systemd_unit_for_pid() { printf "rsyslog.service\n"; }; remediate_deleted_open_files
+            [[ "$(grep -c "restart rsyslog.service" "$DO_TEST_LOG")" == 1 ]]
+        ' _ "$repo_root" "$one" || fail "same-unit deleted-open files triggered more than one restart"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_DELETED_OPEN_REPORT="$one/dry-report" DO_TEST_STATE=unknown DO_TEST_LOG="$one/log" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT; MODE=dry-run; BACKUP_DIR="$2"; : > "$DO_TEST_LOG"; REBOOT_REQUIRED=0
             remediate_deleted_open_files
             [[ ! -e "${HARDEN_DELETED_OPEN_REPORT:-/root/deleted-open-files-report.txt}" && ! -s "$DO_TEST_LOG" ]]
         ' _ "$repo_root" "$one" || fail "deleted-open dry-run wrote state or restarted a service"
