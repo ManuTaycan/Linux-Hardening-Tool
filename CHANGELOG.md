@@ -75,6 +75,12 @@ für 1.1.3 wird erst nach dem vollständigen Zielsystemtest erstellt.
   `report.dat`, and the summary uses that measured baseline instead of a static
   source score. Dry-run explicitly reports `N/A / NOT RUN` and launches no
   writing Lynis scan.
+- Reverse-path filtering is now an explicit routing policy: an active
+  Tailscale overlay receives loose mode `2` for `all`, `default`, and relevant
+  active interfaces (including `tailscale0`), while an inactive host receives
+  strict mode `1` only after a simple-routing check. Policy routing or multiple
+  default paths are retained and reported rather than overwritten. This is a
+  documented compatibility exception, not a Lynis score change.
 - Repeated systemd hardening treats an already-current, health-tested drop-in
   with identical exposure as unchanged/already hardened rather than warning
   that exposure did not decrease.

@@ -73,6 +73,33 @@ nächsten Boot mit noch schreibbarem Control bei 0 bleiben und die Unit darf
 nicht erfolgreich erscheinen. Sichere dann Diagnosebericht und Journal, ohne
 Tailscale-Prefs automatisch zu verändern.
 
+### Ubuntu-26.04.1-Retest der rp_filter-Routingpolicy (#7)
+
+Führe den Apply direkt aus (ohne externes `tee`) und prüfe den vom Script
+geschriebenen Bericht `/root/tailscale-rp-filter-report.txt`:
+
+```bash
+sudo ./harden.sh --apply --aggressive
+sudo cat /root/tailscale-rp-filter-report.txt
+sysctl net.ipv4.conf.all.rp_filter net.ipv4.conf.default.rp_filter \
+  net.ipv4.conf.tailscale0.rp_filter
+ip -4 route show default
+ip -4 rule show
+tailscale status --json
+tailscale ping <TAILSCALE-PEER>
+```
+
+Bei aktivem Tailscale müssen die aufgeführten `rp_filter`-Werte `2` sein und
+der Bericht die akzeptierte Overlay-Ausnahme nennen. Eine Healthmeldung allein
+zu `--accept-routes is false` ist dabei kein Fehler; Router-/Netfilter-Meldungen
+bleiben sichtbar. Prüfe zusätzlich Erreichbarkeit und die bestehenden
+Tailscale-/NAT-Checks. Auf einem Vergleichssystem ohne aktives Tailscale muss
+bei einer einzelnen Default-Route und Standard-`ip rule` der Wert `1` gelten.
+Bei mehreren Default-Routen oder nichtstandardmäßigen Regeln darf der Lauf
+nicht blind auf `1` umstellen, sondern muss WARN/SKIP mit Grund und effektiven
+Werten reporten. Wiederhole den Apply: Die persistente sysctl-Datei und das
+gezielte Reload dürfen dann unverändert bleiben.
+
 Für die Findings #4, #12, #17, #18, #19 und #20 zusätzlich prüfen:
 
 - `aide-lynis-FINT-4402-evidence.txt`, AIDE-Konfigurationsprüfung,
