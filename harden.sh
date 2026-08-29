@@ -73,6 +73,11 @@ IOWAIT_PREVIOUS_PIDS=""
 MANAGED_FILE_CHANGED=0
 MANAGED_SETTING_CHANGED=0
 INITRAMFS_POLICY_CHANGED=0
+RP_FILTER_TAILSCALE_STATE="unknown"
+RP_FILTER_ROUTING_SITUATION="not assessed"
+RP_FILTER_POLICY="not assessed"
+RP_FILTER_REASON="not assessed"
+RP_FILTER_RUNTIME_STATUS="NOT RUN"
 
 readonly COLOR_RESET=$'\033[0m'
 readonly COLOR_DIM=$'\033[2m'
@@ -1075,30 +1080,173 @@ kernel.io_uring_disabled=2
 EOF
 }
 
+rp_filter_active_interfaces() {
+    local sysctl_root="${HARDEN_PROC_SYS_ROOT:-/proc/sys}" interface
+    declare -A seen=()
+    if command -v ip >/dev/null 2>&1; then
+        while IFS= read -r interface; do
+            [[ "$interface" =~ ^[[:alnum:]_.-]+$ ]] || continue
+            [[ -e "$sysctl_root/net/ipv4/conf/${interface}/rp_filter" ]] || continue
+            [[ -n "${seen[$interface]+present}" ]] && continue
+            seen["$interface"]=1
+            printf '%s\n' "$interface"
+        done < <(ip -o link show up 2>/dev/null | awk -F': ' '{name=$2; sub(/@.*/, "", name); sub(/:.*/, "", name); if (name != "lo") print name}')
+    fi
+    if [[ "$RP_FILTER_TAILSCALE_STATE" == active && -e "$sysctl_root/net/ipv4/conf/tailscale0/rp_filter" \
+        && -z "${seen[tailscale0]+present}" ]]; then
+        printf '%s\n' tailscale0
+    fi
+}
+
+detect_rp_filter_routing_situation() {
+    local defaults rules active_interfaces default_count
+    RP_FILTER_ROUTING_SITUATION="unknown"
+    RP_FILTER_REASON="routing inventory is unavailable"
+    if ! command -v ip >/dev/null 2>&1; then
+        RP_FILTER_REASON="ip command is unavailable; strict reverse-path filtering is not forced"
+        return 0
+    fi
+    defaults="$(ip -4 route show default 2>/dev/null || true)"
+    rules="$(ip -4 rule show 2>/dev/null || true)"
+    default_count="$(awk 'NF {count++} END {print count+0}' <<<"$defaults")"
+    if [[ "$default_count" -eq 0 ]]; then
+        RP_FILTER_REASON="no IPv4 default route was detected; strict reverse-path filtering is not forced"
+        return 0
+    fi
+    if [[ "$default_count" -gt 1 ]] || grep -Eq '(^|[[:space:]])nexthop([[:space:]]|$)' <<<"$defaults"; then
+        RP_FILTER_ROUTING_SITUATION="asymmetric-multiple-default-routes"
+        RP_FILTER_REASON="multiple or multipath IPv4 default routes were detected"
+        return 0
+    fi
+    if awk '$1 !~ /^(0:|32766:|32767:)$/ {found=1} END {exit !found}' <<<"$rules"; then
+        RP_FILTER_ROUTING_SITUATION="asymmetric-policy-routing"
+        RP_FILTER_REASON="non-default IPv4 policy-routing rules were detected"
+        return 0
+    fi
+    active_interfaces="$(rp_filter_active_interfaces | wc -l)"
+    if [[ "$active_interfaces" -gt 1 ]]; then
+        RP_FILTER_ROUTING_SITUATION="ambiguous-multiple-active-interfaces"
+        RP_FILTER_REASON="multiple active IPv4-capable interfaces were detected"
+        return 0
+    fi
+    RP_FILTER_ROUTING_SITUATION="simple-single-default-route"
+    RP_FILTER_REASON="one IPv4 default route and only standard policy rules were detected"
+}
+
+tailscale_rp_filter_health() {
+    local summary backend health_problem=0
+    RP_FILTER_RUNTIME_STATUS="NOT APPLICABLE"
+    [[ "$RP_FILTER_TAILSCALE_STATE" == active ]] || return 0
+    if ! command -v tailscale >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+        RP_FILTER_RUNTIME_STATUS="WARN: Tailscale status parser unavailable"
+        return 0
+    fi
+    if ! summary="$(tailscale status --json 2>/dev/null | python3 -c '
+import json, re, sys
+data = json.load(sys.stdin)
+print("backend=" + str(data.get("BackendState", "")))
+for item in data.get("Health") or []:
+    if re.search(r"router|netfilter|firewall|iptables|nftables|masquerad|postrouting|forwarding", str(item), re.I):
+        print("health-problem=1")
+')"; then
+        RP_FILTER_RUNTIME_STATUS="WARN: Tailscale status JSON unavailable"
+        return 0
+    fi
+    backend="$(awk -F= '$1 == "backend" {print substr($0, index($0, "=") + 1)}' <<<"$summary")"
+    grep -Fxq 'health-problem=1' <<<"$summary" && health_problem=1
+    if [[ "$backend" != Running ]]; then
+        RP_FILTER_RUNTIME_STATUS="WARN: Tailscale backend is ${backend:-unknown}"
+    elif [[ "$health_problem" -ne 0 ]]; then
+        RP_FILTER_RUNTIME_STATUS="WARN: Tailscale router/netfilter health warning"
+    else
+        RP_FILTER_RUNTIME_STATUS="OK: Tailscale backend Running; router/netfilter health clear"
+    fi
+    return 0
+}
+
+write_rp_filter_report() {
+    local report="${HARDEN_RP_FILTER_REPORT:-/root/tailscale-rp-filter-report.txt}"
+    local sysctl_root="${HARDEN_PROC_SYS_ROOT:-/proc/sys}" interface key value route_proof="unavailable" temporary
+    [[ "$MODE" == apply ]] || return 0
+    if command -v ip >/dev/null 2>&1 && ip -4 route get 1.1.1.1 >/dev/null 2>&1; then route_proof="available"; fi
+    install -d -m 0700 "$(dirname -- "$report")"
+    temporary="$(mktemp)"
+    {
+        printf 'tailscale rp_filter policy diagnostic\n'
+        printf 'generated=%s\n' "$(timestamp)"
+        printf 'tailscale-state=%s\n' "$RP_FILTER_TAILSCALE_STATE"
+        printf 'routing-situation=%s\n' "$RP_FILTER_ROUTING_SITUATION"
+        printf 'policy=%s\n' "$RP_FILTER_POLICY"
+        printf 'reason=%s\n' "$RP_FILTER_REASON"
+        printf 'network-route-proof=%s\n' "$route_proof"
+        printf 'tailscale-runtime=%s\n' "$RP_FILTER_RUNTIME_STATUS"
+        for key in net.ipv4.conf.all.rp_filter net.ipv4.conf.default.rp_filter; do
+            value="$(sysctl -n "$key" 2>/dev/null || true)"
+            printf '%s=%s\n' "$key" "${value:-unavailable}"
+        done
+        while IFS= read -r interface; do
+            [[ -n "$interface" ]] || continue
+            key="net.ipv4.conf.${interface}.rp_filter"
+            value="$(sysctl -n "$key" 2>/dev/null || true)"
+            printf '%s=%s\n' "$key" "${value:-unavailable}"
+        done < <(rp_filter_active_interfaces)
+        [[ -d "$sysctl_root/net/ipv4/conf/tailscale0" ]] || printf 'tailscale0=not-present\n'
+    } > "$temporary"
+    install -m 0600 "$temporary" "$report"
+    rm -f -- "$temporary"
+}
+
+managed_sysctl_runtime_needs_reload() {
+    local config="$1" key value
+    while IFS='=' read -r key value; do
+        key="${key//[[:space:]]/}"
+        value="${value//[[:space:]]/}"
+        [[ -n "$key" ]] || continue
+        [[ "$(sysctl -n "$key" 2>/dev/null || true)" == "$value" ]] || return 0
+    done < <(grep -Ev '^[[:space:]]*(#|$)' "$config")
+    return 1
+}
+
 configure_sysctl() {
+    local config="${HARDEN_SYSCTL_CONFIG:-/etc/sysctl.d/99-security-hardening.conf}"
+    local sysctl_root="${HARDEN_PROC_SYS_ROOT:-/proc/sys}"
+    local temporary key value proc_path interface desired_rp_filter="" config_changed=0 runtime_reload_needed=0 failed=0
+    if systemctl is-active --quiet tailscaled.service 2>/dev/null; then
+        RP_FILTER_TAILSCALE_STATE=active
+        RP_FILTER_POLICY="accepted-exception-loose-2"
+        RP_FILTER_REASON="active Tailscale overlay can require asymmetric return paths"
+        desired_rp_filter=2
+        log INFO "Tailscale is active; loose reverse-path filtering (2) is an accepted routing policy, not a Lynis score change"
+        record_skip "KRNL-6000:net.ipv4.conf.all.rp_filter" "value=2 is intentionally retained while Tailscale is active; strict value 1 can reject valid asymmetric overlay traffic"
+    else
+        RP_FILTER_TAILSCALE_STATE=inactive
+        detect_rp_filter_routing_situation
+        if [[ "$RP_FILTER_ROUTING_SITUATION" == simple-single-default-route ]]; then
+            RP_FILTER_POLICY="strict-1"
+            desired_rp_filter=1
+        else
+            RP_FILTER_POLICY="preserved-uncertain-routing"
+            record_skip "KRNL-6000:rp_filter" "${RP_FILTER_REASON}; strict value 1 was not forced"
+            log WARN "rp_filter strict mode was not forced: ${RP_FILTER_REASON}"
+        fi
+    fi
     if [[ "$MODE" == "dry-run" ]]; then
-        log INFO "Would write supported baseline sysctls to /etc/sysctl.d/99-security-hardening.conf"
+        log INFO "Would apply rp_filter policy ${RP_FILTER_POLICY} (${RP_FILTER_REASON}) without changing Tailscale preferences"
         if [[ "$AGGRESSIVE" -eq 1 ]]; then
             log WARN "Would also disable unprivileged user namespaces, kexec loading, and io_uring when supported"
         fi
         return 0
-    fi
-    local temporary key value proc_path tailscale_active=0
-    if systemctl is-active --quiet tailscaled.service 2>/dev/null; then
-        tailscale_active=1
-        log INFO "Tailscale is active; loose reverse-path filtering (2) will be used to preserve asymmetric overlay routing"
-        record_skip "KRNL-6000:net.ipv4.conf.all.rp_filter" "value 2 is intentionally retained while Tailscale is active; strict value 1 can reject valid asymmetric overlay traffic"
     fi
     temporary="$(mktemp)"
     {
         printf '# Managed by harden.sh. Unsupported keys are intentionally omitted.\n'
         while IFS='=' read -r key value; do
             [[ -n "$key" ]] || continue
-            if [[ "$tailscale_active" -eq 1 ]] \
-                && [[ "$key" == "net.ipv4.conf.all.rp_filter" || "$key" == "net.ipv4.conf.default.rp_filter" ]]; then
-                value=2
+            if [[ "$key" == "net.ipv4.conf.all.rp_filter" || "$key" == "net.ipv4.conf.default.rp_filter" ]]; then
+                [[ -n "$desired_rp_filter" ]] || continue
+                value="$desired_rp_filter"
             fi
-            if [[ "$tailscale_active" -eq 1 && "$key" == *'.forwarding' ]] \
+            if [[ "$RP_FILTER_TAILSCALE_STATE" == active && "$key" == *'.forwarding' ]] \
                 && [[ "$(sysctl -n "$key" 2>/dev/null || true)" == "1" ]]; then
                 value=1
                 log INFO "Preserving active forwarding control ${key}=1 for the existing Tailscale routing role" >&2
@@ -1108,21 +1256,48 @@ configure_sysctl() {
                 log SKIP "Skipped ${key}: active snapd requires user namespaces" >&2
                 continue
             fi
-            proc_path="/proc/sys/${key//./\/}"
+            proc_path="$sysctl_root/${key//./\/}"
             if [[ -e "$proc_path" ]]; then
                 printf '%s = %s\n' "$key" "$value"
             else
                 log SKIP "Unsupported sysctl omitted: ${key}" >&2
             fi
         done < <(sysctl_candidates; [[ "$AGGRESSIVE" -eq 1 ]] && aggressive_sysctl_candidates)
+        if [[ -n "$desired_rp_filter" ]]; then
+            while IFS= read -r interface; do
+                [[ -n "$interface" ]] || continue
+                printf 'net.ipv4.conf.%s.rp_filter = %s\n' "$interface" "$desired_rp_filter"
+            done < <(rp_filter_active_interfaces)
+        fi
     } > "$temporary"
-    install -o root -g root -m 0644 "$temporary" /etc/sysctl.d/99-security-hardening.conf
-    rm -f "$temporary"
-    record_change "Installed supported kernel/network controls in /etc/sysctl.d/99-security-hardening.conf"
-    if ! run_streamed sysctl --system; then
-        log WARN "sysctl --system returned a failure, possibly from an unrelated vendor file"
+    if [[ ! -f "$config" ]] || ! cmp -s "$temporary" "$config"; then
+        transaction_copy "$config" sysctl-hardening.conf
+        if ! install_managed_file "$config" 0644 < "$temporary"; then
+            rm -f -- "$temporary"
+            record_skip "KRNL-6000" "could not install the managed sysctl policy"
+            return 1
+        fi
+        config_changed="$MANAGED_FILE_CHANGED"
+    else
+        log INFO "Managed sysctl policy is already current: ${config}"
     fi
-    local failed=0
+    if managed_sysctl_runtime_needs_reload "$temporary"; then runtime_reload_needed=1; fi
+    rm -f "$temporary"
+    if [[ "$config_changed" -eq 1 || "$runtime_reload_needed" -eq 1 ]]; then
+        if ! run_streamed sysctl -p "$config"; then
+            transaction_restore "$config" sysctl-hardening.conf
+            run_streamed sysctl -p "$config" || true
+            record_skip "KRNL-6000" "targeted reload of the managed sysctl policy failed; previous file was restored"
+            return 1
+        fi
+        if [[ "$config_changed" -eq 1 ]]; then
+            record_change "Installed and targeted-reloaded supported kernel/network controls in ${config}"
+        else
+            record_change "Targeted-reloaded ${config} because one or more effective sysctls drifted"
+        fi
+    else
+        log INFO "Managed sysctl policy converged; targeted reload is not required"
+    fi
     while IFS='=' read -r key value; do
         key="${key//[[:space:]]/}"
         value="${value//[[:space:]]/}"
@@ -1131,8 +1306,13 @@ configure_sysctl() {
             log WARN "sysctl did not retain requested value: ${key}=${value}"
             failed=1
         fi
-    done < <(grep -Ev '^[[:space:]]*(#|$)' /etc/sysctl.d/99-security-hardening.conf)
+    done < <(grep -Ev '^[[:space:]]*(#|$)' "$config")
     [[ "$failed" -eq 0 ]] || record_skip "KRNL-6000" "one or more supported sysctls could not be applied by the running environment"
+    tailscale_rp_filter_health
+    if [[ "$RP_FILTER_RUNTIME_STATUS" == WARN:* ]]; then
+        log WARN "${RP_FILTER_RUNTIME_STATUS}"
+    fi
+    write_rp_filter_report
     if [[ "$AGGRESSIVE" -eq 0 ]]; then
         record_skip "kernel.modules_disabled" "requires --aggressive because it is irreversible until reboot"
     fi
@@ -4802,7 +4982,9 @@ write_open_findings_report() {
             '- NAME-4028: an organization/domain-dependent DNS identity is not invented.' \
             '- AUTH-9282: no fixed account expiration is imposed without an explicit owner decision.'
         if systemctl is-active --quiet tailscaled.service 2>/dev/null; then
-            printf '%s\n' '- KRNL-6000/rp_filter: net.ipv4.conf.all.rp_filter=2 is intentionally retained for active Tailscale asymmetric overlay routing.'
+            printf '%s\n' "- KRNL-6000/rp_filter: ${RP_FILTER_POLICY}; ${RP_FILTER_REASON}. This is an accepted routing policy, not a Lynis score change."
+        elif [[ "$RP_FILTER_POLICY" == preserved-uncertain-routing ]]; then
+            printf '%s\n' "- KRNL-6000/rp_filter: strict value 1 was not forced because ${RP_FILTER_REASON}."
         fi
     } > "$output"
     chmod 0600 "$output"
@@ -4846,6 +5028,9 @@ AIDE               : ${AIDE_STATUS}
 Fail2ban           : ${FAIL2BAN_STATUS}
 Remote Logging     : ${REMOTE_LOG_STATUS}
 Automatic Updates  : ${UPDATES_STATUS}
+rp_filter Policy   : ${RP_FILTER_POLICY}
+rp_filter Runtime  : ${RP_FILTER_RUNTIME_STATUS}
+rp_filter Report   : $([[ "$MODE" == "apply" ]] && printf '%s' "${HARDEN_RP_FILTER_REPORT:-/root/tailscale-rp-filter-report.txt}" || printf 'not written in dry-run')
 
 Lynis Score Before : ${LYNIS_BEFORE}
 Lynis Score After  : ${LYNIS_AFTER}

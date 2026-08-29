@@ -12,6 +12,6 @@ eine konkrete Betreiberentscheidung oder ein Wartungsfenster.
 | AUTH-9230 | YESCRYPT wird nicht mit Legacy-SHA-Runden „optimiert“. | Lynis-/Profilunterstützung prüfen, nicht wirkungslose SHA-Werte setzen. |
 | NAME-4028 | Keine erfundene DNS-Domain. | Gültiges Forward-/Reverse-DNS mit dem Betreiber einrichten. |
 | AUTH-9282 | Kein pauschales Account-Ablaufdatum; das könnte Recovery oder Dienstkonten sperren. | Kontospezifische Ablaufdaten nach Eigentümerfreigabe setzen. |
-| Tailscale/rp_filter | `rp_filter=2` bleibt bei aktivem Tailscale für asymmetrische Overlay-Routen erhalten. | Tailscale entfernen oder Routing so ändern, dass striktes Filtering sicher ist. |
+| Tailscale/rp_filter | Bei aktivem Tailscale ist `rp_filter=2` für `all`, `default`, relevante aktive Interfaces und `tailscale0` eine bewusste Kompatibilitäts-/Sicherheitsabwägung für asymmetrische Overlay-Routen. Ohne Tailscale wird `1` nur bei eindeutig einfachem IPv4-Routing gesetzt; Policy-Routing oder mehrere Default-Pfade bleiben mit Diagnosebericht unverändert. | Tailscale entfernen oder Routing so vereinfachen, dass striktes Filtering nachweislich sicher ist. |
 
 Jede Zeile ist eine dokumentierte Risikoabwägung, keine Score-Manipulation.
