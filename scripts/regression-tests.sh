@@ -1148,7 +1148,7 @@ EOF
         HARDEN_EFI_BOOT_DIR="$fixture_root/efi" HARDEN_GRUB_DIR="$fixture_root/grub" bash -c '
             source "$1/harden.sh"; trap - ERR EXIT
             MODE=apply; REBOOT_REQUIRED=0; CHANGE_LOG="$2/target.tsv"; : > "$CHANGE_LOG"; mkdir -p "$HARDEN_EFI_RUNTIME_DIR"
-            log() { :; }; record_change() { :; }; record_skip() { printf "SKIP %s: %s\n" "$1" "$2" >&2; }; run_streamed() { "$@"; }
+            log() { :; }; record_change() { :; }; record_skip() { :; }; run_streamed() { "$@"; }
             purge_removed_packages final
             ! grep -E "^(linux-image-unsigned-7.0.0-14-generic|linux-main-modules-zfs-7.0.0-14-generic|linux-modules-7.0.0-14-generic|grub-pc)[[:space:]]" "$RESIDUAL_FIXTURE_STATUS"
             [[ "$RESIDUAL_PURGE_STATUS" == OK* && "$REBOOT_REQUIRED" -eq 0 ]]

@@ -789,13 +789,17 @@ upgrade_packages_safely() {
 
 kernel_residual_version() {
     local package="${1%%:*}" version=""
-    if [[ "$package" =~ ^linux-(image|image-unsigned|modules|modules-extra)-(.+)$ ]]; then
-        version="${BASH_REMATCH[2]}"
-    elif [[ "$package" =~ ^linux-main-modules-.+-([0-9]+(\.[0-9]+)+-[0-9]+-[[:alnum:].+~-]+)$ ]]; then
-        version="${BASH_REMATCH[1]}"
-    else
-        return 1
-    fi
+    case "$package" in
+        linux-image-unsigned-*) version="${package#linux-image-unsigned-}" ;;
+        linux-image-*) version="${package#linux-image-}" ;;
+        linux-modules-extra-*) version="${package#linux-modules-extra-}" ;;
+        linux-modules-*) version="${package#linux-modules-}" ;;
+        linux-main-modules-*)
+            [[ "$package" =~ ^linux-main-modules-.+-([0-9]+(\.[0-9]+)+-[0-9]+-[[:alnum:].+~-]+)$ ]] || return 1
+            version="${BASH_REMATCH[1]}"
+            ;;
+        *) return 1 ;;
+    esac
     [[ "$version" =~ ^[0-9]+(\.[0-9]+)+-[0-9]+-[[:alnum:].+~-]+$ ]] || return 1
     printf '%s\n' "$version"
 }
