@@ -233,6 +233,10 @@ cmp -s /etc/issue /etc/issue.net
 stat -c '%U:%G:%a %n' /etc/issue /etc/issue.net
 cat /etc/issue
 find /etc/update-motd.d -maxdepth 1 -type f -printf '%m %f\n' | sort
+systemctl cat motd-news.service
+stat -c '%a %n' /etc/update-motd.d/50-motd-news
+grep -E '^ENABLED=' /etc/default/motd-news
+systemctl show -p Result -p ExecMainStatus motd-news.service
 sudo ./harden.sh --apply --aggressive
 ```
 
@@ -251,6 +255,12 @@ Der bewusst ausführliche Text gehört ausschließlich in `/etc/issue` und
 eine absichtlich strengere Linux-Policy als Lynis 3.1.6 `prefval=0`: sie lehnt
 alle Routing-Header ab, während `>=0` noch Type 2 zulässt. Diese Abweichung
 wird dokumentiert, nicht durch ein Profil-Skip verborgen.
+
+Auf Ubuntu muss `50-motd-news` ausführbar bleiben, da `motd-news.service` den
+Hook direkt mit `--force` ausführt. News werden stattdessen mit dem offiziellen
+`ENABLED=0`-Schalter in `/etc/default/motd-news` deaktiviert. Ein zuvor
+vorhandener `203/EXEC`-Status darf nach einer vom Tool reparierten Berechtigung
+gezielt zurückgesetzt werden; der Apply startet oder startet den Dienst nicht neu.
 
 Für die verbleibenden Paket-/Firewall-Findings zusätzlich prüfen:
 

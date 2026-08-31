@@ -1393,9 +1393,11 @@ EOF
 configure_motd_presentation() {
     local motd_dir="${HARDEN_UPDATE_MOTD_DIR:-/etc/update-motd.d}"
     local motd_cache="${HARDEN_MOTD_CACHE:-/run/motd.dynamic}"
-    local hook label changed=0 i
+    local motd_news_config="${HARDEN_MOTD_NEWS_DEFAULT:-/etc/default/motd-news}"
+    local motd_news_hook="${motd_dir}/50-motd-news"
+    local hook label changed=0 motd_news_repaired=0 i
     local -a changed_hooks=() changed_labels=()
-    local -a presentation_hooks=(00-header 10-help-text 10-uname 50-landscape-sysinfo 50-motd-news 80-livepatch 88-esm-announce 90-updates-available 91-contract-ua-esm-status 91-release-upgrade 92-unattended-upgrades 95-hwe-eol)
+    local -a presentation_hooks=(00-header 10-help-text 10-uname 50-landscape-sysinfo 80-livepatch 88-esm-announce 90-updates-available 91-contract-ua-esm-status 91-release-upgrade 92-unattended-upgrades 95-hwe-eol)
     if [[ "$AGGRESSIVE" -ne 1 ]]; then
         MOTD_STATUS="SKIPPED (requires --aggressive)"
         record_skip "MOTD" "presentation hooks are changed only with --aggressive"
@@ -1405,6 +1407,45 @@ configure_motd_presentation() {
         MOTD_STATUS="N/A (no Ubuntu presentation hooks)"
         log INFO "MOTD presentation policy is not applicable on this Debian-compatible layout"
         return 0
+    fi
+    if [[ -f "$motd_news_hook" && ! -L "$motd_news_hook" ]]; then
+        if [[ "$MODE" == dry-run ]]; then
+            log INFO "Would keep Ubuntu motd-news service ExecStart target executable: ${motd_news_hook}"
+        elif [[ ! -x "$motd_news_hook" ]]; then
+            label="motd-news-exec-permission"
+            transaction_copy "$motd_news_hook" "$label"
+            if ! chmod a+x "$motd_news_hook"; then
+                transaction_restore "$motd_news_hook" "$label"
+                MOTD_STATUS="FAILED"
+                return 1
+            fi
+            changed_hooks+=("$motd_news_hook")
+            changed_labels+=("$label")
+            changed=1
+            motd_news_repaired=1
+            record_change "Restored executable permission for Ubuntu motd-news systemd ExecStart target ${motd_news_hook}"
+        fi
+        if [[ "$MODE" == dry-run ]]; then
+            log INFO "Would set the Ubuntu motd-news official ENABLED switch to 0 in ${motd_news_config} when available"
+        elif [[ -f "$motd_news_config" && ! -L "$motd_news_config" ]] \
+            && ! awk '$1 ~ /^ENABLED=/ { value=substr($1, 9) } END { exit !(value == "0") }' "$motd_news_config"; then
+            label="motd-news-enabled"
+            transaction_copy "$motd_news_config" "$label"
+            if ! replace_setting "$motd_news_config" ENABLED 0 "="; then
+                transaction_restore "$motd_news_config" "$label"
+                for ((i=${#changed_hooks[@]} - 1; i>=0; i--)); do
+                    transaction_restore "${changed_hooks[$i]}" "${changed_labels[$i]}"
+                done
+                MOTD_STATUS="FAILED"
+                return 1
+            fi
+            changed_hooks+=("$motd_news_config")
+            changed_labels+=("$label")
+            changed=1
+            record_change "Disabled Ubuntu motd-news through its official ENABLED=0 configuration switch"
+        elif [[ ! -f "$motd_news_config" || -L "$motd_news_config" ]]; then
+            record_skip "MOTD:motd-news" "official /etc/default/motd-news configuration is unavailable or unsafe; executable hook was preserved and no replacement config was invented"
+        fi
     fi
     for hook in "${presentation_hooks[@]}"; do
         hook="${motd_dir}/${hook}"
@@ -1440,9 +1481,16 @@ configure_motd_presentation() {
             MOTD_STATUS="FAILED"
             return 1
         fi
-        MOTD_STATUS="OK (presentation hooks disabled; reboot notice hook preserved)"
+        if [[ "$motd_news_repaired" -eq 1 ]] && systemctl show --property=ExecMainStatus --value motd-news.service 2>/dev/null | grep -qx '203'; then
+            if run_streamed systemctl reset-failed motd-news.service; then
+                record_change "Reset only the stale motd-news.service 203/EXEC failure after restoring its executable ExecStart target"
+            else
+                log WARN "Could not reset the stale motd-news.service failure state after executable permission repair"
+            fi
+        fi
+        MOTD_STATUS="OK (presentation hooks disabled; motd-news disabled via official config; reboot notice hook preserved)"
     else
-        MOTD_STATUS="OK (already converged; reboot notice hook preserved)"
+        MOTD_STATUS="OK (already converged; motd-news disabled via official config; reboot notice hook preserved)"
     fi
     return 0
 }

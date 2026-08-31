@@ -2616,33 +2616,66 @@ EOF
         MODE=dry-run; configure_banners
     ' _ "$repo_root" || fail "banner dry-run failed"
 
-    local motd_root="$case_root/motd" motd_dir motd_cache
+    local motd_root="$case_root/motd" motd_dir motd_cache motd_news_config
     motd_dir="$motd_root/update-motd.d"
     motd_cache="$motd_root/motd.dynamic"
+    motd_news_config="$motd_root/default/motd-news"
     local motd_mock_exec=0
     [[ "$(uname -s)" == MINGW* ]] && motd_mock_exec=1
     install -d "$motd_dir"
-    for hook in 00-header 50-landscape-sysinfo 90-updates-available 98-reboot-required; do printf '#!/bin/sh\nexit 0\n' > "$motd_dir/$hook"; chmod 0755 "$motd_dir/$hook"; done
+    for hook in 00-header 50-landscape-sysinfo 50-motd-news 90-updates-available 98-reboot-required; do printf '#!/bin/sh\nexit 0\n' > "$motd_dir/$hook"; chmod 0755 "$motd_dir/$hook"; done
+    chmod 0644 "$motd_dir/50-motd-news"
+    install -d "$(dirname -- "$motd_news_config")"
+    printf 'ENABLED=1\nURLS="https://motd.ubuntu.com"\n' > "$motd_news_config"
     printf 'stale presentation\n' > "$motd_cache"
-    env HARDEN_SOURCE_ONLY=1 HARDEN_UPDATE_MOTD_DIR="$motd_dir" HARDEN_MOTD_CACHE="$motd_cache" MOTD_TEST_MOCK_EXEC="$motd_mock_exec" bash -c '
+    env HARDEN_SOURCE_ONLY=1 HARDEN_UPDATE_MOTD_DIR="$motd_dir" HARDEN_MOTD_CACHE="$motd_cache" HARDEN_MOTD_NEWS_DEFAULT="$motd_news_config" MOTD_TEST_MOCK_EXEC="$motd_mock_exec" bash -c '
         source "$1/harden.sh"; trap - ERR EXIT
         MODE=apply; AGGRESSIVE=1; OS_ID=ubuntu; BACKUP_DIR="$2/backup"; CHANGE_LOG="$2/changes.tsv"; mkdir -p "$BACKUP_DIR"; : > "$CHANGE_LOG"
         transaction_copy() { cp -a -- "$1" "$BACKUP_DIR/$2"; }
-        transaction_restore() { cp -a -- "$BACKUP_DIR/$2" "$1"; chmod 0755 "$1"; }
+        transaction_restore() { cp -a -- "$BACKUP_DIR/$2" "$1"; }
+        systemctl() { case "${1:-}" in show) printf '203\n' ;; reset-failed) : > "$BACKUP_DIR/motd-news-reset" ;; esac; return 0; }
+        replace_setting() { sed -E "s/^[[:space:]]*ENABLED[[:space:]]*=.*/ENABLED=0/" "$1" > "$1.new" && mv "$1.new" "$1"; }
         if [[ "$MOTD_TEST_MOCK_EXEC" == 1 ]]; then
-            chmod() { [[ "$1" == a-x ]] && { : > "${2}.disabled"; return 0; }; command chmod "$@"; }
+            chmod() { case "$1" in a-x) : > "${2}.disabled" ;; a+x) : > "${2}.enabled" ;; *) command chmod "$@" ;; esac; }
         fi
         configure_motd_presentation
         if [[ "$MOTD_TEST_MOCK_EXEC" == 1 ]]; then
             [[ -e "$HARDEN_UPDATE_MOTD_DIR/00-header.disabled" && -e "$HARDEN_UPDATE_MOTD_DIR/50-landscape-sysinfo.disabled" && -e "$HARDEN_UPDATE_MOTD_DIR/90-updates-available.disabled" ]]
+            [[ ! -e "$HARDEN_UPDATE_MOTD_DIR/50-motd-news.disabled" ]]
             [[ ! -e "$HARDEN_UPDATE_MOTD_DIR/98-reboot-required.disabled" && ! -e "$HARDEN_MOTD_CACHE" ]]
         else
             [[ ! -x "$HARDEN_UPDATE_MOTD_DIR/00-header" && ! -x "$HARDEN_UPDATE_MOTD_DIR/50-landscape-sysinfo" && ! -x "$HARDEN_UPDATE_MOTD_DIR/90-updates-available" ]]
-            [[ -x "$HARDEN_UPDATE_MOTD_DIR/98-reboot-required" && ! -e "$HARDEN_MOTD_CACHE" ]]
+            [[ -x "$HARDEN_UPDATE_MOTD_DIR/50-motd-news" && -x "$HARDEN_UPDATE_MOTD_DIR/98-reboot-required" && ! -e "$HARDEN_MOTD_CACHE" ]]
         fi
+        grep -Fxq "ENABLED=0" "$HARDEN_MOTD_NEWS_DEFAULT"
+        [[ "$MOTD_TEST_MOCK_EXEC" == 1 || -e "$BACKUP_DIR/motd-news-reset" ]]
         transaction_restore "$HARDEN_UPDATE_MOTD_DIR/00-header" motd-hook-00-header
         [[ "$MOTD_TEST_MOCK_EXEC" == 1 || -x "$HARDEN_UPDATE_MOTD_DIR/00-header" ]]
     ' _ "$repo_root" "$motd_root" || fail "MOTD presentation classification, preservation, or rollback failed"
+    local motd_noop_root="$case_root/motd-noop" motd_noop_dir="$case_root/motd-noop/update-motd.d" motd_noop_config="$case_root/motd-noop/default/motd-news"
+    install -d "$motd_noop_dir" "$(dirname -- "$motd_noop_config")"
+    printf '#!/bin/sh\nexit 0\n' > "$motd_noop_dir/50-motd-news"; chmod 0755 "$motd_noop_dir/50-motd-news"
+    printf 'ENABLED=0\n' > "$motd_noop_config"
+    env HARDEN_SOURCE_ONLY=1 HARDEN_UPDATE_MOTD_DIR="$motd_noop_dir" HARDEN_MOTD_NEWS_DEFAULT="$motd_noop_config" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        MODE=apply; AGGRESSIVE=1; OS_ID=ubuntu; BACKUP_DIR="$2/backup"; CHANGE_LOG="$2/changes"; mkdir -p "$BACKUP_DIR"; : > "$CHANGE_LOG"; : > "$2/commands"
+        transaction_copy() { printf "copy %s\n" "$1" >> "$2/commands"; }; transaction_restore() { return 0; }
+        systemctl() { printf "%s\n" "$*" >> "$2/commands"; return 0; }
+        configure_motd_presentation
+        [[ "$MOTD_STATUS" == "OK (already converged; motd-news disabled via official config; reboot notice hook preserved)" ]]
+        [[ ! -s "$CHANGE_LOG" && ! -s "$2/commands" ]]
+    ' _ "$repo_root" "$motd_noop_root" || fail "converged motd-news configuration was not a no-op"
+    local motd_dry_root="$case_root/motd-dry" motd_dry_dir="$case_root/motd-dry/update-motd.d" motd_dry_config="$case_root/motd-dry/default/motd-news" motd_dry_cache="$case_root/motd-dry/motd.dynamic"
+    install -d "$motd_dry_dir" "$(dirname -- "$motd_dry_config")"
+    printf '#!/bin/sh\nexit 0\n' > "$motd_dry_dir/50-motd-news"; chmod 0644 "$motd_dry_dir/50-motd-news"
+    printf 'ENABLED=1\n' > "$motd_dry_config"; printf 'stale news\n' > "$motd_dry_cache"
+    env HARDEN_SOURCE_ONLY=1 HARDEN_UPDATE_MOTD_DIR="$motd_dry_dir" HARDEN_MOTD_NEWS_DEFAULT="$motd_dry_config" HARDEN_MOTD_CACHE="$motd_dry_cache" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        MODE=dry-run; AGGRESSIVE=1; OS_ID=ubuntu
+        before_hook="$(sha256sum "$HARDEN_UPDATE_MOTD_DIR/50-motd-news")"; before_config="$(sha256sum "$HARDEN_MOTD_NEWS_DEFAULT")"
+        configure_motd_presentation
+        [[ "$(sha256sum "$HARDEN_UPDATE_MOTD_DIR/50-motd-news")" == "$before_hook" && "$(sha256sum "$HARDEN_MOTD_NEWS_DEFAULT")" == "$before_config" && -e "$HARDEN_MOTD_CACHE" ]]
+    ' _ "$repo_root" || fail "motd-news dry-run wrote files"
     env HARDEN_SOURCE_ONLY=1 HARDEN_UPDATE_MOTD_DIR="$motd_dir" bash -c '
         source "$1/harden.sh"; trap - ERR EXIT
         MODE=apply; AGGRESSIVE=1; OS_ID=debian; configure_motd_presentation
