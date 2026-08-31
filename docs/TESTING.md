@@ -176,7 +176,9 @@ Firewall dürfen dabei unverändert bleiben.
 ```bash
 sudo ./harden.sh --apply --aggressive
 sudo cat /root/ipv6-policy-report.txt
-cat /etc/issue /etc/issue.net
+cmp -s /etc/issue /etc/issue.net
+stat -c '%U:%G:%a %n' /etc/issue /etc/issue.net
+cat /etc/issue
 find /etc/update-motd.d -maxdepth 1 -type f -printf '%m %f\n' | sort
 sudo ./harden.sh --apply --aggressive
 ```
@@ -189,6 +191,30 @@ forwardenden Host müssen `all` und `default` bei `accept_source_route=-1` und
 `forwarding=0` stehen; ein aktiver oder unklarer Forwarding-Zustand wird
 erhalten und blockiert eine Deaktivierung. Prüfe danach SSH und Tailscale
 einschließlich eines genehmigten `tailscale ping <TAILSCALE-PEER>`.
+
+Die beiden Pre-Login-Banner müssen byte-identisch, `root:root` und `0644` sein.
+Der bewusst ausführliche Text gehört ausschließlich in `/etc/issue` und
+`/etc/issue.net`, nicht in das Post-Login-MOTD. `accept_source_route=-1` ist
+eine absichtlich strengere Linux-Policy als Lynis 3.1.6 `prefval=0`: sie lehnt
+alle Routing-Header ab, während `>=0` noch Type 2 zulässt. Diese Abweichung
+wird dokumentiert, nicht durch ein Profil-Skip verborgen.
+
+Für die verbleibenden Paket-/Firewall-Findings zusätzlich prüfen:
+
+```bash
+sudo apt-get check
+sudo cat /root/firewall-rule-inventory.txt
+dpkg-query -W -f='${binary:Package}\t${Status}\n' | awk -F '\t' '$2 == "deinstall ok config-files"'
+test -e /var/run/reboot-required && cat /var/run/reboot-required.pkgs || true
+```
+
+Der Paketpfad darf nur `apt-get upgrade` ohne Removal oder Downgrade ausführen;
+ein Full-/Dist-Upgrade ist kein Testfall. FIRE-4513 bleibt sichtbar, wenn die
+Inventur keine eindeutig redundante, vom Tool selbst verantwortete Regel
+beweist. `LOGG-2190` mit ausschließlich `/memfd:* (deleted)` bleibt eine
+sichtbare akzeptierte Ausnahme; Tailscale-, SSH-, Fail2ban-, NAT- und
+Forwarding-Regeln sowie Automationspakete werden niemals zur Score-Optimierung
+gelöscht bzw. installiert.
 
 Nur auf einer nachweislich IPv6-unbenutzten Test-VM darf zusätzlich der
 explizite Opt-in geprüft werden:

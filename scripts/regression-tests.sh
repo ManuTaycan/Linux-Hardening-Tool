@@ -959,6 +959,126 @@ EOF
         ' _ "$repo_root" "$case_root" || fail "unsafe PackageKit dependency simulation was not blocked"
 }
 
+run_package_upgrade_tests() {
+    local case_root="$test_root/package-upgrade" mock_bin="$test_root/package-upgrade/bin" apt_log="$test_root/package-upgrade/apt.log"
+    install -d "$mock_bin"
+    cat > "$mock_bin/apt-get" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$PACKAGE_UPGRADE_APT_LOG"
+case "${1:-}" in
+    check) exit 0 ;;
+    -s)
+        case "${PACKAGE_UPGRADE_TEST_CASE:-nothing}" in
+            nothing) printf '0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n' ;;
+            upgrades) printf 'Inst openssl [3.0.0] (3.0.1 Ubuntu:26.04/stable)\n' ;;
+            removal) printf 'Remv critical-package [1.0]\nInst openssl [3.0.0] (3.0.1 Ubuntu:26.04/stable)\n' ;;
+            downgrade) printf 'The following packages will be DOWNGRADED:\nInst openssl [3.0.1] (3.0.0 Ubuntu:26.04/stable)\n' ;;
+            *) exit 1 ;;
+        esac
+        ;;
+    -y)
+        [[ "${PACKAGE_UPGRADE_TEST_CASE:-}" == upgrades ]] || exit 64
+        ;;
+    *) exit 64 ;;
+esac
+EOF
+    chmod +x "$mock_bin/apt-get"
+    for test_case in nothing upgrades removal downgrade; do
+        : > "$apt_log"
+        env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 PACKAGE_UPGRADE_APT_LOG="$apt_log" PACKAGE_UPGRADE_TEST_CASE="$test_case" \
+            HARDEN_REBOOT_REQUIRED_FILE="$case_root/reboot-required" bash -c '
+                source "$1/harden.sh"; trap - ERR EXIT
+                MODE=apply; CHANGE_LOG="$2/changes.tsv"; : > "$CHANGE_LOG"; REBOOT_REQUIRED=0
+                log() { :; }; record_change() { :; }; record_skip() { :; }; run_streamed() { "$@"; }
+                upgrade_packages_safely
+                case "$3" in
+                    nothing) [[ "$PACKAGE_UPGRADE_STATUS" == "OK (nothing upgradeable)" ]]; ! grep -Eq "^-y | -y " "$PACKAGE_UPGRADE_APT_LOG" ;;
+                    upgrades) [[ "$PACKAGE_UPGRADE_STATUS" == "OK (upgraded; no reboot required)" ]]; grep -Eq "^-y | -y " "$PACKAGE_UPGRADE_APT_LOG" ;;
+                    removal|downgrade) [[ "$PACKAGE_UPGRADE_STATUS" == "BLOCKED"* ]]; ! grep -Eq "^-y | -y " "$PACKAGE_UPGRADE_APT_LOG" ;;
+                esac
+            ' _ "$repo_root" "$case_root" "$test_case" || fail "package upgrade ${test_case} safety regression failed"
+    done
+    : > "$apt_log"; : > "$case_root/reboot-required"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 PACKAGE_UPGRADE_APT_LOG="$apt_log" PACKAGE_UPGRADE_TEST_CASE=upgrades \
+        HARDEN_REBOOT_REQUIRED_FILE="$case_root/reboot-required" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; CHANGE_LOG="$2/reboot.tsv"; : > "$CHANGE_LOG"; REBOOT_REQUIRED=0
+            log() { :; }; record_change() { :; }; record_skip() { :; }; run_streamed() { "$@"; }
+            upgrade_packages_safely
+            [[ "$REBOOT_REQUIRED" -eq 1 && "$PACKAGE_UPGRADE_STATUS" == "OK (upgraded; reboot required)" ]]
+        ' _ "$repo_root" "$case_root" || fail "package upgrade reboot marker regression failed"
+}
+
+run_residual_purge_tests() {
+    local case_root="$test_root/residual-purge" mock_bin="$test_root/residual-purge/bin"
+    install -d "$mock_bin"
+    cat > "$mock_bin/dpkg-query" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == -W ]]; then
+    if [[ "${3:-}" == safe-residual ]]; then
+        [[ "${RESIDUAL_STATE:-present}" == present ]] && printf 'deinstall ok config-files\n'
+        exit 0
+    fi
+    if [[ "${RESIDUAL_STATE:-present}" == present ]]; then
+        printf 'safe-residual\tdeinstall ok config-files\n'
+    fi
+    [[ "${RESIDUAL_PROTECTED:-0}" == 1 ]] && printf 'openssh-server\tdeinstall ok config-files\n'
+fi
+EOF
+    cat > "$mock_bin/apt-get" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == -s ]]; then
+    if [[ "${RESIDUAL_UNREQUESTED:-0}" == 1 ]]; then printf 'Purg safe-residual [1.0]\nPurg unrelated-config [1.0]\n'; else printf 'Purg safe-residual [1.0]\n'; fi
+elif [[ " $* " == *' purge -y '* ]]; then
+    printf '%s\n' "$*" >> "$RESIDUAL_APT_LOG"
+    printf cleared > "$RESIDUAL_STATE_FILE"
+fi
+EOF
+    chmod +x "$mock_bin/dpkg-query" "$mock_bin/apt-get"
+    : > "$case_root/apt.log"; : > "$case_root/state"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 RESIDUAL_APT_LOG="$case_root/apt.log" RESIDUAL_STATE_FILE="$case_root/state" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        MODE=apply; CHANGE_LOG="$2/changes.tsv"; : > "$CHANGE_LOG"; BACKUP_DIR="$2/backup"; mkdir -p "$BACKUP_DIR"
+        log() { :; }; record_change() { :; }; record_skip() { :; }; run_streamed() { "$@"; }
+        dpkg-query() { if [[ -s "$RESIDUAL_STATE_FILE" ]]; then RESIDUAL_STATE=cleared command dpkg-query "$@"; else RESIDUAL_STATE=present command dpkg-query "$@"; fi; }
+        purge_removed_packages final
+        grep -Fq "purge -y safe-residual" "$RESIDUAL_APT_LOG" || { cat "$RESIDUAL_APT_LOG" >&2; exit 1; }
+        ! grep -Fq safe-residual < <(dpkg-query -W) || { dpkg-query -W >&2; exit 1; }
+    ' _ "$repo_root" "$case_root" || fail "residual package final sweep regression failed"
+    : > "$case_root/apt.log"; : > "$case_root/state"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 RESIDUAL_APT_LOG="$case_root/apt.log" RESIDUAL_STATE_FILE="$case_root/state" RESIDUAL_UNREQUESTED=1 bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        MODE=apply; CHANGE_LOG="$2/unrequested.tsv"; : > "$CHANGE_LOG"; log() { :; }; record_change() { :; }; record_skip() { :; }; run_streamed() { "$@"; }
+        purge_removed_packages final
+        [[ ! -s "$RESIDUAL_APT_LOG" ]]
+    ' _ "$repo_root" "$case_root" || fail "residual package unrequested purge was not blocked"
+}
+
+run_firewall_inventory_tests() {
+    local case_root="$test_root/firewall-inventory" mock_bin="$test_root/firewall-inventory/bin" command_log="$test_root/firewall-inventory/commands.log"
+    install -d "$mock_bin"
+    cat > "$mock_bin/nft" <<'EOF'
+#!/usr/bin/env bash
+printf 'nft %s\n' "$*" >> "$FIREWALL_TEST_COMMAND_LOG"
+if [[ "$*" == 'list ruleset' ]]; then printf 'table inet tailscale { chain ts-input { } }\n'; elif [[ "$*" == 'list table inet hardening_filter' ]]; then printf 'table inet hardening_filter { chain input { tcp dport 22 accept } }\n'; fi
+EOF
+    cat > "$mock_bin/iptables" <<'EOF'
+#!/usr/bin/env bash
+printf 'iptables %s\n' "$*" >> "$FIREWALL_TEST_COMMAND_LOG"
+printf '%s\n' '-P INPUT ACCEPT'
+EOF
+    cp "$mock_bin/iptables" "$mock_bin/ip6tables"
+    chmod +x "$mock_bin/nft" "$mock_bin/iptables" "$mock_bin/ip6tables"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_FIREWALL_RULE_REPORT="$case_root/report.txt" FIREWALL_TEST_COMMAND_LOG="$command_log" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        MODE=apply; log() { :; }; record_skip() { :; }
+        inspect_firewall_rule_hygiene
+        [[ "$FIREWALL_RULE_HYGIENE_STATUS" == "INVENTORIED"* || "$FIREWALL_RULE_HYGIENE_STATUS" == "REVIEW REQUIRED"* ]]
+        grep -Fq "table inet tailscale" "$HARDEN_FIREWALL_RULE_REPORT"
+        ! grep -Eqi "(delete|flush| -D )" "$FIREWALL_TEST_COMMAND_LOG"
+    ' _ "$repo_root" || fail "FIRE-4513 inventory safety regression failed"
+}
+
 run_compiler_tests() {
     local case_root="$test_root/compiler" mock_bin="$test_root/compiler/bin" apt_log="$test_root/compiler/apt.log"
     install -d "$mock_bin" "$case_root/backup" "$case_root/empty-usr/bin" "$case_root/empty-local/bin"
@@ -1929,8 +2049,27 @@ EOF
             mkdir -p -- "$(dirname -- "$destination")"; cp -- "$temporary" "$destination"; chmod "$mode" "$destination"; rm -f "$temporary"; MANAGED_FILE_CHANGED=1
         }
         configure_banners
-        expected="Authorized access only. Disconnect if you are not authorized."
+        expected="$(cat <<"EOF"
+*******************************************************************************
+                        AUTHORIZED ACCESS ONLY
+
+  This system is the private property of its owner. Unauthorized access,
+  use, modification, or disclosure of data on this system is prohibited
+  and may be subject to criminal prosecution under applicable law.
+
+  All activities on this system are monitored and recorded. By continuing,
+  you consent to this monitoring. Evidence of unauthorized use may be
+  disclosed to law enforcement authorities.
+
+  Disconnect IMMEDIATELY if you are not an authorized user.
+*******************************************************************************
+EOF
+)"
         [[ "$(cat "$HARDEN_ISSUE_FILE")" == "$expected" && "$(cat "$HARDEN_ISSUE_NET_FILE")" == "$expected" ]]
+        cmp -s "$HARDEN_ISSUE_FILE" "$HARDEN_ISSUE_NET_FILE"
+        grep -Fq "AUTHORIZED ACCESS ONLY" "$HARDEN_ISSUE_FILE"
+        grep -Fq "monitored and recorded" "$HARDEN_ISSUE_FILE"
+        grep -Fq "law enforcement authorities" "$HARDEN_ISSUE_FILE"
         [[ "$(stat -c %a "$HARDEN_ISSUE_FILE")" == 644 && "$(stat -c %a "$HARDEN_ISSUE_NET_FILE")" == 644 ]]
         configure_banners
     ' _ "$repo_root" "$banner_root" || fail "banner content, permissions, or idempotence failed"
@@ -2415,6 +2554,12 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
     compiler)
         run_compiler_tests
         ;;
+    packages)
+        run_packagekit_tests
+        run_package_upgrade_tests
+        run_residual_purge_tests
+        run_firewall_inventory_tests
+        ;;
     deleted-open)
         run_deleted_open_tests
         ;;
@@ -2439,6 +2584,9 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
         run_lynis_summary_tests
         run_fail2ban_tests
         run_packagekit_tests
+        run_package_upgrade_tests
+        run_residual_purge_tests
+        run_firewall_inventory_tests
         run_compiler_tests
         run_binfmt_tests
         run_systemd_idempotency_tests
@@ -2457,6 +2605,9 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
         run_lynis_summary_tests
         run_fail2ban_tests
         run_packagekit_tests
+        run_package_upgrade_tests
+        run_residual_purge_tests
+        run_firewall_inventory_tests
         run_compiler_tests
         run_binfmt_tests
         run_systemd_idempotency_tests

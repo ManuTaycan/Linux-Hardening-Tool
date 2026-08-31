@@ -7,6 +7,22 @@ für 1.1.3 wird erst nach dem vollständigen Zielsystemtest erstellt.
 
 ### Changed
 
+- Ubuntu target-test follow-up: Phase 03 now performs one controlled
+  `apt-get upgrade` only after `apt-get check` and a locale-stable simulation;
+  removals and downgrade signals block the operation, conffiles use conservative
+  dpkg defaults, post-check/reboot state are recorded, and an empty upgrade is
+  a true no-op. A final simulated residual-configuration sweep runs after all
+  package-changing phases and retains protected or unrequested dependencies.
+- `/etc/issue` and `/etc/issue.net` now receive the exact byte-identical
+  pre-login legal/consent banner required by the reviewed Lynis 3.1.6 banner
+  heuristics; the dynamic post-login MOTD policy remains presentation-only.
+- FIRE-4513 now writes a root-only nftables/iptables inventory instead of
+  deleting rules without ownership proof. Tailscale, SSH, Fail2ban, NAT,
+  forwarding, and all non-owned rules remain untouched.
+- Remaining-findings documentation distinguishes the accepted anonymous memfd
+  LOGG-2190 case, intentionally retained SSH port 22 and absent automation
+  platform, and explains why IPv6 `accept_source_route=-1` is stricter than
+  Lynis 3.1.6's legacy `prefval=0` rather than a score-gaming mismatch.
 - Unreleased real-test fix: synchronous dual logging replaces the asynchronous
   process-substitution logger, keeps interactive colors, writes ANSI-free logs,
   prevents logging FD inheritance or package-process job-control stalls, and

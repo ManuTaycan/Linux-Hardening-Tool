@@ -66,6 +66,8 @@ APPARMOR_STATUS="NOT RUN"
 AIDE_STATUS="NOT RUN"
 FAIL2BAN_STATUS="NOT RUN"
 UPDATES_STATUS="NOT RUN"
+PACKAGE_UPGRADE_STATUS="NOT RUN"
+FIREWALL_RULE_HYGIENE_STATUS="NOT RUN"
 REMOTE_LOG_STATUS="DISABLED"
 USE_COLOR=0
 LOG_READY=0
@@ -732,14 +734,65 @@ EOF
     fi
 }
 
+upgrade_packages_safely() {
+    local simulation upgrades removals reboot_marker="${HARDEN_REBOOT_REQUIRED_FILE:-/var/run/reboot-required}"
+    if [[ "$MODE" == "dry-run" ]]; then
+        PACKAGE_UPGRADE_STATUS="PLANNED (simulation only; no package changes)"
+        log INFO "Would validate APT and simulate a conservative apt-get upgrade without removals or downgrades"
+        return 0
+    fi
+    if ! run_streamed apt-get check; then
+        PACKAGE_UPGRADE_STATUS="FAILED (APT check before upgrade)"
+        record_skip "PKGS-7392" "apt-get check failed before the controlled upgrade; no package was changed"
+        return 1
+    fi
+    simulation="$(LC_ALL=C apt-get -s --no-remove upgrade 2>&1)" || {
+        PACKAGE_UPGRADE_STATUS="FAILED (upgrade simulation)"
+        record_skip "PKGS-7392" "apt-get --no-remove upgrade simulation failed; no package was changed"
+        return 1
+    }
+    removals="$(awk '$1 == "Remv" || $1 == "Purg" {print $2}' <<<"$simulation")"
+    if [[ -n "$removals" ]] || grep -Eqi 'downgrad(e|ing)|DOWNGRADED' <<<"$simulation"; then
+        PACKAGE_UPGRADE_STATUS="BLOCKED (simulation proposed removal or downgrade)"
+        record_skip "PKGS-7392" "upgrade simulation proposed a removal or downgrade; use a reviewed maintenance workflow instead"
+        return 0
+    fi
+    upgrades="$(awk '$1 == "Inst" {print $2}' <<<"$simulation")"
+    if [[ -z "$upgrades" ]]; then
+        PACKAGE_UPGRADE_STATUS="OK (nothing upgradeable)"
+        log INFO "APT upgrade simulation reports no upgradeable packages"
+        return 0
+    fi
+    if ! run_streamed env DEBIAN_FRONTEND=noninteractive apt-get -y --no-remove \
+        -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade; then
+        PACKAGE_UPGRADE_STATUS="FAILED (apt-get upgrade)"
+        record_skip "PKGS-7392" "conservative apt-get upgrade failed; inspect APT/dpkg output before retrying"
+        return 1
+    fi
+    if ! run_streamed apt-get check; then
+        PACKAGE_UPGRADE_STATUS="FAILED (APT check after upgrade)"
+        record_skip "PKGS-7392" "apt-get check failed after upgrade; inspect APT/dpkg before further hardening"
+        return 1
+    fi
+    if [[ -e "$reboot_marker" ]]; then
+        REBOOT_REQUIRED=1
+        PACKAGE_UPGRADE_STATUS="OK (upgraded; reboot required)"
+    else
+        PACKAGE_UPGRADE_STATUS="OK (upgraded; no reboot required)"
+    fi
+    record_change "Completed conservative package upgrade without removals or downgrades: ${upgrades//$'\n'/, }"
+    return 0
+}
+
 purge_removed_packages() {
-    local -a residual=() safe=() verified=() protected=()
+    local stage="${1:-routine}" package status simulation removals remaining reason
+    local -a residual=() safe=() verified=() protected=() dependency_removals=()
+    declare -A requested=()
     mapfile -t residual < <(dpkg-query -W -f='${binary:Package}\t${Status}\n' 2>/dev/null | awk -F '\t' '$2 == "deinstall ok config-files" {print $1}')
     if ((${#residual[@]} == 0)); then
         log INFO "No residual package configurations found"
         return 0
     fi
-    local package
     for package in "${residual[@]}"; do
         case "$package" in
             linux-*|grub*|shim*|systemd*|openssh*|sudo*|tailscale*|nftables*|iptables*|netplan*|network-manager*|ifupdown*|cloud-init*)
@@ -770,22 +823,35 @@ purge_removed_packages() {
         return 0
     fi
     if [[ "$MODE" == "dry-run" ]]; then
-        log INFO "Would simulate and purge only non-protected residual package configurations: ${safe[*]}"
+        log INFO "Would perform ${stage} residual-config simulation and purge only non-protected packages: ${safe[*]}"
         return 0
     fi
-    local simulation removals
-    simulation="$(apt-get -s purge "${safe[@]}" 2>&1)" || {
+    for package in "${safe[@]}"; do requested["$package"]=1; done
+    simulation="$(LC_ALL=C apt-get -s purge "${safe[@]}" 2>&1)" || {
         record_skip "PKGS-7346" "APT simulation failed; nothing was purged"
         return 0
     }
-    removals="$(awk '$1 == "Remv" {print $2}' <<<"$simulation")"
+    removals="$(parse_apt_purge_packages <<<"$simulation")"
     if grep -E '^(linux-|grub|shim|systemd|openssh|sudo|tailscale|nftables|iptables|netplan|network-manager|ifupdown|cloud-init)' <<<"$removals" >/dev/null; then
         record_skip "PKGS-7346" "APT simulation included a protected dependency; nothing was purged"
         return 0
     fi
+    for package in $removals; do
+        [[ -n "${requested[$package]+requested}" ]] || dependency_removals+=("$package")
+    done
+    if ((${#dependency_removals[@]})); then
+        printf -v reason '%s, ' "${dependency_removals[@]}"
+        record_skip "PKGS-7346" "APT simulation would purge unrequested package configurations: ${reason%, }; nothing was purged"
+        return 0
+    fi
     if run_streamed env DEBIAN_FRONTEND=noninteractive apt-get purge -y "${safe[@]}"; then
         PACKAGES_REMOVED+=("${safe[@]}")
-        record_change "Purged only simulated, non-protected residual package configurations: ${safe[*]}"
+        mapfile -t remaining < <(dpkg-query -W -f='${binary:Package}\t${Status}\n' 2>/dev/null | awk -F '\t' '$2 == "deinstall ok config-files" {print $1}')
+        if ((${#remaining[@]})); then
+            record_skip "PKGS-7346" "residual configurations remain after ${stage} sweep: ${remaining[*]}; see protected/dependency simulation reasons"
+        else
+            record_change "Purged only simulated, non-protected residual package configurations during ${stage} sweep: ${safe[*]}"
+        fi
     fi
 }
 
@@ -1042,15 +1108,27 @@ remote_logging_destination_loaded() {
 }
 
 configure_banners() {
-    local banner='Authorized access only. Disconnect if you are not authorized.' file
+    local file
     local issue_file="${HARDEN_ISSUE_FILE:-/etc/issue}" issue_net_file="${HARDEN_ISSUE_NET_FILE:-/etc/issue.net}"
     if [[ "$MODE" == apply ]]; then
         transaction_copy "$issue_file" issue-banner
         transaction_copy "$issue_net_file" issue-net-banner
     fi
     for file in "$issue_file" "$issue_net_file"; do
-        if ! install_managed_file "$file" 0644 <<EOF
-$banner
+        if ! install_managed_file "$file" 0644 <<'EOF'
+*******************************************************************************
+                        AUTHORIZED ACCESS ONLY
+
+  This system is the private property of its owner. Unauthorized access,
+  use, modification, or disclosure of data on this system is prohibited
+  and may be subject to criminal prosecution under applicable law.
+
+  All activities on this system are monitored and recorded. By continuing,
+  you consent to this monitoring. Evidence of unauthorized use may be
+  disclosed to law enforcement authorities.
+
+  Disconnect IMMEDIATELY if you are not an authorized user.
+*******************************************************************************
 EOF
         then
             [[ "$MODE" != apply ]] || { transaction_restore "$issue_file" issue-banner; transaction_restore "$issue_net_file" issue-net-banner; }
@@ -2769,6 +2847,35 @@ EOF
     run_streamed systemctl daemon-reload
     FIREWALL_STATUS="FAILED/OWNED TABLE ROLLED BACK"
     die "Owned nftables table failed activation or health validation; unrelated tables were never modified"
+}
+
+inspect_firewall_rule_hygiene() {
+    local report="${HARDEN_FIREWALL_RULE_REPORT:-/root/firewall-rule-inventory.txt}" owned_rules=""
+    if [[ "$MODE" == "dry-run" ]]; then
+        FIREWALL_RULE_HYGIENE_STATUS="PLANNED (inventory only; no foreign rule mutation)"
+        log INFO "Would inventory nftables and iptables-nft rules for FIRE-4513 without deleting foreign, Tailscale, SSH, Fail2ban, NAT, or forwarding rules"
+        return 0
+    fi
+    {
+        printf 'Firewall rule inventory for Lynis FIRE-4513\n'
+        printf 'generated=%s\n' "$(timestamp)"
+        printf 'policy=inventory-only; only the harden.sh-owned inet hardening_filter table may ever be replaced\n\n'
+        printf '%s\n' '=== nftables ruleset ==='
+        command -v nft >/dev/null 2>&1 && nft list ruleset || printf 'nft unavailable\n'
+        printf '\n%s\n' '=== iptables IPv4 rules ==='
+        command -v iptables >/dev/null 2>&1 && iptables -S || printf 'iptables unavailable\n'
+        printf '\n%s\n' '=== iptables IPv6 rules ==='
+        command -v ip6tables >/dev/null 2>&1 && ip6tables -S || printf 'ip6tables unavailable\n'
+    } > "$report" 2>&1
+    chmod 0600 "$report"
+    owned_rules="$(nft list table inet hardening_filter 2>/dev/null || true)"
+    if [[ -n "$owned_rules" ]] && grep -Eq '(^|[[:space:]])(tailscale|fail2ban|masquerade|postrouting|forward|ssh)([[:space:]_:-]|$)' <<<"$owned_rules"; then
+        FIREWALL_RULE_HYGIENE_STATUS="REVIEW REQUIRED (owned table contains role-sensitive rule; no deletion)"
+    else
+        FIREWALL_RULE_HYGIENE_STATUS="INVENTORIED (foreign and role-sensitive rules preserved)"
+    fi
+    record_skip "FIRE-4513" "iptables/nftables inventory saved to ${report}; no rule was deleted because non-owned, Tailscale, SSH, Fail2ban, NAT, forwarding, and system rules are safety-critical"
+    return 0
 }
 
 harden_ssh() {
@@ -5795,17 +5902,19 @@ explain_open_test() {
         FILE-6310) printf '%s\n' '/home or /var is not a separate filesystem.' 'Repartition/LVM-migrate these paths during a maintenance window.' 'An in-place move can exhaust storage, corrupt boot mounts, or cause prolonged downtime.' ;;
         USB-1000) printf '%s\n' 'USB storage was preserved because --aggressive was not used or USB-backed storage is mounted.' 'Verify hardware dependencies and rerun with --aggressive.' 'Blocking usb-storage can make virtual media, backup disks, or boot/recovery devices unavailable.' ;;
         NAME-4028) printf '%s\n' 'The host has no administrator-provided DNS domain.' 'Create matching forward/reverse DNS and configure a valid FQDN.' 'Inventing a local domain can break TLS, mail, Kerberos, and service discovery.' ;;
-        PKGS-7346) printf '%s\n' 'Residual package configuration could not be purged.' 'Review dpkg-query rc entries and purge the named packages.' 'Purge maintainer scripts can remove configuration still needed for rollback.' ;;
+        PKGS-7346) printf '%s\n' 'Residual package configurations remain after the final simulated purge sweep.' 'Review the named rc packages and the recorded protected/dependency simulation reason.' 'Purge maintainer scripts can remove configuration still needed for rollback.' ;;
+        PKGS-7392) printf '%s\n' 'A conservative apt-get upgrade was blocked or failed validation.' 'Review the saved APT simulation and run a maintenance-window upgrade without removals/downgrades.' 'A full/dist-upgrade or unreviewed removal can replace critical packages and require recovery.' ;;
+        FIRE-4513) printf '%s\n' 'Lynis observed iptables-nft/nftables rules it considers unused.' 'Review /root/firewall-rule-inventory.txt and remove only a rule proven redundant and owned by the local operator.' 'Deleting Tailscale, SSH, Fail2ban, NAT, forwarding, or foreign rules solely for a score can sever access or break routing.' ;;
         NETW-3200) printf '%s\n' 'A protocol module remains loaded or available despite the modprobe policy.' 'Stop its consumer, unload it, rebuild initramfs, and reboot.' 'Removing an in-use protocol can terminate clustered/storage/network workloads.' ;;
         SSH-7408) printf '%s\n' 'SSH-7408: SSH port intentionally preserved; changing the port is not considered a meaningful security control for this deployment.' 'No Port directive is managed; the detected port is used only for firewall and Fail2ban policy.' 'Changing the listening port can cause lockout without providing a substantive security boundary.' ;;
         LOGG-2154) printf '%s\n' 'No remote logging destination was selected or rsyslog validation failed.' 'Rerun with REMOTE_LOG_SERVER/PORT/PROTOCOL and, for TLS, a trusted CA file.' 'A wrong destination can disclose logs; an invalid queue/TLS setup can drop remote copies.' ;;
-        LOGG-2190) printf '%s\n' 'Deleted files remain open after allowlisted safe service restarts.' 'Review deleted-open-files-after-remediation.txt and restart the remaining owner only during an approved maintenance window.' 'Blind service restarts can interrupt SSH, networking, storage, or applications.' ;;
+        LOGG-2190) printf '%s\n' 'Deleted-file inventory is retained for review; anonymous memfd entries are non-persistent RAM objects, not orphaned filesystem inodes.' 'Review the deleted-open-file report and restart only an allowlisted owner during an approved maintenance window when an actionable file remains.' 'Blind service restarts can interrupt SSH, networking, storage, or applications.' ;;
         PROC-3614) printf '%s\n' 'One or more processes were observed in uninterruptible IO wait.' 'Review /root/hardening-iowait-processes.txt and diagnose the named device, filesystem, or kernel wait channel.' 'Killing a blocked process can corrupt data and often cannot complete until the kernel IO wait resolves.' ;;
         ACCT-9622|ACCT-9628|ACCT-9630) printf '%s\n' 'Accounting/audit package or service was unavailable, rejected rules, could not start, or runtime rules were empty.' 'Review journalctl and auditctl -l, correct any rejected kernel-specific rule, and reload with augenrules.' 'Invalid or overly broad audit rules can cause boot delay, log exhaustion, or lost events.' ;;
         FINT-4315|FINT-4316|FINT-4350|FINT-4402) printf '%s\n' 'AIDE was unavailable, its effective SHA-2 runtime policy failed validation, or its declared active database was absent.' 'Review the saved config-check, aide --init, and aide --check output, then initialize a trusted SHA256/SHA512 baseline.' 'A baseline created on a compromised system legitimizes malicious files; scans are I/O intensive.' ;;
         TOOL-5002) printf '%s\n' 'No automation platform was installed solely to satisfy a score.' 'Adopt a real configuration-management platform when there is an operational owner.' 'An unused privileged agent expands attack surface and supply-chain trust.' ;;
         FILE-7524) printf '%s\n' 'At least one Lynis static permission target still differs from its profile.' 'Use lynis show details FILE-7524 and correct only the named object.' 'Blind recursive chmod can break package ownership, setuid helpers, ACLs, and services.' ;;
-        KRNL-6000) printf '%s\n' 'All managed sysctls are validated; with active Tailscale, net.ipv4.conf.all.rp_filter=2 is an intentional overlay-routing exception to Lynis expected value 1.' 'Keep value 2 while asymmetric Tailscale routing is required; correct any separately listed mismatched key.' 'Forcing strict reverse-path filtering can discard valid overlay traffic and remove remote access.' ;;
+        KRNL-6000) printf '%s\n' 'IPv6 accept_source_route=-1 is stricter Linux semantics than Lynis 3.1.6 prefval=0: -1 rejects every routing header, while >=0 still permits Type 2.' 'Keep the validated -1 policy and separately review only named mismatched keys; do not skip or tune Lynis.' 'Relaxing source-route handling merely to match a legacy preference weakens IPv6 packet validation.' ;;
         HRDN-7222) printf '%s\n' 'A compiler remains executable to non-root or was restored by a package update.' 'Remove unused development packages or rerun --aggressive after dependency review.' 'Removing/restricting toolchains can break DKMS, package builds, and diagnostics.' ;;
         HRDN-7230) printf '%s\n' 'No supported repository malware scanner was available/detected.' 'Install and schedule a maintained scanner from an official repository.' 'Rootkit scanners can produce false positives and consume significant I/O.' ;;
         BANN-7126|BANN-7130) printf '%s\n' 'The local policy banner did not match the Lynis heuristic.' 'Have legal counsel approve organization-specific /etc/issue and /etc/issue.net text.' 'Incorrect legal language can weaken rather than strengthen notice/consent arguments.' ;;
@@ -5867,6 +5976,9 @@ write_open_findings_report() {
             '- AUTH-9230: legacy SHA rounds are not added when YESCRYPT is the effective password hash method.' \
             '- NAME-4028: an organization/domain-dependent DNS identity is not invented.' \
             '- AUTH-9282: no fixed account expiration is imposed without an explicit owner decision.' \
+            '- KRNL-6000/IPv6 source routing: accept_source_route=-1 is intentionally stricter than Lynis 3.1.6 prefval=0; it rejects all routing headers while >=0 still accepts Type 2.' \
+            '- TOOL-5002: no privileged automation agent is installed without an operational deployment owner.' \
+            '- LOGG-2190: anonymous /memfd:* (deleted) entries remain visible as non-actionable volatile exceptions; no restart, kill, or reboot is forced.' \
             "$mor_finding"
         if systemctl is-active --quiet tailscaled.service 2>/dev/null; then
             printf '%s\n' "- KRNL-6000/rp_filter: ${RP_FILTER_POLICY}; ${RP_FILTER_REASON}. This is an accepted routing policy, not a Lynis score change."
@@ -5908,6 +6020,7 @@ Aggressive         : ${aggressive_label}
 
 SSH                : ${SSH_STATUS}
 Firewall           : ${FIREWALL_STATUS}
+Firewall rule audit: ${FIREWALL_RULE_HYGIENE_STATUS}
 PAM                : ${PAM_STATUS}
 Failed-login log   : ${FAILED_LOGIN_STATUS}
 Shell timeout      : ${SHELL_TIMEOUT_STATUS}
@@ -5919,6 +6032,7 @@ AIDE               : ${AIDE_STATUS}
 Fail2ban           : ${FAIL2BAN_STATUS}
 Remote Logging     : ${REMOTE_LOG_STATUS}
 Automatic Updates  : ${UPDATES_STATUS}
+Package upgrade    : ${PACKAGE_UPGRADE_STATUS}
 rp_filter Policy   : ${RP_FILTER_POLICY}
 rp_filter Runtime  : ${RP_FILTER_RUNTIME_STATUS}
 rp_filter Report   : $([[ "$MODE" == "apply" ]] && printf '%s' "${HARDEN_RP_FILTER_REPORT:-/root/tailscale-rp-filter-report.txt}" || printf 'not written in dry-run')
@@ -5995,6 +6109,7 @@ main() {
     log WARN "Phase 03 installs and configures security packages and may legitimately take several minutes on a fresh server; package operations are not subject to artificial timeouts"
     prepare_packages
     configure_apt
+    upgrade_packages_safely
     configure_updates
     configure_debsums
     purge_removed_packages
@@ -6018,6 +6133,7 @@ main() {
 
     phase 07 18 "Firewall"
     configure_firewall
+    inspect_firewall_rule_hygiene
     if [[ "$MODE" != "apply" || "$FIREWALL_STATUS" == OK* ]]; then FIREWALL_COMPLETED=1; fi
 
     phase 08 18 "SSH"
@@ -6042,6 +6158,7 @@ main() {
     configure_malware_scanner
     harden_systemd_services
     verify_disabled_services
+    purge_removed_packages "final post-package-change"
 
     phase 12 18 "AppArmor"
     configure_apparmor
