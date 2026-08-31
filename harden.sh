@@ -23,6 +23,7 @@ readonly MAIN_PID="$BASHPID"
 MODE=""
 AGGRESSIVE=0
 AUTO_REBOOT=0
+DISABLE_IPV6=0
 NON_INTERACTIVE=0
 OS_ID=""
 OS_VERSION=""
@@ -65,6 +66,9 @@ APPARMOR_STATUS="NOT RUN"
 AIDE_STATUS="NOT RUN"
 FAIL2BAN_STATUS="NOT RUN"
 UPDATES_STATUS="NOT RUN"
+PACKAGE_UPGRADE_STATUS="NOT RUN"
+RESIDUAL_PURGE_STATUS="NOT RUN"
+FIREWALL_RULE_HYGIENE_STATUS="NOT RUN"
 REMOTE_LOG_STATUS="DISABLED"
 USE_COLOR=0
 LOG_READY=0
@@ -91,6 +95,17 @@ DELETED_OPEN_FILES_STATUS="NOT RUN"
 DELETED_OPEN_FILES_REPORT="/root/deleted-open-files-report.txt"
 UEFI_MOR_STATUS="NOT RUN"
 UEFI_MOR_REPORT="${HARDEN_UEFI_MOR_REPORT:-/root/uefi-mor-report.txt}"
+IPV6_POLICY="NOT RUN"
+IPV6_REASON="not assessed"
+IPV6_RUNTIME_STATUS="NOT RUN"
+IPV6_PERSISTENCE_STATUS="NOT RUN"
+IPV6_REPORT="${HARDEN_IPV6_REPORT:-/root/ipv6-policy-report.txt}"
+IPV6_FORWARDING_STATE="NOT RUN"
+IPV6_MANAGED_DISABLE_EXISTING=0
+declare -A IPV6_RUNTIME_BEFORE=()
+declare -a IPV6_RUNTIME_INTERFACE_ORDER=()
+BANNER_STATUS="NOT RUN"
+MOTD_STATUS="NOT RUN"
 
 readonly COLOR_RESET=$'\033[0m'
 readonly COLOR_DIM=$'\033[2m'
@@ -121,13 +136,14 @@ declare -A SERVICE_EXPOSURE_AFTER=()
 
 usage() {
     cat <<'EOF'
-Usage: harden.sh (--dry-run | --apply) [--aggressive] [--reboot] [--non-interactive]
+Usage: harden.sh (--dry-run | --apply) [--aggressive] [--disable-ipv6] [--reboot] [--non-interactive]
                  [--no-color] [--remote-log-server HOST]
                  [--remote-log-port PORT] [--remote-log-protocol tcp|udp|tls]
 
   --dry-run          Show planned changes. No files, logs, packages, or services change.
   --apply            Apply hardening (must run as root or through sudo).
   --aggressive       Enable compatibility-sensitive server controls.
+  --disable-ipv6     Explicitly disable unused IPv6 (requires --aggressive; never default).
   --reboot           Reboot after a successful --apply run if a reboot is required.
   --non-interactive  Do not prompt for a remote log server; use REMOTE_LOG_* variables.
   --no-color         Disable ANSI colors even on an interactive terminal.
@@ -366,6 +382,7 @@ parse_args() {
                 MODE="apply"
                 ;;
             --aggressive) AGGRESSIVE=1 ;;
+            --disable-ipv6) DISABLE_IPV6=1 ;;
             --reboot) AUTO_REBOOT=1 ;;
             --non-interactive) NON_INTERACTIVE=1 ;;
             --no-color) USE_COLOR=0 ;;
@@ -398,6 +415,9 @@ parse_args() {
     [[ -n "$MODE" ]] || { usage >&2; die "Specify --dry-run or --apply"; }
     if [[ "$AUTO_REBOOT" -eq 1 && "$MODE" != "apply" ]]; then
         die "--reboot is valid only with --apply"
+    fi
+    if [[ "$DISABLE_IPV6" -eq 1 && "$AGGRESSIVE" -ne 1 ]]; then
+        die "--disable-ipv6 requires --aggressive and is intentionally default-off"
     fi
     if [[ "$REMOTE_LOG_OPTION_SEEN" -eq 1 && -z "$REMOTE_LOG_SERVER" ]]; then
         die "--remote-log-port/--remote-log-protocol require --remote-log-server (or REMOTE_LOG_SERVER)"
@@ -460,7 +480,7 @@ backup_config() {
         /etc/systemd /etc/audit /etc/rsyslog.conf /etc/rsyslog.d
         /etc/nftables.conf /etc/nftables.d /etc/fail2ban /etc/sudoers
         /etc/sudoers.d /etc/login.defs /etc/profile.d /etc/modprobe.d /etc/fstab /etc/apt
-        /etc/default/grub /etc/default/grub.d /etc/grub.d /etc/issue /etc/issue.net
+        /etc/default/grub /etc/default/grub.d /etc/grub.d /etc/issue /etc/issue.net /etc/update-motd.d
     )
     local -a present=()
     local item
@@ -620,14 +640,16 @@ install_package() {
     return 0
 }
 
-prepare_packages() {
+refresh_apt_metadata() {
     if [[ "$MODE" == "apply" ]]; then
         log INFO "Refreshing APT metadata from configured repositories"
         run_streamed env DEBIAN_FRONTEND=noninteractive apt-get update
     else
-        log INFO "Would run apt-get update before package availability checks"
+        log INFO "Would run apt-get update"
     fi
+}
 
+prepare_packages() {
     local -a common_packages=(
         auditd audispd-plugins apparmor apparmor-utils fail2ban aide aide-common rsyslog
         libpam-pwquality needrestart unattended-upgrades debsums acct nftables
@@ -715,26 +737,228 @@ EOF
     fi
 }
 
+upgrade_packages_safely() {
+    local simulation upgrades removals reboot_marker="${HARDEN_REBOOT_REQUIRED_FILE:-/var/run/reboot-required}"
+    if [[ "$MODE" == "dry-run" ]]; then
+        PACKAGE_UPGRADE_STATUS="PLANNED (simulation only; no package changes)"
+        log INFO "Would simulate/apply conservative apt-get upgrade without removals or downgrades"
+        return 0
+    fi
+    if ! run_streamed apt-get check; then
+        PACKAGE_UPGRADE_STATUS="FAILED (APT check before upgrade)"
+        record_skip "PKGS-7392" "apt-get check failed before the controlled upgrade; no package was changed"
+        return 1
+    fi
+    simulation="$(LC_ALL=C apt-get -s --no-remove upgrade 2>&1)" || {
+        PACKAGE_UPGRADE_STATUS="FAILED (upgrade simulation)"
+        record_skip "PKGS-7392" "apt-get --no-remove upgrade simulation failed; no package was changed"
+        return 1
+    }
+    removals="$(awk '$1 == "Remv" || $1 == "Purg" {print $2}' <<<"$simulation")"
+    if [[ -n "$removals" ]] || grep -Eqi 'downgrad(e|ing)|DOWNGRADED' <<<"$simulation"; then
+        PACKAGE_UPGRADE_STATUS="BLOCKED (simulation proposed removal or downgrade)"
+        record_skip "PKGS-7392" "upgrade simulation proposed a removal or downgrade; use a reviewed maintenance workflow instead"
+        return 0
+    fi
+    upgrades="$(awk '$1 == "Inst" {print $2}' <<<"$simulation")"
+    if [[ -z "$upgrades" ]]; then
+        PACKAGE_UPGRADE_STATUS="OK (nothing upgradeable)"
+        log INFO "APT upgrade simulation reports no upgradeable packages"
+        return 0
+    fi
+    if ! run_streamed env DEBIAN_FRONTEND=noninteractive apt-get -y --no-remove \
+        -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade; then
+        PACKAGE_UPGRADE_STATUS="FAILED (apt-get upgrade)"
+        record_skip "PKGS-7392" "conservative apt-get upgrade failed; inspect APT/dpkg output before retrying"
+        return 1
+    fi
+    if ! run_streamed apt-get check; then
+        PACKAGE_UPGRADE_STATUS="FAILED (APT check after upgrade)"
+        record_skip "PKGS-7392" "apt-get check failed after upgrade; inspect APT/dpkg before further hardening"
+        return 1
+    fi
+    if [[ -e "$reboot_marker" ]]; then
+        REBOOT_REQUIRED=1
+        PACKAGE_UPGRADE_STATUS="OK (upgraded; reboot required)"
+    else
+        PACKAGE_UPGRADE_STATUS="OK (upgraded; no reboot required)"
+    fi
+    record_change "Completed conservative package upgrade without removals or downgrades: ${upgrades//$'\n'/, }"
+    return 0
+}
+
+kernel_residual_version() {
+    local package="${1%%:*}" version=""
+    case "$package" in
+        linux-image-unsigned-*) version="${package#linux-image-unsigned-}" ;;
+        linux-image-*) version="${package#linux-image-}" ;;
+        linux-modules-extra-*) version="${package#linux-modules-extra-}" ;;
+        linux-modules-*) version="${package#linux-modules-}" ;;
+        linux-main-modules-*)
+            [[ "$package" =~ ^linux-main-modules-.+-([0-9]+(\.[0-9]+)+-[0-9]+-[[:alnum:].+~-]+)$ ]] || return 1
+            version="${BASH_REMATCH[1]}"
+            ;;
+        *) return 1 ;;
+    esac
+    [[ "$version" =~ ^[0-9]+(\.[0-9]+)+-[0-9]+-[[:alnum:].+~-]+$ ]] || return 1
+    printf '%s\n' "$version"
+}
+
+kernel_version_has_installed_package() {
+    local version="$1" inventory
+    inventory="$(dpkg-query -W -f='${binary:Package}\t${Status}\n' 2>/dev/null)" || return 2
+    awk -F '\t' -v version="$version" '
+            $2 == "install ok installed" {
+                package=$1
+                sub(/:[^:]+$/, "", package)
+                if (length(package) > length(version) && substr(package, length(package) - length(version)) == "-" version) {
+                    found=1
+                }
+            }
+            END { exit(found ? 0 : 1) }
+        ' <<<"$inventory"
+}
+
+kernel_residual_boot_artifacts_exist() {
+    local version="$1" boot_dir="${HARDEN_BOOT_DIR:-/boot}" artifact
+    [[ -d "$boot_dir" && -r "$boot_dir" ]] || return 2
+    for artifact in "${boot_dir}/vmlinuz-${version}" "${boot_dir}/initrd.img-${version}" \
+        "${boot_dir}/System.map-${version}" "${boot_dir}/config-${version}"; do
+        [[ -e "$artifact" || -L "$artifact" ]] && return 0
+    done
+    return 1
+}
+
+kernel_residual_is_boot_target() {
+    local version="$1" boot_dir="${HARDEN_BOOT_DIR:-/boot}" link target
+    local link_root="${HARDEN_BOOT_SYMLINK_DIR:-/}"
+    for link in "${link_root%/}/vmlinuz" "${link_root%/}/initrd.img" \
+        "${boot_dir}/vmlinuz" "${boot_dir}/initrd.img"; do
+        [[ -e "$link" || -L "$link" ]] || continue
+        target="$(readlink -f -- "$link" 2>/dev/null || true)"
+        [[ -n "$target" ]] || return 2
+        [[ "${target##*/}" == *-"${version}" ]] && return 0
+    done
+    return 1
+}
+
+efi_grub_stack_is_valid() {
+    local efi_runtime="${HARDEN_EFI_RUNTIME_DIR:-/sys/firmware/efi}"
+    local efi_boot_dir="${HARDEN_EFI_BOOT_DIR:-/boot/efi}"
+    local grub_dir="${HARDEN_GRUB_DIR:-/boot/grub}"
+    local efi_binary
+    [[ -d "$efi_runtime" && -f "${grub_dir}/grub.cfg" && -d "${efi_boot_dir}/EFI" ]] || return 1
+    efi_binary="$(find "${efi_boot_dir}/EFI" -type f -iname '*.efi' -print -quit 2>/dev/null || true)"
+    [[ -n "$efi_binary" ]] || return 1
+    dpkg-query -W -f='${binary:Package}\t${Status}\n' 2>/dev/null | \
+        awk -F '\t' '
+            $2 == "install ok installed" {
+                package=$1
+                sub(/:[^:]+$/, "", package)
+                if (package ~ /^grub-efi-(amd64|arm64|ia32)$/) found=1
+            }
+            END { exit(found ? 0 : 1) }
+        '
+}
+
+current_kernel_boot_manifest() {
+    local boot_dir="${HARDEN_BOOT_DIR:-/boot}" kernel="$1" artifact
+    for artifact in "${boot_dir}/vmlinuz-${kernel}" "${boot_dir}/initrd.img-${kernel}" \
+        "${boot_dir}/System.map-${kernel}" "${boot_dir}/config-${kernel}"; do
+        [[ -e "$artifact" || -L "$artifact" ]] || continue
+        sha256sum -- "$artifact" 2>/dev/null || return 1
+    done
+}
+
+residual_package_is_eligible() {
+    local package="$1" current_kernel="$2" version inspection_status
+    case "${package%%:*}" in
+        grub-pc)
+            if efi_grub_stack_is_valid; then
+                return 0
+            fi
+            printf '%s\n' "grub-pc residual retained: UEFI runtime, EFI GRUB packages, EFI boot files, or grub.cfg could not be verified"
+            return 1
+            ;;
+        linux-image-generic*|linux-generic*|linux-headers-generic*|linux-meta*|linux-signed-generic*)
+            printf '%s\n' "kernel meta package retained"
+            return 1
+            ;;
+        linux-image-*|linux-modules-*|linux-main-modules-*)
+            version="$(kernel_residual_version "$package" 2>/dev/null || true)"
+            if [[ -z "$version" ]]; then
+                printf '%s\n' "kernel package name/version is ambiguous"
+                return 1
+            fi
+            if [[ "$version" == "$current_kernel" ]]; then
+                printf '%s\n' "running kernel version ${version} is never purged"
+                return 1
+            fi
+            if kernel_version_has_installed_package "$version"; then
+                printf '%s\n' "an installed package still owns kernel version ${version}"
+                return 1
+            else
+                inspection_status=$?
+                if ((inspection_status != 1)); then
+                    printf '%s\n' "installed package inventory could not be inspected for kernel version ${version}"
+                    return 1
+                fi
+            fi
+            if kernel_residual_boot_artifacts_exist "$version"; then
+                printf '%s\n' "matching /boot artifact exists for kernel version ${version}"
+                return 1
+            else
+                inspection_status=$?
+                if ((inspection_status != 1)); then
+                    printf '%s\n' "/boot artifacts could not be inspected for kernel version ${version}"
+                    return 1
+                fi
+            fi
+            if kernel_residual_is_boot_target "$version"; then
+                printf '%s\n' "kernel version ${version} is referenced by a boot symlink"
+                return 1
+            else
+                inspection_status=$?
+                if ((inspection_status != 1)); then
+                    printf '%s\n' "boot symlink target could not be inspected for kernel version ${version}"
+                    return 1
+                fi
+            fi
+            return 0
+            ;;
+        linux-*|grub*|shim*|systemd*|openssh*|sudo*|tailscale*|nftables*|iptables*|netplan*|network-manager*|ifupdown*|cloud-init*)
+            printf '%s\n' "protected boot, kernel, SSH, network, or host-critical package"
+            return 1
+            ;;
+        *) return 0 ;;
+    esac
+}
+
 purge_removed_packages() {
-    local -a residual=() safe=() verified=() protected=()
+    local stage="${1:-routine}" package status simulation removals remaining reason eligibility_reason
+    local current_kernel boot_manifest reboot_required_before validation_failed=0
+    local -a residual=() safe=() verified=() protected=() dependency_removals=() simulated_removals=()
+    declare -A requested=()
     mapfile -t residual < <(dpkg-query -W -f='${binary:Package}\t${Status}\n' 2>/dev/null | awk -F '\t' '$2 == "deinstall ok config-files" {print $1}')
     if ((${#residual[@]} == 0)); then
+        RESIDUAL_PURGE_STATUS="OK (no residual configurations)"
         log INFO "No residual package configurations found"
         return 0
     fi
-    local package
+    current_kernel="$(uname -r)"
     for package in "${residual[@]}"; do
-        case "$package" in
-            linux-*|grub*|shim*|systemd*|openssh*|sudo*|tailscale*|nftables*|iptables*|netplan*|network-manager*|ifupdown*|cloud-init*)
-                protected+=("$package")
-                ;;
-            *) safe+=("$package") ;;
-        esac
+        eligibility_reason="$(residual_package_is_eligible "$package" "$current_kernel" 2>/dev/null || true)"
+        if [[ -n "$eligibility_reason" ]]; then
+            protected+=("${package}: ${eligibility_reason}")
+        else
+            safe+=("$package")
+        fi
     done
     if ((${#protected[@]})); then
-        record_skip "PKGS-7346" "protected residual boot/kernel/SSH/network package configurations were retained: ${protected[*]}"
+        record_skip "PKGS-7346" "protected or unverifiable residual configurations were retained: ${protected[*]}"
     fi
     if ((${#safe[@]} == 0)); then
+        RESIDUAL_PURGE_STATUS="OK (no safely purgeable residual configurations)"
         log INFO "No non-protected residual package configurations are eligible for purge"
         return 0
     fi
@@ -749,26 +973,73 @@ purge_removed_packages() {
     done
     safe=("${verified[@]}")
     if ((${#safe[@]} == 0)); then
+        RESIDUAL_PURGE_STATUS="OK (no twice-verified residual configurations)"
         log INFO "No twice-verified residual configurations remain eligible for purge"
         return 0
     fi
     if [[ "$MODE" == "dry-run" ]]; then
-        log INFO "Would simulate and purge only non-protected residual package configurations: ${safe[*]}"
+        RESIDUAL_PURGE_STATUS="PLANNED (simulation only; no package changes)"
+        log INFO "Would perform ${stage} residual-config simulation and purge only non-protected packages: ${safe[*]}"
         return 0
     fi
-    local simulation removals
-    simulation="$(apt-get -s purge "${safe[@]}" 2>&1)" || {
+    for package in "${safe[@]}"; do requested["$package"]=1; done
+    simulation="$(LC_ALL=C apt-get -s purge "${safe[@]}" 2>&1)" || {
+        RESIDUAL_PURGE_STATUS="REVIEW REQUIRED (APT simulation failed)"
         record_skip "PKGS-7346" "APT simulation failed; nothing was purged"
         return 0
     }
-    removals="$(awk '$1 == "Remv" {print $2}' <<<"$simulation")"
-    if grep -E '^(linux-|grub|shim|systemd|openssh|sudo|tailscale|nftables|iptables|netplan|network-manager|ifupdown|cloud-init)' <<<"$removals" >/dev/null; then
-        record_skip "PKGS-7346" "APT simulation included a protected dependency; nothing was purged"
+    removals="$(parse_apt_purge_packages <<<"$simulation")"
+    mapfile -t simulated_removals <<<"$removals"
+    for package in "${safe[@]}"; do
+        if ! grep -Fxq "$package" <<<"$removals"; then
+            RESIDUAL_PURGE_STATUS="REVIEW REQUIRED (APT simulation did not confirm every requested purge)"
+            record_skip "PKGS-7346" "APT simulation did not explicitly confirm residual package ${package}; nothing was purged"
+            return 0
+        fi
+    done
+    for package in "${simulated_removals[@]}"; do
+        [[ -n "$package" ]] || continue
+        [[ -n "${requested[$package]+requested}" ]] || dependency_removals+=("$package")
+    done
+    if ((${#dependency_removals[@]})); then
+        printf -v reason '%s, ' "${dependency_removals[@]}"
+        RESIDUAL_PURGE_STATUS="REVIEW REQUIRED (APT simulation proposed unrequested removals)"
+        record_skip "PKGS-7346" "APT simulation would purge unrequested package configurations: ${reason%, }; nothing was purged"
         return 0
     fi
+    boot_manifest="$(current_kernel_boot_manifest "$current_kernel")" || {
+        RESIDUAL_PURGE_STATUS="REVIEW REQUIRED (could not capture running-kernel /boot manifest)"
+        record_skip "PKGS-7346" "running-kernel /boot manifest could not be captured; nothing was purged"
+        return 0
+    }
+    reboot_required_before="$REBOOT_REQUIRED"
     if run_streamed env DEBIAN_FRONTEND=noninteractive apt-get purge -y "${safe[@]}"; then
         PACKAGES_REMOVED+=("${safe[@]}")
-        record_change "Purged only simulated, non-protected residual package configurations: ${safe[*]}"
+        for package in "${safe[@]}"; do
+            status="$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)"
+            [[ "$status" == "deinstall ok config-files" ]] && validation_failed=1
+        done
+        [[ "$(uname -r)" == "$current_kernel" ]] || validation_failed=1
+        [[ "$(current_kernel_boot_manifest "$current_kernel")" == "$boot_manifest" ]] || validation_failed=1
+        for package in "${safe[@]}"; do
+            if [[ "${package%%:*}" == grub-pc ]] && ! efi_grub_stack_is_valid; then validation_failed=1; fi
+        done
+        if ! run_streamed apt-get check; then validation_failed=1; fi
+        if ((validation_failed)); then
+            RESIDUAL_PURGE_STATUS="FAILED/REVIEW REQUIRED (post-purge validation failed)"
+            record_skip "PKGS-7346" "post-purge validation failed; review dpkg status, APT health, running kernel, /boot, and EFI GRUB state before treating residual configurations as resolved"
+            return 1
+        fi
+        REBOOT_REQUIRED="$reboot_required_before"
+        RESIDUAL_PURGE_STATUS="OK (selected residual configurations purged and validated)"
+        mapfile -t remaining < <(dpkg-query -W -f='${binary:Package}\t${Status}\n' 2>/dev/null | awk -F '\t' '$2 == "deinstall ok config-files" {print $1}')
+        if ((${#remaining[@]})); then
+            record_skip "PKGS-7346" "other residual configurations remain after ${stage} sweep: ${remaining[*]}; see protected/dependency simulation reasons"
+        fi
+        record_change "Purged only simulated, validated residual package configurations during ${stage} sweep: ${safe[*]}"
+    else
+        RESIDUAL_PURGE_STATUS="REVIEW REQUIRED (APT purge failed)"
+        record_skip "PKGS-7346" "simulated residual purge failed during apply; no successful purge was recorded"
     fi
 }
 
@@ -1025,18 +1296,97 @@ remote_logging_destination_loaded() {
 }
 
 configure_banners() {
-    install_managed_file /etc/issue 0644 <<'EOF'
-NOTICE: This is a private system for authorized access and use only. Use is subject
-to monitoring, recording, and audit. By continuing, you consent to these conditions.
-Unauthorized use is prohibited and may result in disciplinary action and enforcement
-under applicable law. There is no expectation of privacy. Disconnect if unauthorized.
+    local file
+    local issue_file="${HARDEN_ISSUE_FILE:-/etc/issue}" issue_net_file="${HARDEN_ISSUE_NET_FILE:-/etc/issue.net}"
+    if [[ "$MODE" == apply ]]; then
+        transaction_copy "$issue_file" issue-banner
+        transaction_copy "$issue_net_file" issue-net-banner
+    fi
+    for file in "$issue_file" "$issue_net_file"; do
+        if ! install_managed_file "$file" 0644 <<'EOF'
+*******************************************************************************
+                        AUTHORIZED ACCESS ONLY
+
+  This system is the private property of its owner. Unauthorized access,
+  use, modification, or disclosure of data on this system is prohibited
+  and may be subject to criminal prosecution under applicable law.
+
+  All activities on this system are monitored and recorded. By continuing,
+  you consent to this monitoring. Evidence of unauthorized use may be
+  disclosed to law enforcement authorities.
+
+  Disconnect IMMEDIATELY if you are not an authorized user.
+*******************************************************************************
 EOF
-    install_managed_file /etc/issue.net 0644 <<'EOF'
-NOTICE: This is a private system for authorized access and use only. Use is subject
-to monitoring, recording, and audit. By continuing, you consent to these conditions.
-Unauthorized use is prohibited and may result in disciplinary action and enforcement
-under applicable law. There is no expectation of privacy. Disconnect if unauthorized.
-EOF
+        then
+            [[ "$MODE" != apply ]] || { transaction_restore "$issue_file" issue-banner; transaction_restore "$issue_net_file" issue-net-banner; }
+            BANNER_STATUS="FAILED"
+            return 1
+        fi
+        if [[ "$MODE" == apply ]] && [[ "$(stat -c '%U:%G:%a' "$file" 2>/dev/null || true)" != root:root:644 ]]; then
+            chown root:root "$file" && chmod 0644 "$file" || return 1
+            record_change "Corrected banner ownership and mode: ${file}"
+        fi
+    done
+    BANNER_STATUS=$([[ "$MODE" == apply ]] && printf 'OK' || printf 'PLANNED')
+    return 0
+}
+
+configure_motd_presentation() {
+    local motd_dir="${HARDEN_UPDATE_MOTD_DIR:-/etc/update-motd.d}"
+    local motd_cache="${HARDEN_MOTD_CACHE:-/run/motd.dynamic}"
+    local hook label changed=0 i
+    local -a changed_hooks=() changed_labels=()
+    local -a presentation_hooks=(00-header 10-help-text 10-uname 50-landscape-sysinfo 50-motd-news 80-livepatch 88-esm-announce 90-updates-available 91-contract-ua-esm-status 91-release-upgrade 92-unattended-upgrades 95-hwe-eol)
+    if [[ "$AGGRESSIVE" -ne 1 ]]; then
+        MOTD_STATUS="SKIPPED (requires --aggressive)"
+        record_skip "MOTD" "presentation hooks are changed only with --aggressive"
+        return 0
+    fi
+    if [[ "$OS_ID" != ubuntu || ! -d "$motd_dir" ]]; then
+        MOTD_STATUS="N/A (no Ubuntu presentation hooks)"
+        log INFO "MOTD presentation policy is not applicable on this Debian-compatible layout"
+        return 0
+    fi
+    for hook in "${presentation_hooks[@]}"; do
+        hook="${motd_dir}/${hook}"
+        [[ -f "$hook" && ! -L "$hook" ]] || continue
+        [[ -x "$hook" ]] || continue
+        if [[ "$MODE" == dry-run ]]; then
+            log INFO "Would disable Ubuntu MOTD presentation hook ${hook}"
+            continue
+        fi
+        label="motd-hook-$(basename -- "$hook")"
+        transaction_copy "$hook" "$label"
+        if ! chmod a-x "$hook"; then
+            transaction_restore "$hook" "$label"
+            for ((i=${#changed_hooks[@]} - 1; i>=0; i--)); do
+                transaction_restore "${changed_hooks[$i]}" "${changed_labels[$i]}"
+            done
+            MOTD_STATUS="FAILED"
+            return 1
+        fi
+        changed_hooks+=("$hook")
+        changed_labels+=("$label")
+        changed=1
+        record_change "Disabled Ubuntu MOTD presentation hook ${hook}"
+    done
+    if [[ "$MODE" == dry-run ]]; then
+        MOTD_STATUS="PLANNED (presentation hooks only)"
+    elif [[ "$changed" -eq 1 ]]; then
+        # This is volatile generated presentation output; it is regenerated by pam_motd.
+        if [[ -f "$motd_cache" && ! -L "$motd_cache" ]] && ! rm -f -- "$motd_cache"; then
+            for ((i=${#changed_hooks[@]} - 1; i>=0; i--)); do
+                transaction_restore "${changed_hooks[$i]}" "${changed_labels[$i]}"
+            done
+            MOTD_STATUS="FAILED"
+            return 1
+        fi
+        MOTD_STATUS="OK (presentation hooks disabled; reboot notice hook preserved)"
+    else
+        MOTD_STATUS="OK (already converged; reboot notice hook preserved)"
+    fi
+    return 0
 }
 
 sysctl_candidates() {
@@ -1075,11 +1425,9 @@ net.ipv4.icmp_ignore_bogus_error_responses=1
 net.ipv4.tcp_rfc1337=1
 net.ipv4.tcp_syncookies=1
 net.ipv6.conf.all.accept_redirects=0
-net.ipv6.conf.all.accept_source_route=0
-net.ipv6.conf.all.forwarding=0
+net.ipv6.conf.all.accept_source_route=-1
 net.ipv6.conf.default.accept_redirects=0
-net.ipv6.conf.default.accept_source_route=0
-net.ipv6.conf.default.forwarding=0
+net.ipv6.conf.default.accept_source_route=-1
 vm.mmap_min_addr=65536
 vm.unprivileged_userfaultfd=0
 EOF
@@ -1105,8 +1453,8 @@ rp_filter_active_interfaces() {
             printf '%s\n' "$interface"
         done < <(ip -o link show up 2>/dev/null | awk -F': ' '{name=$2; sub(/@.*/, "", name); sub(/:.*/, "", name); if (name != "lo") print name}')
     fi
-    if [[ "$RP_FILTER_TAILSCALE_STATE" == active && -e "$sysctl_root/net/ipv4/conf/tailscale0/rp_filter" \
-        && -z "${seen[tailscale0]+present}" ]]; then
+    if [[ "$RP_FILTER_TAILSCALE_STATE" == active && -e "$sysctl_root/net/ipv4/conf/tailscale0/rp_filter" ]] \
+        && [[ -z "${seen[tailscale0]+present}" ]]; then
         printf '%s\n' tailscale0
     fi
 }
@@ -1244,10 +1592,249 @@ managed_sysctl_runtime_needs_reload() {
     return 1
 }
 
+ipv6_active_interfaces() {
+    local sysctl_root="${HARDEN_PROC_SYS_ROOT:-/proc/sys}" interface
+    declare -A seen=()
+    [[ -d "$sysctl_root/net/ipv6/conf" ]] || return 0
+    if command -v ip >/dev/null 2>&1; then
+        while IFS= read -r interface; do
+            [[ "$interface" =~ ^[[:alnum:]_.-]+$ ]] || continue
+            [[ -e "$sysctl_root/net/ipv6/conf/${interface}/disable_ipv6" ]] || continue
+            [[ -n "${seen[$interface]+present}" ]] && continue
+            seen["$interface"]=1
+            printf '%s\n' "$interface"
+        done < <(ip -o link show up 2>/dev/null | awk -F': ' '{name=$2; sub(/@.*/, "", name); sub(/:.*/, "", name); if (name != "lo") print name}')
+    fi
+    if systemctl is-active --quiet tailscaled.service 2>/dev/null \
+        && [[ -e "$sysctl_root/net/ipv6/conf/tailscale0/disable_ipv6" ]] && [[ -z "${seen[tailscale0]+present}" ]]; then
+        printf '%s\n' tailscale0
+    fi
+}
+
+ipv6_existing_interfaces() {
+    local sysctl_root="${HARDEN_PROC_SYS_ROOT:-/proc/sys}" entry interface
+    [[ -d "$sysctl_root/net/ipv6/conf" ]] || return 0
+    while IFS= read -r entry; do
+        interface="$(basename -- "$entry")"
+        [[ "$interface" == all || "$interface" == default ]] && continue
+        [[ -e "$entry/disable_ipv6" ]] || continue
+        printf '%s\n' "$interface"
+    done < <(find "$sysctl_root/net/ipv6/conf" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | sort)
+}
+
+ipv6_disable_runtime_keys() {
+    local interface
+    printf '%s\n' net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6
+    while IFS= read -r interface; do
+        [[ -n "$interface" ]] && printf 'net.ipv6.conf.%s.disable_ipv6\n' "$interface"
+    done < <(ipv6_existing_interfaces)
+}
+
+ipv6_forwarding_runtime_keys() {
+    local sysctl_root="${HARDEN_PROC_SYS_ROOT:-/proc/sys}" interface key
+    for key in net.ipv6.conf.all.forwarding net.ipv6.conf.default.forwarding; do
+        printf '%s\n' "$key"
+    done
+    if [[ -e "$sysctl_root/net/ipv6/conf/all/force_forwarding" || -e "$sysctl_root/net/ipv6/conf/default/force_forwarding" ]]; then
+        for key in net.ipv6.conf.all.force_forwarding net.ipv6.conf.default.force_forwarding; do
+            [[ -e "$sysctl_root/${key//./\/}" ]] && printf '%s\n' "$key"
+        done
+    fi
+    while IFS= read -r interface; do
+        [[ -n "$interface" ]] || continue
+        printf 'net.ipv6.conf.%s.forwarding\n' "$interface"
+        [[ -e "$sysctl_root/net/ipv6/conf/${interface}/force_forwarding" ]] \
+            && printf 'net.ipv6.conf.%s.force_forwarding\n' "$interface"
+    done < <(ipv6_existing_interfaces)
+}
+
+ipv6_managed_disable_exists() {
+    local config="$1"
+    [[ -f "$config" ]] && grep -Eq '^[[:space:]]*net\.ipv6\.conf\.[[:alnum:]_.-]+\.disable_ipv6[[:space:]]*=[[:space:]]*1[[:space:]]*$' "$config"
+}
+
+detect_ipv6_forwarding() {
+    local key value
+    IPV6_FORWARDING_STATE="inactive-normal"
+    while IFS= read -r key; do
+        [[ -n "$key" ]] || continue
+        value="$(sysctl -n "$key" 2>/dev/null || true)"
+        if [[ "$value" == 1 ]]; then
+            IPV6_FORWARDING_STATE="active"
+            return 0
+        elif [[ "$value" != 0 ]]; then
+            IPV6_FORWARDING_STATE="unknown"
+            return 0
+        fi
+    done < <(ipv6_forwarding_runtime_keys)
+}
+
+detect_ipv6_policy() {
+    local config="${1:-${HARDEN_SYSCTL_CONFIG:-/etc/sysctl.d/99-security-hardening.conf}}" sysctl_root="${HARDEN_PROC_SYS_ROOT:-/proc/sys}" routes rules listeners global_addresses
+    local -a reasons=()
+    IPV6_POLICY="enabled-safe"
+    IPV6_REASON="IPv6 disable is default-off; hardened IPv6 remains enabled"
+    IPV6_RUNTIME_STATUS="NOT RUN"
+    IPV6_PERSISTENCE_STATUS="NOT RUN"
+    IPV6_MANAGED_DISABLE_EXISTING=0
+    if [[ ! -d "$sysctl_root/net/ipv6/conf" ]]; then
+        IPV6_POLICY="NOT_APPLICABLE"
+        IPV6_REASON="kernel IPv6 sysctl tree is unavailable"
+        IPV6_RUNTIME_STATUS="N/A"
+        return 0
+    fi
+    if systemctl is-active --quiet tailscaled.service 2>/dev/null; then
+        reasons+=("active-tailscale-overlay")
+    fi
+    if ! command -v ip >/dev/null 2>&1 || ! command -v ss >/dev/null 2>&1; then
+        reasons+=("network-inventory-command-unavailable")
+    else
+        global_addresses="$(ip -6 -o addr show scope global 2>/dev/null || true)"
+        [[ -z "$global_addresses" ]] || reasons+=("global-ipv6-address")
+        routes="$(ip -6 route show default 2>/dev/null || true)"
+        [[ -z "$routes" ]] || reasons+=("ipv6-default-route")
+        rules="$(ip -6 rule show 2>/dev/null || true)"
+        if awk '/lookup/ && $NF !~ /^(local|main|default)$/ { found=1 } END { exit !found }' <<<"$rules"; then
+            reasons+=("ipv6-policy-routing")
+        fi
+        listeners="$(ss -H -6 -lntu 2>/dev/null || true)"
+        [[ -z "$listeners" ]] || reasons+=("ipv6-listener")
+    fi
+    detect_ipv6_forwarding
+    case "$IPV6_FORWARDING_STATE" in
+        active) reasons+=("ipv6-forwarding-active") ;;
+        unknown) reasons+=("ipv6-forwarding-unknown") ;;
+    esac
+    if ((${#reasons[@]})); then
+        IPV6_REASON="$(IFS=,; printf '%s' "${reasons[*]}")"
+    fi
+    if ipv6_managed_disable_exists "$config"; then
+        IPV6_MANAGED_DISABLE_EXISTING=1
+        IPV6_POLICY="disabled-preserved-existing"
+        IPV6_REASON="previous explicit tool-managed IPv6 disable is retained until an explicit rollback path is chosen"
+    elif [[ "$DISABLE_IPV6" -eq 1 ]]; then
+        if ((${#reasons[@]})); then
+            IPV6_POLICY="enabled-safety-blocked"
+            IPV6_REASON="explicit disable refused: ${IPV6_REASON}"
+            record_skip "IPv6 disable" "$IPV6_REASON"
+        else
+            IPV6_POLICY="disabled-explicit-opt-in"
+            IPV6_REASON="explicit --disable-ipv6 with --aggressive; no IPv6 use, route, listener, forwarding, policy-routing, or overlay signal detected"
+        fi
+    elif ((${#reasons[@]})); then
+        IPV6_POLICY="enabled-required-or-uncertain"
+    fi
+    IPV6_RUNTIME_STATUS="inspected"
+}
+
+ipv6_policy_candidates() {
+    local interface
+    if [[ "$IPV6_POLICY" == disabled-explicit-opt-in || "$IPV6_POLICY" == disabled-preserved-existing ]]; then
+        while IFS= read -r interface; do
+            [[ -n "$interface" ]] && printf '%s=1\n' "$interface"
+        done < <(ipv6_disable_runtime_keys)
+    fi
+    if [[ "$IPV6_FORWARDING_STATE" == inactive-normal ]]; then
+        printf '%s\n' 'net.ipv6.conf.all.forwarding=0' 'net.ipv6.conf.default.forwarding=0'
+    fi
+}
+
+capture_ipv6_disable_runtime() {
+    local key value interface
+    IPV6_RUNTIME_BEFORE=()
+    IPV6_RUNTIME_INTERFACE_ORDER=()
+    for key in net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6; do
+        value="$(sysctl -n "$key" 2>/dev/null || true)"
+        [[ "$value" =~ ^[01]$ ]] || return 1
+        IPV6_RUNTIME_BEFORE["$key"]="$value"
+    done
+    while IFS= read -r interface; do
+        [[ -n "$interface" ]] || continue
+        key="net.ipv6.conf.${interface}.disable_ipv6"
+        value="$(sysctl -n "$key" 2>/dev/null || true)"
+        [[ "$value" =~ ^[01]$ ]] || return 1
+        IPV6_RUNTIME_BEFORE["$key"]="$value"
+        IPV6_RUNTIME_INTERFACE_ORDER+=("$interface")
+    done < <(ipv6_existing_interfaces)
+    ((${#IPV6_RUNTIME_BEFORE[@]} > 1))
+}
+
+restore_ipv6_disable_runtime() {
+    local key value interface failed=0
+    # Linux propagates an all.disable_ipv6 write into default and interfaces.
+    # Restore the captured values in kernel-safe order, never hash iteration order.
+    for key in net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6; do
+        [[ -n "${IPV6_RUNTIME_BEFORE[$key]+captured}" ]] || { failed=1; continue; }
+        value="${IPV6_RUNTIME_BEFORE[$key]}"
+        sysctl -w "${key}=${value}" >/dev/null 2>&1 || failed=1
+    done
+    for interface in "${IPV6_RUNTIME_INTERFACE_ORDER[@]}"; do
+        key="net.ipv6.conf.${interface}.disable_ipv6"
+        value="${IPV6_RUNTIME_BEFORE[$key]}"
+        sysctl -w "${key}=${value}" >/dev/null 2>&1 || failed=1
+    done
+    for key in net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6; do
+        [[ "$(sysctl -n "$key" 2>/dev/null || true)" == "${IPV6_RUNTIME_BEFORE[$key]}" ]] || failed=1
+    done
+    for interface in "${IPV6_RUNTIME_INTERFACE_ORDER[@]}"; do
+        key="net.ipv6.conf.${interface}.disable_ipv6"
+        [[ "$(sysctl -n "$key" 2>/dev/null || true)" == "${IPV6_RUNTIME_BEFORE[$key]}" ]] || failed=1
+    done
+    [[ "$failed" -eq 0 ]]
+}
+
+validate_ipv6_disable_runtime() {
+    local key failed=0
+    while IFS= read -r key; do
+        [[ "$(sysctl -n "$key" 2>/dev/null || true)" == 1 ]] || failed=1
+    done < <(ipv6_disable_runtime_keys)
+    [[ "$failed" -eq 0 ]]
+}
+
+rollback_ipv6_disable() {
+    local config="$1" restore_result=FAILED
+    transaction_restore "$config" sysctl-hardening.conf
+    run_streamed sysctl -p "$config" || true
+    if restore_ipv6_disable_runtime; then restore_result=OK; fi
+    IPV6_RUNTIME_STATUS="FAILED (rollback runtime restore=${restore_result})"
+    IPV6_PERSISTENCE_STATUS="FAILED (previous config restored)"
+    record_skip "IPv6 disable" "managed sysctl reload or full-interface verification failed; previous configuration and captured runtime values were restored (${restore_result})"
+}
+
+write_ipv6_report() {
+    local report="${HARDEN_IPV6_REPORT:-/root/ipv6-policy-report.txt}" key value interface
+    [[ "$MODE" == apply ]] || return 0
+    [[ "$IPV6_POLICY" != NOT_APPLICABLE ]] || return 0
+    install -d -m 0700 "$(dirname -- "$report")"
+    {
+        printf 'IPv6 policy diagnostic\n'
+        printf 'generated=%s\n' "$(timestamp)"
+        printf 'policy=%s\n' "$IPV6_POLICY"
+        printf 'reason=%s\n' "$IPV6_REASON"
+        printf 'runtime=%s\n' "$IPV6_RUNTIME_STATUS"
+        printf 'persistence=%s\n' "$IPV6_PERSISTENCE_STATUS"
+        printf 'forwarding-state=%s\n' "$IPV6_FORWARDING_STATE"
+        for key in net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6 net.ipv6.conf.all.accept_redirects net.ipv6.conf.default.accept_redirects net.ipv6.conf.all.accept_source_route net.ipv6.conf.default.accept_source_route; do
+            value="$(sysctl -n "$key" 2>/dev/null || true)"
+            printf '%s=%s\n' "$key" "${value:-unavailable}"
+        done
+        while IFS= read -r key; do
+            value="$(sysctl -n "$key" 2>/dev/null || true)"
+            printf '%s=%s\n' "$key" "${value:-unavailable}"
+        done < <(ipv6_forwarding_runtime_keys)
+        while IFS= read -r interface; do
+            value="$(sysctl -n "net.ipv6.conf.${interface}.disable_ipv6" 2>/dev/null || true)"
+            printf 'net.ipv6.conf.%s.disable_ipv6=%s\n' "$interface" "${value:-unavailable}"
+        done < <(ipv6_existing_interfaces)
+    } > "$report"
+    chmod 0600 "$report"
+}
+
 configure_sysctl() {
     local config="${HARDEN_SYSCTL_CONFIG:-/etc/sysctl.d/99-security-hardening.conf}"
     local sysctl_root="${HARDEN_PROC_SYS_ROOT:-/proc/sys}"
-    local temporary key value proc_path interface desired_rp_filter="" config_changed=0 runtime_reload_needed=0 failed=0
+    local temporary key value proc_path interface desired_rp_filter="" config_changed=0 runtime_reload_needed=0 failed=0 ipv6_disable_snapshot=0 sysctl_backup_taken=0
+    detect_ipv6_policy "$config"
     if systemctl is-active --quiet tailscaled.service 2>/dev/null; then
         RP_FILTER_TAILSCALE_STATE=active
         RP_FILTER_POLICY="accepted-exception-loose-2"
@@ -1269,10 +1856,25 @@ configure_sysctl() {
     fi
     if [[ "$MODE" == "dry-run" ]]; then
         log INFO "Would apply rp_filter policy ${RP_FILTER_POLICY} (${RP_FILTER_REASON}) without changing Tailscale preferences"
+        log INFO "Would apply IPv6 policy ${IPV6_POLICY} (${IPV6_REASON}) without GRUB kernel parameters"
+        if [[ "$IPV6_POLICY" == NOT_APPLICABLE ]]; then
+            IPV6_PERSISTENCE_STATUS="N/A"
+        else
+            IPV6_PERSISTENCE_STATUS="PLANNED (safe sysctls; explicit disable only when selected and safe)"
+        fi
         if [[ "$AGGRESSIVE" -eq 1 ]]; then
             log WARN "Would also disable unprivileged user namespaces, kexec loading, and io_uring when supported"
         fi
         return 0
+    fi
+    if [[ "$IPV6_POLICY" == disabled-explicit-opt-in || "$IPV6_POLICY" == disabled-preserved-existing ]]; then
+        if ! capture_ipv6_disable_runtime; then
+            IPV6_RUNTIME_STATUS="FAILED (could not capture every pre-reload runtime value)"
+            IPV6_PERSISTENCE_STATUS="FAILED (no runtime reload attempted)"
+            record_skip "IPv6 disable" "all/default and every existing IPv6 interface must be readable before applying or preserving the managed disable state"
+            return 1
+        fi
+        ipv6_disable_snapshot=1
     fi
     temporary="$(mktemp)"
     {
@@ -1299,7 +1901,7 @@ configure_sysctl() {
             else
                 log SKIP "Unsupported sysctl omitted: ${key}" >&2
             fi
-        done < <(sysctl_candidates; [[ "$AGGRESSIVE" -eq 1 ]] && aggressive_sysctl_candidates)
+        done < <(sysctl_candidates; ipv6_policy_candidates; [[ "$AGGRESSIVE" -eq 1 ]] && aggressive_sysctl_candidates)
         if [[ -n "$desired_rp_filter" ]]; then
             while IFS= read -r interface; do
                 [[ -n "$interface" ]] || continue
@@ -1310,7 +1912,10 @@ configure_sysctl() {
         fi
     } > "$temporary"
     if [[ ! -f "$config" ]] || ! cmp -s "$temporary" "$config"; then
-        transaction_copy "$config" sysctl-hardening.conf
+        if [[ "$sysctl_backup_taken" -eq 0 ]]; then
+            transaction_copy "$config" sysctl-hardening.conf
+            sysctl_backup_taken=1
+        fi
         if ! install_managed_file "$config" 0644 < "$temporary"; then
             rm -f -- "$temporary"
             record_skip "KRNL-6000" "could not install the managed sysctl policy"
@@ -1323,9 +1928,17 @@ configure_sysctl() {
     if managed_sysctl_runtime_needs_reload "$temporary"; then runtime_reload_needed=1; fi
     rm -f "$temporary"
     if [[ "$config_changed" -eq 1 || "$runtime_reload_needed" -eq 1 ]]; then
+        if [[ "$ipv6_disable_snapshot" -eq 1 && "$sysctl_backup_taken" -eq 0 ]]; then
+            transaction_copy "$config" sysctl-hardening.conf
+            sysctl_backup_taken=1
+        fi
         if ! run_streamed sysctl -p "$config"; then
-            transaction_restore "$config" sysctl-hardening.conf
-            run_streamed sysctl -p "$config" || true
+            if [[ "$ipv6_disable_snapshot" -eq 1 ]]; then
+                rollback_ipv6_disable "$config"
+            else
+                transaction_restore "$config" sysctl-hardening.conf
+                run_streamed sysctl -p "$config" || true
+            fi
             record_skip "KRNL-6000" "targeted reload of the managed sysctl policy failed; previous file was restored"
             return 1
         fi
@@ -1346,12 +1959,31 @@ configure_sysctl() {
             failed=1
         fi
     done < <(grep -Ev '^[[:space:]]*(#|$)' "$config")
+    if [[ "$IPV6_POLICY" == disabled-explicit-opt-in || "$IPV6_POLICY" == disabled-preserved-existing ]]; then
+        if validate_ipv6_disable_runtime; then
+            IPV6_RUNTIME_STATUS="OK (all/default and every existing interface disabled)"
+            IPV6_PERSISTENCE_STATUS="OK (managed sysctl disable)"
+        else
+            failed=1
+            log WARN "IPv6 disable verification failed for all/default or an existing interface"
+        fi
+    elif [[ "$IPV6_POLICY" == NOT_APPLICABLE ]]; then
+        IPV6_PERSISTENCE_STATUS="N/A"
+    else
+        IPV6_RUNTIME_STATUS="OK (safe IPv6 sysctls validated)"
+        IPV6_PERSISTENCE_STATUS="OK (managed safe IPv6 sysctls; no disable requested)"
+    fi
+    if [[ "$failed" -ne 0 && "$ipv6_disable_snapshot" -eq 1 ]]; then
+        rollback_ipv6_disable "$config"
+        return 1
+    fi
     [[ "$failed" -eq 0 ]] || record_skip "KRNL-6000" "one or more supported sysctls could not be applied by the running environment"
     tailscale_rp_filter_health
     if [[ "$RP_FILTER_RUNTIME_STATUS" == WARN:* ]]; then
         log WARN "${RP_FILTER_RUNTIME_STATUS}"
     fi
     write_rp_filter_report
+    write_ipv6_report
     if [[ "$AGGRESSIVE" -eq 0 ]]; then
         record_skip "kernel.modules_disabled" "requires --aggressive because it is irreversible until reboot"
     fi
@@ -2403,6 +3035,35 @@ EOF
     run_streamed systemctl daemon-reload
     FIREWALL_STATUS="FAILED/OWNED TABLE ROLLED BACK"
     die "Owned nftables table failed activation or health validation; unrelated tables were never modified"
+}
+
+inspect_firewall_rule_hygiene() {
+    local report="${HARDEN_FIREWALL_RULE_REPORT:-/root/firewall-rule-inventory.txt}" owned_rules=""
+    if [[ "$MODE" == "dry-run" ]]; then
+        FIREWALL_RULE_HYGIENE_STATUS="PLANNED (inventory only; no foreign rule mutation)"
+        log INFO "Would inventory nftables and iptables-nft rules for FIRE-4513 without deleting foreign, Tailscale, SSH, Fail2ban, NAT, or forwarding rules"
+        return 0
+    fi
+    {
+        printf 'Firewall rule inventory for Lynis FIRE-4513\n'
+        printf 'generated=%s\n' "$(timestamp)"
+        printf 'policy=inventory-only; only the harden.sh-owned inet hardening_filter table may ever be replaced\n\n'
+        printf '%s\n' '=== nftables ruleset ==='
+        command -v nft >/dev/null 2>&1 && nft list ruleset || printf 'nft unavailable\n'
+        printf '\n%s\n' '=== iptables IPv4 rules ==='
+        command -v iptables >/dev/null 2>&1 && iptables -S || printf 'iptables unavailable\n'
+        printf '\n%s\n' '=== iptables IPv6 rules ==='
+        command -v ip6tables >/dev/null 2>&1 && ip6tables -S || printf 'ip6tables unavailable\n'
+    } > "$report" 2>&1
+    chmod 0600 "$report"
+    owned_rules="$(nft list table inet hardening_filter 2>/dev/null || true)"
+    if [[ -n "$owned_rules" ]] && grep -Eq '(^|[[:space:]])(tailscale|fail2ban|masquerade|postrouting|forward|ssh)([[:space:]_:-]|$)' <<<"$owned_rules"; then
+        FIREWALL_RULE_HYGIENE_STATUS="REVIEW REQUIRED (owned table contains role-sensitive rule; no deletion)"
+    else
+        FIREWALL_RULE_HYGIENE_STATUS="INVENTORIED (foreign and role-sensitive rules preserved)"
+    fi
+    record_skip "FIRE-4513" "iptables/nftables inventory saved to ${report}; no rule was deleted because non-owned, Tailscale, SSH, Fail2ban, NAT, forwarding, and system rules are safety-critical"
+    return 0
 }
 
 harden_ssh() {
@@ -5429,17 +6090,19 @@ explain_open_test() {
         FILE-6310) printf '%s\n' '/home or /var is not a separate filesystem.' 'Repartition/LVM-migrate these paths during a maintenance window.' 'An in-place move can exhaust storage, corrupt boot mounts, or cause prolonged downtime.' ;;
         USB-1000) printf '%s\n' 'USB storage was preserved because --aggressive was not used or USB-backed storage is mounted.' 'Verify hardware dependencies and rerun with --aggressive.' 'Blocking usb-storage can make virtual media, backup disks, or boot/recovery devices unavailable.' ;;
         NAME-4028) printf '%s\n' 'The host has no administrator-provided DNS domain.' 'Create matching forward/reverse DNS and configure a valid FQDN.' 'Inventing a local domain can break TLS, mail, Kerberos, and service discovery.' ;;
-        PKGS-7346) printf '%s\n' 'Residual package configuration could not be purged.' 'Review dpkg-query rc entries and purge the named packages.' 'Purge maintainer scripts can remove configuration still needed for rollback.' ;;
+        PKGS-7346) printf '%s\n' 'Residual package configurations remain after the final simulated purge sweep.' 'Review the named rc packages and the recorded protected/dependency simulation reason.' 'Purge maintainer scripts can remove configuration still needed for rollback.' ;;
+        PKGS-7392) printf '%s\n' 'A conservative apt-get upgrade was blocked or failed validation.' 'Review the saved APT simulation and run a maintenance-window upgrade without removals/downgrades.' 'A full/dist-upgrade or unreviewed removal can replace critical packages and require recovery.' ;;
+        FIRE-4513) printf '%s\n' 'Lynis observed iptables-nft/nftables rules it considers unused.' 'Review /root/firewall-rule-inventory.txt and remove only a rule proven redundant and owned by the local operator.' 'Deleting Tailscale, SSH, Fail2ban, NAT, forwarding, or foreign rules solely for a score can sever access or break routing.' ;;
         NETW-3200) printf '%s\n' 'A protocol module remains loaded or available despite the modprobe policy.' 'Stop its consumer, unload it, rebuild initramfs, and reboot.' 'Removing an in-use protocol can terminate clustered/storage/network workloads.' ;;
         SSH-7408) printf '%s\n' 'SSH-7408: SSH port intentionally preserved; changing the port is not considered a meaningful security control for this deployment.' 'No Port directive is managed; the detected port is used only for firewall and Fail2ban policy.' 'Changing the listening port can cause lockout without providing a substantive security boundary.' ;;
         LOGG-2154) printf '%s\n' 'No remote logging destination was selected or rsyslog validation failed.' 'Rerun with REMOTE_LOG_SERVER/PORT/PROTOCOL and, for TLS, a trusted CA file.' 'A wrong destination can disclose logs; an invalid queue/TLS setup can drop remote copies.' ;;
-        LOGG-2190) printf '%s\n' 'Deleted files remain open after allowlisted safe service restarts.' 'Review deleted-open-files-after-remediation.txt and restart the remaining owner only during an approved maintenance window.' 'Blind service restarts can interrupt SSH, networking, storage, or applications.' ;;
+        LOGG-2190) printf '%s\n' 'Deleted-file inventory is retained for review; anonymous memfd entries are non-persistent RAM objects, not orphaned filesystem inodes.' 'Review the deleted-open-file report and restart only an allowlisted owner during an approved maintenance window when an actionable file remains.' 'Blind service restarts can interrupt SSH, networking, storage, or applications.' ;;
         PROC-3614) printf '%s\n' 'One or more processes were observed in uninterruptible IO wait.' 'Review /root/hardening-iowait-processes.txt and diagnose the named device, filesystem, or kernel wait channel.' 'Killing a blocked process can corrupt data and often cannot complete until the kernel IO wait resolves.' ;;
         ACCT-9622|ACCT-9628|ACCT-9630) printf '%s\n' 'Accounting/audit package or service was unavailable, rejected rules, could not start, or runtime rules were empty.' 'Review journalctl and auditctl -l, correct any rejected kernel-specific rule, and reload with augenrules.' 'Invalid or overly broad audit rules can cause boot delay, log exhaustion, or lost events.' ;;
         FINT-4315|FINT-4316|FINT-4350|FINT-4402) printf '%s\n' 'AIDE was unavailable, its effective SHA-2 runtime policy failed validation, or its declared active database was absent.' 'Review the saved config-check, aide --init, and aide --check output, then initialize a trusted SHA256/SHA512 baseline.' 'A baseline created on a compromised system legitimizes malicious files; scans are I/O intensive.' ;;
         TOOL-5002) printf '%s\n' 'No automation platform was installed solely to satisfy a score.' 'Adopt a real configuration-management platform when there is an operational owner.' 'An unused privileged agent expands attack surface and supply-chain trust.' ;;
         FILE-7524) printf '%s\n' 'At least one Lynis static permission target still differs from its profile.' 'Use lynis show details FILE-7524 and correct only the named object.' 'Blind recursive chmod can break package ownership, setuid helpers, ACLs, and services.' ;;
-        KRNL-6000) printf '%s\n' 'All managed sysctls are validated; with active Tailscale, net.ipv4.conf.all.rp_filter=2 is an intentional overlay-routing exception to Lynis expected value 1.' 'Keep value 2 while asymmetric Tailscale routing is required; correct any separately listed mismatched key.' 'Forcing strict reverse-path filtering can discard valid overlay traffic and remove remote access.' ;;
+        KRNL-6000) printf '%s\n' 'IPv6 accept_source_route=-1 is stricter Linux semantics than Lynis 3.1.6 prefval=0: -1 rejects every routing header, while >=0 still permits Type 2.' 'Keep the validated -1 policy and separately review only named mismatched keys; do not skip or tune Lynis.' 'Relaxing source-route handling merely to match a legacy preference weakens IPv6 packet validation.' ;;
         HRDN-7222) printf '%s\n' 'A compiler remains executable to non-root or was restored by a package update.' 'Remove unused development packages or rerun --aggressive after dependency review.' 'Removing/restricting toolchains can break DKMS, package builds, and diagnostics.' ;;
         HRDN-7230) printf '%s\n' 'No supported repository malware scanner was available/detected.' 'Install and schedule a maintained scanner from an official repository.' 'Rootkit scanners can produce false positives and consume significant I/O.' ;;
         BANN-7126|BANN-7130) printf '%s\n' 'The local policy banner did not match the Lynis heuristic.' 'Have legal counsel approve organization-specific /etc/issue and /etc/issue.net text.' 'Incorrect legal language can weaken rather than strengthen notice/consent arguments.' ;;
@@ -5501,6 +6164,9 @@ write_open_findings_report() {
             '- AUTH-9230: legacy SHA rounds are not added when YESCRYPT is the effective password hash method.' \
             '- NAME-4028: an organization/domain-dependent DNS identity is not invented.' \
             '- AUTH-9282: no fixed account expiration is imposed without an explicit owner decision.' \
+            '- KRNL-6000/IPv6 source routing: accept_source_route=-1 is intentionally stricter than Lynis 3.1.6 prefval=0; it rejects all routing headers while >=0 still accepts Type 2.' \
+            '- TOOL-5002: no privileged automation agent is installed without an operational deployment owner.' \
+            '- LOGG-2190: anonymous /memfd:* (deleted) entries remain visible as non-actionable volatile exceptions; no restart, kill, or reboot is forced.' \
             "$mor_finding"
         if systemctl is-active --quiet tailscaled.service 2>/dev/null; then
             printf '%s\n' "- KRNL-6000/rp_filter: ${RP_FILTER_POLICY}; ${RP_FILTER_REASON}. This is an accepted routing policy, not a Lynis score change."
@@ -5542,15 +6208,20 @@ Aggressive         : ${aggressive_label}
 
 SSH                : ${SSH_STATUS}
 Firewall           : ${FIREWALL_STATUS}
+Firewall rule audit: ${FIREWALL_RULE_HYGIENE_STATUS}
 PAM                : ${PAM_STATUS}
 Failed-login log   : ${FAILED_LOGIN_STATUS}
 Shell timeout      : ${SHELL_TIMEOUT_STATUS}
+Login banners      : ${BANNER_STATUS}
+MOTD policy        : ${MOTD_STATUS}
 Audit              : ${AUDIT_STATUS}
 AppArmor           : ${APPARMOR_STATUS}
 AIDE               : ${AIDE_STATUS}
 Fail2ban           : ${FAIL2BAN_STATUS}
 Remote Logging     : ${REMOTE_LOG_STATUS}
 Automatic Updates  : ${UPDATES_STATUS}
+Package upgrade    : ${PACKAGE_UPGRADE_STATUS}
+Residual configs   : ${RESIDUAL_PURGE_STATUS}
 rp_filter Policy   : ${RP_FILTER_POLICY}
 rp_filter Runtime  : ${RP_FILTER_RUNTIME_STATUS}
 rp_filter Report   : $([[ "$MODE" == "apply" ]] && printf '%s' "${HARDEN_RP_FILTER_REPORT:-/root/tailscale-rp-filter-report.txt}" || printf 'not written in dry-run')
@@ -5558,6 +6229,11 @@ Deleted open files : ${DELETED_OPEN_FILES_STATUS}
 Deleted-file report: $([[ "$MODE" == "apply" ]] && printf '%s' "${HARDEN_DELETED_OPEN_REPORT:-$DELETED_OPEN_FILES_REPORT}" || printf 'not written in dry-run')
 UEFI MOR           : ${UEFI_MOR_STATUS}
 UEFI MOR report    : $([[ "$MODE" == "apply" ]] && printf '%s' "$UEFI_MOR_REPORT" || printf 'not written in dry-run')
+IPv6 Policy        : ${IPV6_POLICY}
+IPv6 Reason        : ${IPV6_REASON}
+IPv6 Runtime       : ${IPV6_RUNTIME_STATUS}
+IPv6 Persistence   : ${IPV6_PERSISTENCE_STATUS}
+IPv6 Report        : $([[ "$MODE" == "apply" && "$IPV6_POLICY" != NOT_APPLICABLE ]] && printf '%s' "$IPV6_REPORT" || printf 'not written / not applicable')
 
 Lynis Score Before : ${LYNIS_BEFORE}
 Lynis Score After  : ${LYNIS_AFTER}
@@ -5620,6 +6296,8 @@ main() {
 
     phase 03 18 "Package Security"
     log WARN "Phase 03 installs and configures security packages and may legitimately take several minutes on a fresh server; package operations are not subject to artificial timeouts"
+    refresh_apt_metadata
+    upgrade_packages_safely
     prepare_packages
     configure_apt
     configure_updates
@@ -5629,6 +6307,7 @@ main() {
 
     phase 04 18 "Logging"
     configure_banners
+    configure_motd_presentation
     configure_logging
 
     phase 05 18 "Kernel Hardening"
@@ -5644,6 +6323,7 @@ main() {
 
     phase 07 18 "Firewall"
     configure_firewall
+    inspect_firewall_rule_hygiene
     if [[ "$MODE" != "apply" || "$FIREWALL_STATUS" == OK* ]]; then FIREWALL_COMPLETED=1; fi
 
     phase 08 18 "SSH"
@@ -5668,6 +6348,7 @@ main() {
     configure_malware_scanner
     harden_systemd_services
     verify_disabled_services
+    purge_removed_packages "final post-package-change"
 
     phase 12 18 "AppArmor"
     configure_apparmor

@@ -959,6 +959,294 @@ EOF
         ' _ "$repo_root" "$case_root" || fail "unsafe PackageKit dependency simulation was not blocked"
 }
 
+run_package_upgrade_tests() {
+    local case_root="$test_root/package-upgrade" mock_bin="$test_root/package-upgrade/bin" apt_log="$test_root/package-upgrade/apt.log"
+    install -d "$mock_bin"
+    cat > "$mock_bin/apt-get" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$PACKAGE_UPGRADE_APT_LOG"
+case "${1:-}" in
+    check) exit 0 ;;
+    -s)
+        case "${PACKAGE_UPGRADE_TEST_CASE:-nothing}" in
+            nothing) printf '0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n' ;;
+            upgrades) printf 'Inst openssl [3.0.0] (3.0.1 Ubuntu:26.04/stable)\n' ;;
+            removal) printf 'Remv critical-package [1.0]\nInst openssl [3.0.0] (3.0.1 Ubuntu:26.04/stable)\n' ;;
+            downgrade) printf 'The following packages will be DOWNGRADED:\nInst openssl [3.0.1] (3.0.0 Ubuntu:26.04/stable)\n' ;;
+            *) exit 1 ;;
+        esac
+        ;;
+    -y)
+        [[ "${PACKAGE_UPGRADE_TEST_CASE:-}" == upgrades ]] || exit 64
+        ;;
+    *) exit 64 ;;
+esac
+EOF
+    chmod +x "$mock_bin/apt-get"
+    for test_case in nothing upgrades removal downgrade; do
+        : > "$apt_log"
+        env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 PACKAGE_UPGRADE_APT_LOG="$apt_log" PACKAGE_UPGRADE_TEST_CASE="$test_case" \
+            HARDEN_REBOOT_REQUIRED_FILE="$case_root/reboot-required" bash -c '
+                source "$1/harden.sh"; trap - ERR EXIT
+                MODE=apply; CHANGE_LOG="$2/changes.tsv"; : > "$CHANGE_LOG"; REBOOT_REQUIRED=0
+                log() { :; }; record_change() { :; }; record_skip() { :; }; run_streamed() { "$@"; }
+                upgrade_packages_safely
+                case "$3" in
+                    nothing) [[ "$PACKAGE_UPGRADE_STATUS" == "OK (nothing upgradeable)" ]]; ! grep -Eq "^-y | -y " "$PACKAGE_UPGRADE_APT_LOG" ;;
+                    upgrades) [[ "$PACKAGE_UPGRADE_STATUS" == "OK (upgraded; no reboot required)" ]]; grep -Eq "^-y | -y " "$PACKAGE_UPGRADE_APT_LOG" ;;
+                    removal|downgrade) [[ "$PACKAGE_UPGRADE_STATUS" == "BLOCKED"* ]]; ! grep -Eq "^-y | -y " "$PACKAGE_UPGRADE_APT_LOG" ;;
+                esac
+            ' _ "$repo_root" "$case_root" "$test_case" || fail "package upgrade ${test_case} safety regression failed"
+    done
+    : > "$apt_log"; : > "$case_root/reboot-required"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 PACKAGE_UPGRADE_APT_LOG="$apt_log" PACKAGE_UPGRADE_TEST_CASE=upgrades \
+        HARDEN_REBOOT_REQUIRED_FILE="$case_root/reboot-required" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; CHANGE_LOG="$2/reboot.tsv"; : > "$CHANGE_LOG"; REBOOT_REQUIRED=0
+            log() { :; }; record_change() { :; }; record_skip() { :; }; run_streamed() { "$@"; }
+            upgrade_packages_safely
+            [[ "$REBOOT_REQUIRED" -eq 1 && "$PACKAGE_UPGRADE_STATUS" == "OK (upgraded; reboot required)" ]]
+        ' _ "$repo_root" "$case_root" || fail "package upgrade reboot marker regression failed"
+
+    local main_section refresh_line upgrade_line prepare_line backup_line update_count
+    main_section="$(sed -n '/^main()/,$p' "$repo_root/harden.sh")"
+    refresh_line="$(awk '/^[[:space:]]*refresh_apt_metadata[[:space:]]*$/ { print NR; exit }' <<<"$main_section")"
+    upgrade_line="$(awk '/^[[:space:]]*upgrade_packages_safely[[:space:]]*$/ { print NR; exit }' <<<"$main_section")"
+    prepare_line="$(awk '/^[[:space:]]*prepare_packages[[:space:]]*$/ { print NR; exit }' <<<"$main_section")"
+    backup_line="$(awk '/^[[:space:]]*backup_config[[:space:]]*$/ { print NR; exit }' <<<"$main_section")"
+    update_count="$(awk '!/^[[:space:]]*#/ && /run_streamed[[:space:]].*apt-get update/ {count++} END {print count+0}' "$repo_root/harden.sh")"
+    [[ "$update_count" == 1 && "$backup_line" -lt "$refresh_line" && "$refresh_line" -lt "$upgrade_line" && "$upgrade_line" -lt "$prepare_line" ]] \
+        || fail "Phase 03 APT refresh/upgrade/package-install order or single-update invariant regressed"
+
+    : > "$apt_log"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 PACKAGE_UPGRADE_APT_LOG="$apt_log" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        MODE=dry-run; log() { printf "%s\n" "$*"; }; refresh_apt_metadata; upgrade_packages_safely
+        [[ ! -s "$PACKAGE_UPGRADE_APT_LOG" && "$PACKAGE_UPGRADE_STATUS" == PLANNED* ]]
+    ' _ "$repo_root" || fail "Phase 03 APT dry-run performed a package operation"
+}
+
+run_residual_purge_tests() {
+    local case_root="$test_root/residual-purge" mock_bin="$test_root/residual-purge/bin"
+    install -d "$mock_bin"
+    cat > "$mock_bin/dpkg-query" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == -W ]]; then
+    if [[ "${3:-}" == safe-residual ]]; then
+        [[ "${RESIDUAL_STATE:-present}" == present ]] && printf 'deinstall ok config-files\n'
+        exit 0
+    fi
+    if [[ "${RESIDUAL_STATE:-present}" == present ]]; then
+        printf 'safe-residual\tdeinstall ok config-files\n'
+    fi
+    [[ "${RESIDUAL_PROTECTED:-0}" == 1 ]] && printf 'openssh-server\tdeinstall ok config-files\n'
+fi
+EOF
+    cat > "$mock_bin/apt-get" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == -s ]]; then
+    if [[ "${RESIDUAL_UNREQUESTED:-0}" == 1 ]]; then printf 'Purg safe-residual [1.0]\nPurg unrelated-config [1.0]\n'; else printf 'Purg safe-residual [1.0]\n'; fi
+elif [[ " $* " == *' purge -y '* ]]; then
+    printf '%s\n' "$*" >> "$RESIDUAL_APT_LOG"
+    printf cleared > "$RESIDUAL_STATE_FILE"
+fi
+EOF
+    chmod +x "$mock_bin/dpkg-query" "$mock_bin/apt-get"
+    : > "$case_root/apt.log"; : > "$case_root/state"; install -d "$case_root/boot"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 RESIDUAL_APT_LOG="$case_root/apt.log" RESIDUAL_STATE_FILE="$case_root/state" HARDEN_BOOT_DIR="$case_root/boot" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        MODE=apply; CHANGE_LOG="$2/changes.tsv"; : > "$CHANGE_LOG"; BACKUP_DIR="$2/backup"; mkdir -p "$BACKUP_DIR"
+        log() { :; }; record_change() { :; }; record_skip() { :; }; run_streamed() { "$@"; }
+        dpkg-query() { if [[ -s "$RESIDUAL_STATE_FILE" ]]; then RESIDUAL_STATE=cleared command dpkg-query "$@"; else RESIDUAL_STATE=present command dpkg-query "$@"; fi; }
+        purge_removed_packages final || { printf "purge status: %s\n" "$RESIDUAL_PURGE_STATUS" >&2; cat "$RESIDUAL_APT_LOG" >&2; exit 1; }
+        grep -Fq "purge -y safe-residual" "$RESIDUAL_APT_LOG" || { cat "$RESIDUAL_APT_LOG" >&2; exit 1; }
+        ! grep -Fq safe-residual < <(dpkg-query -W) || { dpkg-query -W >&2; exit 1; }
+    ' _ "$repo_root" "$case_root" || fail "residual package final sweep regression failed"
+    : > "$case_root/apt.log"; : > "$case_root/state"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 RESIDUAL_APT_LOG="$case_root/apt.log" RESIDUAL_STATE_FILE="$case_root/state" RESIDUAL_UNREQUESTED=1 bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        MODE=apply; CHANGE_LOG="$2/unrequested.tsv"; : > "$CHANGE_LOG"; log() { :; }; record_change() { :; }; record_skip() { :; }; run_streamed() { "$@"; }
+        purge_removed_packages final
+        [[ ! -s "$RESIDUAL_APT_LOG" ]]
+    ' _ "$repo_root" "$case_root" || fail "residual package unrequested purge was not blocked"
+
+    local fixture_root fixture_status fixture_log
+    fixture_root="$case_root/boot-fixtures"
+    fixture_status="$fixture_root/status.tsv"
+    fixture_log="$fixture_root/apt.log"
+    install -d "$fixture_root/bin" "$fixture_root/boot" "$fixture_root/efi/EFI/ubuntu" "$fixture_root/grub" "$fixture_root/links"
+    cat > "$fixture_root/bin/uname" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "${RESIDUAL_KERNEL_VERSION:-7.0.0-30-generic}"
+EOF
+    cat > "$fixture_root/bin/readlink" <<'EOF'
+#!/usr/bin/env bash
+[[ -n "${RESIDUAL_BOOT_TARGET:-}" ]] || exit 1
+printf '%s\n' "$RESIDUAL_BOOT_TARGET"
+EOF
+    cat > "$fixture_root/bin/dpkg-query" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+fmt="${2:-}" package="${3:-}"
+emit() {
+    local name="$1" status="$2"
+    case "$fmt" in
+        *'${binary:Package}'*) printf '%s\t%s\n' "$name" "$status" ;;
+        *'${db:Status-Abbrev}'*) [[ "$status" == 'install ok installed' ]] && printf 'ii \n' || printf 'rc \n' ;;
+        *) printf '%s\n' "$status" ;;
+    esac
+}
+if [[ -z "$package" ]]; then
+    while IFS=$'\t' read -r name status; do [[ -n "$name" ]] && emit "$name" "$status"; done < "$RESIDUAL_FIXTURE_STATUS"
+else
+    while IFS=$'\t' read -r name status; do
+        [[ "$name" == "$package" ]] && { emit "$name" "$status"; exit 0; }
+    done < "$RESIDUAL_FIXTURE_STATUS"
+fi
+EOF
+    cat > "$fixture_root/bin/apt-get" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == -s ]]; then
+    shift
+    [[ "${1:-}" == purge ]] || exit 1
+    shift
+    for package in "$@"; do printf 'Purg %s [1.0]\n' "$package"; done
+    if [[ "${RESIDUAL_SIM_EXTRA:-0}" == 1 ]]; then printf 'Purg unrelated-installed [1.0]\n'; fi
+elif [[ "${1:-}" == check ]]; then
+    exit 0
+elif [[ "${1:-}" == purge ]]; then
+    printf '%s\n' "$*" >> "$RESIDUAL_FIXTURE_APT_LOG"
+    for package in "$@"; do
+        [[ "$package" == -y ]] && continue
+        awk -F '\t' -v package="$package" '$1 != package {print $0}' "$RESIDUAL_FIXTURE_STATUS" > "${RESIDUAL_FIXTURE_STATUS}.next"
+        mv "${RESIDUAL_FIXTURE_STATUS}.next" "$RESIDUAL_FIXTURE_STATUS"
+    done
+else
+    exit 1
+fi
+EOF
+    chmod +x "$fixture_root/bin/uname" "$fixture_root/bin/readlink" "$fixture_root/bin/dpkg-query" "$fixture_root/bin/apt-get"
+    printf 'grub configuration\n' > "$fixture_root/grub/grub.cfg"
+    printf 'efi binary\n' > "$fixture_root/efi/EFI/ubuntu/shimx64.efi"
+    for artifact in vmlinuz initrd.img System.map config; do printf 'current %s\n' "$artifact" > "$fixture_root/boot/${artifact}-7.0.0-30-generic"; done
+
+    cat > "$fixture_status" <<'EOF'
+linux-image-7.0.0-30-generic	install ok installed
+linux-image-unsigned-7.0.0-14-generic	deinstall ok config-files
+linux-main-modules-zfs-7.0.0-14-generic	deinstall ok config-files
+linux-modules-7.0.0-14-generic	deinstall ok config-files
+grub-pc	deinstall ok config-files
+grub-efi-amd64	install ok installed
+grub-efi-amd64-bin	install ok installed
+grub2-common	install ok installed
+shim-signed	install ok installed
+EOF
+    : > "$fixture_log"
+    env PATH="$fixture_root/bin:$PATH" HARDEN_SOURCE_ONLY=1 RESIDUAL_FIXTURE_STATUS="$fixture_status" RESIDUAL_FIXTURE_APT_LOG="$fixture_log" \
+        HARDEN_BOOT_DIR="$fixture_root/boot" HARDEN_BOOT_SYMLINK_DIR="$fixture_root/links" HARDEN_EFI_RUNTIME_DIR="$fixture_root/efi-runtime" \
+        HARDEN_EFI_BOOT_DIR="$fixture_root/efi" HARDEN_GRUB_DIR="$fixture_root/grub" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; REBOOT_REQUIRED=0; CHANGE_LOG="$2/target.tsv"; : > "$CHANGE_LOG"; mkdir -p "$HARDEN_EFI_RUNTIME_DIR"
+            log() { :; }; record_change() { :; }; record_skip() { :; }; run_streamed() { "$@"; }
+            purge_removed_packages final
+            ! grep -E "^(linux-image-unsigned-7.0.0-14-generic|linux-main-modules-zfs-7.0.0-14-generic|linux-modules-7.0.0-14-generic|grub-pc)[[:space:]]" "$RESIDUAL_FIXTURE_STATUS"
+            [[ "$RESIDUAL_PURGE_STATUS" == OK* && "$REBOOT_REQUIRED" -eq 0 ]]
+            grep -Fq "purge -y linux-image-unsigned-7.0.0-14-generic linux-main-modules-zfs-7.0.0-14-generic linux-modules-7.0.0-14-generic grub-pc" "$RESIDUAL_FIXTURE_APT_LOG"
+            before="$(wc -l < "$RESIDUAL_FIXTURE_APT_LOG")"; purge_removed_packages final; [[ "$(wc -l < "$RESIDUAL_FIXTURE_APT_LOG")" == "$before" ]]
+        ' _ "$repo_root" "$fixture_root" || fail "UEFI old-kernel/grub-pc residual purge regression failed"
+
+    cat > "$fixture_status" <<'EOF'
+linux-image-7.0.0-30-generic	deinstall ok config-files
+grub-efi-amd64	install ok installed
+EOF
+    : > "$fixture_log"
+    env PATH="$fixture_root/bin:$PATH" HARDEN_SOURCE_ONLY=1 RESIDUAL_FIXTURE_STATUS="$fixture_status" RESIDUAL_FIXTURE_APT_LOG="$fixture_log" \
+        HARDEN_BOOT_DIR="$fixture_root/boot" HARDEN_BOOT_SYMLINK_DIR="$fixture_root/links" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; log() { :; }; record_change() { :; }; record_skip() { :; }; run_streamed() { "$@"; }; purge_removed_packages; [[ ! -s "$RESIDUAL_FIXTURE_APT_LOG" ]]
+        ' _ "$repo_root" "$fixture_root" || fail "running kernel residual was not protected"
+
+    cat > "$fixture_status" <<'EOF'
+linux-image-unsigned-7.0.0-14-generic	deinstall ok config-files
+EOF
+    printf 'old artifact\n' > "$fixture_root/boot/vmlinuz-7.0.0-14-generic"
+    : > "$fixture_log"
+    env PATH="$fixture_root/bin:$PATH" HARDEN_SOURCE_ONLY=1 RESIDUAL_FIXTURE_STATUS="$fixture_status" RESIDUAL_FIXTURE_APT_LOG="$fixture_log" HARDEN_BOOT_DIR="$fixture_root/boot" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; log() { :; }; record_change() { :; }; record_skip() { :; }; run_streamed() { "$@"; }; purge_removed_packages; [[ ! -s "$RESIDUAL_FIXTURE_APT_LOG" ]]
+        ' _ "$repo_root" "$fixture_root" || fail "old kernel residual with /boot artifact was not protected"
+    rm -f "$fixture_root/boot/vmlinuz-7.0.0-14-generic"
+    printf 'old boot target\n' > "$fixture_root/old-vmlinuz-7.0.0-14-generic"
+    : > "$fixture_root/links/vmlinuz"
+    : > "$fixture_log"
+    env PATH="$fixture_root/bin:$PATH" HARDEN_SOURCE_ONLY=1 RESIDUAL_FIXTURE_STATUS="$fixture_status" RESIDUAL_FIXTURE_APT_LOG="$fixture_log" RESIDUAL_BOOT_TARGET="$fixture_root/old-vmlinuz-7.0.0-14-generic" \
+        HARDEN_BOOT_DIR="$fixture_root/boot" HARDEN_BOOT_SYMLINK_DIR="$fixture_root/links" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; log() { :; }; record_change() { :; }; record_skip() { :; }; run_streamed() { "$@"; }; purge_removed_packages; [[ ! -s "$RESIDUAL_FIXTURE_APT_LOG" ]]
+        ' _ "$repo_root" "$fixture_root" || fail "kernel residual referenced by a boot symlink was not protected"
+    rm -f "$fixture_root/links/vmlinuz" "$fixture_root/old-vmlinuz-7.0.0-14-generic"
+
+    cat > "$fixture_status" <<'EOF'
+linux-image-custom	deinstall ok config-files
+linux-image-generic	deinstall ok config-files
+grub-pc	deinstall ok config-files
+EOF
+    : > "$fixture_log"
+    env PATH="$fixture_root/bin:$PATH" HARDEN_SOURCE_ONLY=1 RESIDUAL_FIXTURE_STATUS="$fixture_status" RESIDUAL_FIXTURE_APT_LOG="$fixture_log" HARDEN_BOOT_DIR="$fixture_root/boot" HARDEN_EFI_RUNTIME_DIR="$fixture_root/no-efi" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; log() { :; }; record_change() { :; }; record_skip() { :; }; run_streamed() { "$@"; }; purge_removed_packages; [[ ! -s "$RESIDUAL_FIXTURE_APT_LOG" ]]
+        ' _ "$repo_root" "$fixture_root" || fail "ambiguous/meta kernel or BIOS grub-pc residual was not protected"
+
+    cat > "$fixture_status" <<'EOF'
+linux-image-unsigned-7.0.0-14-generic	deinstall ok config-files
+linux-image-7.0.0-14-generic	install ok installed
+grub-pc	deinstall ok config-files
+EOF
+    : > "$fixture_log"
+    env PATH="$fixture_root/bin:$PATH" HARDEN_SOURCE_ONLY=1 RESIDUAL_FIXTURE_STATUS="$fixture_status" RESIDUAL_FIXTURE_APT_LOG="$fixture_log" HARDEN_BOOT_DIR="$fixture_root/boot" HARDEN_EFI_RUNTIME_DIR="$fixture_root/efi-runtime" HARDEN_EFI_BOOT_DIR="$fixture_root/missing-efi" HARDEN_GRUB_DIR="$fixture_root/grub" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; log() { :; }; record_change() { :; }; record_skip() { :; }; run_streamed() { "$@"; }; purge_removed_packages; [[ ! -s "$RESIDUAL_FIXTURE_APT_LOG" ]]
+        ' _ "$repo_root" "$fixture_root" || fail "installed old kernel or unverifiable EFI GRUB was not protected"
+
+    cat > "$fixture_status" <<'EOF'
+linux-image-unsigned-7.0.0-14-generic	deinstall ok config-files
+grub-efi-amd64	install ok installed
+unrelated-installed	install ok installed
+EOF
+    : > "$fixture_log"
+    env PATH="$fixture_root/bin:$PATH" HARDEN_SOURCE_ONLY=1 RESIDUAL_FIXTURE_STATUS="$fixture_status" RESIDUAL_FIXTURE_APT_LOG="$fixture_log" RESIDUAL_SIM_EXTRA=1 \
+        HARDEN_BOOT_DIR="$fixture_root/boot" HARDEN_EFI_RUNTIME_DIR="$fixture_root/efi-runtime" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; log() { :; }; record_change() { :; }; record_skip() { :; }; run_streamed() { "$@"; }; purge_removed_packages; [[ ! -s "$RESIDUAL_FIXTURE_APT_LOG" ]]
+        ' _ "$repo_root" "$fixture_root" || fail "residual purge simulation with extra removal was not blocked"
+}
+
+run_firewall_inventory_tests() {
+    local case_root="$test_root/firewall-inventory" mock_bin="$test_root/firewall-inventory/bin" command_log="$test_root/firewall-inventory/commands.log"
+    install -d "$mock_bin"
+    cat > "$mock_bin/nft" <<'EOF'
+#!/usr/bin/env bash
+printf 'nft %s\n' "$*" >> "$FIREWALL_TEST_COMMAND_LOG"
+if [[ "$*" == 'list ruleset' ]]; then printf 'table inet tailscale { chain ts-input { } }\n'; elif [[ "$*" == 'list table inet hardening_filter' ]]; then printf 'table inet hardening_filter { chain input { tcp dport 22 accept } }\n'; fi
+EOF
+    cat > "$mock_bin/iptables" <<'EOF'
+#!/usr/bin/env bash
+printf 'iptables %s\n' "$*" >> "$FIREWALL_TEST_COMMAND_LOG"
+printf '%s\n' '-P INPUT ACCEPT'
+EOF
+    cp "$mock_bin/iptables" "$mock_bin/ip6tables"
+    chmod +x "$mock_bin/nft" "$mock_bin/iptables" "$mock_bin/ip6tables"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_FIREWALL_RULE_REPORT="$case_root/report.txt" FIREWALL_TEST_COMMAND_LOG="$command_log" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        MODE=apply; log() { :; }; record_skip() { :; }
+        inspect_firewall_rule_hygiene
+        [[ "$FIREWALL_RULE_HYGIENE_STATUS" == "INVENTORIED"* || "$FIREWALL_RULE_HYGIENE_STATUS" == "REVIEW REQUIRED"* ]]
+        grep -Fq "table inet tailscale" "$HARDEN_FIREWALL_RULE_REPORT"
+        ! grep -Eqi "(delete|flush| -D )" "$FIREWALL_TEST_COMMAND_LOG"
+    ' _ "$repo_root" || fail "FIRE-4513 inventory safety regression failed"
+}
+
 run_compiler_tests() {
     local case_root="$test_root/compiler" mock_bin="$test_root/compiler/bin" apt_log="$test_root/compiler/apt.log"
     install -d "$mock_bin" "$case_root/backup" "$case_root/empty-usr/bin" "$case_root/empty-local/bin"
@@ -1356,7 +1644,10 @@ EOF
         grep -Fq "INITRAMFS_POLICY_CHANGED" <<<"$kernel_section"
         grep -Fq "Managed module policy is unchanged" <<<"$kernel_section"
         grep -Fq "grub_config_changed" <<<"$grub_section"
-        [[ "$(grep -Fc "REBOOT_REQUIRED=1" "$1/harden.sh")" == 4 ]]
+        upgrade_section="$(sed -n "/^upgrade_packages_safely()/,/^}/p" "$1/harden.sh")"
+        grep -Fq "reboot_marker=\"\${HARDEN_REBOOT_REQUIRED_FILE:-/var/run/reboot-required}\"" <<<"$upgrade_section"
+        grep -Fq "PACKAGE_UPGRADE_STATUS=\"OK (upgraded; reboot required)\"" <<<"$upgrade_section"
+        [[ "$(grep -Fc "REBOOT_REQUIRED=1" "$1/harden.sh")" == 5 ]]
     ' _ "$repo_root" || fail "initramfs/GRUB/reboot-required change gating regressed"
 }
 
@@ -1654,6 +1945,344 @@ run_uefi_mor_tests() {
         || fail "UEFI MOR implementation redirects output to an EFI variable path"
     ! grep -Eq '\b(rm|dd|tee|install|cp|mv)\b.*\$?(mor_path|lock_path|efivars_dir)' "$repo_root/harden.sh" \
         || fail "UEFI MOR implementation contains an EFI-variable mutation command"
+}
+
+run_ipv6_banner_motd_tests() {
+    local case_root="$test_root/ipv6-banner-motd" mock_bin
+    mock_bin="$case_root/bin"
+    install -d "$mock_bin"
+    cat > "$mock_bin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+[[ "$1" == is-active && "$2" == --quiet && "$3" == tailscaled.service && "${IPV6_TEST_TAILSCALE:-0}" == 1 ]] && exit 0
+exit 1
+EOF
+    cat > "$mock_bin/ip" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-} ${2:-} ${3:-} ${4:-}" in
+    '-o link show up') printf '2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\n' ;;
+    '-6 -o addr show') [[ "${IPV6_TEST_GLOBAL:-0}" == 1 ]] && printf '2: eth0    inet6 2001:db8::10/64 scope global\n' ;;
+    '-6 route show default') [[ "${IPV6_TEST_DEFAULT_ROUTE:-0}" == 1 ]] && printf 'default via 2001:db8::1 dev eth0\n' ;;
+    '-6 rule show '*) [[ "${IPV6_TEST_POLICY_ROUTE:-0}" == 1 ]] && printf '100: from all lookup 100\n' || printf '0: from all lookup local\n32766: from all lookup main\n32767: from all lookup default\n' ;;
+esac
+EOF
+cat > "$mock_bin/ss" <<'EOF'
+#!/usr/bin/env bash
+[[ "$1 $2 $3" == '-H -6 -lntu' ]] || exit 64
+case "${IPV6_TEST_LISTENER:-0}" in
+    1) printf 'tcp LISTEN 0 128 [::]:22 [::]:*\n' ;;
+    wildcard) printf 'tcp LISTEN 0 128 *:443 *:*\n' ;;
+esac
+EOF
+cat > "$mock_bin/sysctl" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+root="${HARDEN_PROC_SYS_ROOT:?}"
+set_value() {
+    local key="$1" value="$2" path="$root/${key//./\/}"
+    [[ -e "$path" ]] || return 1
+    if [[ "$key" == net.ipv6.conf.all.disable_ipv6 ]]; then
+        # Match Linux: writing conf/all/disable_ipv6 propagates to default and
+        # every per-interface value before a deterministic restore rewrites them.
+        while IFS= read -r path; do
+            printf '%s\n' "$value" > "$path"
+        done < <(find "$root/net/ipv6/conf" -mindepth 2 -maxdepth 2 -type f -name disable_ipv6 -print | sort)
+        return 0
+    fi
+    printf '%s\n' "$value" > "$path"
+}
+case "${1:-}" in
+    -n) cat "$root/${2//./\/}" ;;
+    -w)
+        key="${2%%=*}"; value="${2#*=}"
+        set_value "$key" "$value"
+        ;;
+    -p)
+        count=0
+        while IFS='=' read -r key value; do
+            key="${key//[[:space:]]/}"; value="${value//[[:space:]]/}"
+            [[ -n "$key" && "$key" != \#* ]] || continue
+            count=$((count + 1))
+            set_value "$key" "$value"
+            [[ "${IPV6_TEST_FAIL_SYSCTL_KEY:-}" != "$key" ]] || exit 1
+            [[ "${IPV6_TEST_FAIL_SYSCTL_AFTER:-0}" -eq 0 || "$count" -lt "${IPV6_TEST_FAIL_SYSCTL_AFTER}" ]] || exit 1
+        done < "$2"
+        ;;
+    *) exit 64 ;;
+esac
+EOF
+    chmod +x "$mock_bin/systemctl" "$mock_bin/ip" "$mock_bin/ss" "$mock_bin/sysctl"
+
+    make_ipv6_tree() {
+        local root="$1" interface key
+        for interface in all default lo eth0 tailscale0 down0; do
+            install -d "$root/net/ipv6/conf/$interface"
+            for key in disable_ipv6 accept_redirects accept_source_route forwarding; do printf '0\n' > "$root/net/ipv6/conf/$interface/$key"; done
+        done
+    }
+    run_ipv6_case() {
+        local name="$1" tailscale="$2" global="$3" default_route="$4" listener="$5" forwarding="$6" policy_route="$7" disable="$8" expected="$9"
+        local root="$case_root/$name/proc/sys"
+        make_ipv6_tree "$root"
+        printf '%s\n' "$forwarding" > "$root/net/ipv6/conf/all/forwarding"
+        env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_PROC_SYS_ROOT="$root" \
+            IPV6_TEST_TAILSCALE="$tailscale" IPV6_TEST_GLOBAL="$global" IPV6_TEST_DEFAULT_ROUTE="$default_route" IPV6_TEST_LISTENER="$listener" IPV6_TEST_POLICY_ROUTE="$policy_route" bash -c '
+                source "$1/harden.sh"; trap - ERR EXIT
+                MODE=apply; AGGRESSIVE=1; DISABLE_IPV6="$3"; log() { :; }; record_skip() { :; }
+                set +e; detect_ipv6_policy; detect_status=$?; set -e
+                [[ "$IPV6_POLICY" == "$2" ]] || { printf "status=%s policy=%s reason=%s forwarding=%s\n" "$detect_status" "$IPV6_POLICY" "$IPV6_REASON" "$IPV6_FORWARDING_STATE" >&2; exit 1; }
+                if [[ "$IPV6_POLICY" == disabled-explicit-opt-in ]]; then
+                    candidates="$(ipv6_policy_candidates)"
+                    grep -Fxq "net.ipv6.conf.all.disable_ipv6=1" <<<"$candidates"
+                    grep -Fxq "net.ipv6.conf.eth0.disable_ipv6=1" <<<"$candidates" || { printf "candidates=%s\n" "$candidates" >&2; exit 1; }
+                    grep -Fxq "net.ipv6.conf.lo.disable_ipv6=1" <<<"$candidates"
+                    grep -Fxq "net.ipv6.conf.tailscale0.disable_ipv6=1" <<<"$candidates"
+                    grep -Fxq "net.ipv6.conf.down0.disable_ipv6=1" <<<"$candidates"
+                else
+                    ! ipv6_policy_candidates | grep -q disable_ipv6
+                fi
+            ' _ "$repo_root" "$expected" "$disable" || fail "IPv6 ${name} policy failed (expected ${expected})"
+    }
+    run_ipv6_case unused-default-off 0 0 0 0 0 0 0 enabled-safe
+    run_ipv6_case unused-opt-in 0 0 0 0 0 0 1 disabled-explicit-opt-in
+    run_ipv6_case global-address 0 1 0 0 0 0 1 enabled-safety-blocked
+    run_ipv6_case default-route 0 0 1 0 0 0 1 enabled-safety-blocked
+    run_ipv6_case listener 0 0 0 1 0 0 1 enabled-safety-blocked
+    run_ipv6_case wildcard-listener 0 0 0 wildcard 0 0 1 enabled-safety-blocked
+    run_ipv6_case forwarding 0 0 0 0 1 0 1 enabled-safety-blocked
+    run_ipv6_case policy-routing 0 0 0 0 0 1 1 enabled-safety-blocked
+    run_ipv6_case tailscale 1 0 0 0 0 0 1 enabled-safety-blocked
+
+    local ipv6_dry="$case_root/dry-run"
+    make_ipv6_tree "$ipv6_dry/proc/sys"
+    printf 'unchanged\n' > "$ipv6_dry/99-security-hardening.conf"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_PROC_SYS_ROOT="$ipv6_dry/proc/sys" \
+        HARDEN_SYSCTL_CONFIG="$ipv6_dry/99-security-hardening.conf" HARDEN_IPV6_REPORT="$ipv6_dry/ipv6-report.txt" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=dry-run; AGGRESSIVE=1; DISABLE_IPV6=1; log() { :; }
+            configure_sysctl
+            [[ "$IPV6_POLICY" == disabled-explicit-opt-in ]]
+            [[ "$IPV6_PERSISTENCE_STATUS" == PLANNED* ]]
+            grep -Fxq unchanged "$HARDEN_SYSCTL_CONFIG"
+            [[ ! -e "$HARDEN_IPV6_REPORT" ]]
+        ' _ "$repo_root" || fail "IPv6 dry-run wrote managed state or did not plan explicit disable"
+
+    run_ipv6_apply() {
+        local root="$1" disable="$2" fail_after="${3:-0}" fail_key="${4:-}"
+        env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_PROC_SYS_ROOT="$root/proc/sys" \
+            HARDEN_SYSCTL_CONFIG="$root/99-security-hardening.conf" HARDEN_IPV6_REPORT="$root/ipv6-report.txt" \
+            HARDEN_RP_FILTER_REPORT="$root/rp-filter-report.txt" IPV6_TEST_FAIL_SYSCTL_AFTER="$fail_after" IPV6_TEST_FAIL_SYSCTL_KEY="$fail_key" IPV6_TEST_EXPECT_FAILURE="$([[ "$fail_after" -gt 0 || -n "$fail_key" ]] && printf 1 || printf 0)" bash -c '
+                source "$1/harden.sh"; trap - ERR EXIT
+                MODE=apply; AGGRESSIVE=1; DISABLE_IPV6="$3"; BACKUP_DIR="$2/backup"; CHANGE_LOG="$2/changes.tsv"
+                mkdir -p "$BACKUP_DIR"; : > "$CHANGE_LOG"
+                log() { :; }; record_change() { :; }; record_skip() { :; }
+                run_streamed() { "$@"; }
+                write_rp_filter_report() { :; }
+                write_ipv6_report() { printf "policy=%s\nreason=%s\nruntime=%s\npersistence=%s\n" "$IPV6_POLICY" "$IPV6_REASON" "$IPV6_RUNTIME_STATUS" "$IPV6_PERSISTENCE_STATUS" > "$HARDEN_IPV6_REPORT"; }
+                transaction_copy() { [[ -e "$1" ]] && cp -a -- "$1" "$BACKUP_DIR/$2" || : > "$BACKUP_DIR/$2.absent"; }
+                transaction_restore() { [[ -e "$BACKUP_DIR/$2.absent" ]] && rm -f -- "$1" || cp -a -- "$BACKUP_DIR/$2" "$1"; }
+                install_managed_file() { local destination="$1" mode="$2" temporary; MANAGED_FILE_CHANGED=0; temporary="$(mktemp)"; cat > "$temporary"; if [[ -f "$destination" ]] && cmp -s "$temporary" "$destination"; then rm -f "$temporary"; return 0; fi; mkdir -p -- "$(dirname -- "$destination")"; cp -- "$temporary" "$destination"; chmod "$mode" "$destination"; rm -f "$temporary"; MANAGED_FILE_CHANGED=1; }
+                set +e; configure_sysctl; configure_status=$?; set -e
+                if [[ "$configure_status" -ne 0 ]]; then
+                    [[ "$IPV6_TEST_EXPECT_FAILURE" == 1 ]] || printf "configure-status=%s ipv6-policy=%s runtime=%s persistence=%s\n" "$configure_status" "$IPV6_POLICY" "$IPV6_RUNTIME_STATUS" "$IPV6_PERSISTENCE_STATUS" >&2
+                    exit "$configure_status"
+                fi
+            ' _ "$repo_root" "$root" "$disable"
+    }
+
+    local ipv6_apply="$case_root/apply"
+    make_ipv6_tree "$ipv6_apply/proc/sys"
+    : > "$ipv6_apply/99-security-hardening.conf"
+    run_ipv6_apply "$ipv6_apply" 0 || fail "normal IPv6 safe sysctl application failed"
+    grep -Fxq 'net.ipv6.conf.all.accept_source_route = -1' "$ipv6_apply/99-security-hardening.conf" \
+        && grep -Fxq 'net.ipv6.conf.default.accept_source_route = -1' "$ipv6_apply/99-security-hardening.conf" \
+        && grep -Fxq 'net.ipv6.conf.all.forwarding = 0' "$ipv6_apply/99-security-hardening.conf" \
+        && grep -Fxq 'net.ipv6.conf.default.forwarding = 0' "$ipv6_apply/99-security-hardening.conf" \
+        || fail "normal non-forwarding host did not persist source-route=-1 and forwarding=0"
+
+    run_ipv6_apply "$ipv6_apply" 1 || fail "explicit IPv6 disable failed"
+    for key in all default lo eth0 tailscale0 down0; do
+        [[ "$(cat "$ipv6_apply/proc/sys/net/ipv6/conf/$key/disable_ipv6")" == 1 ]] \
+            || fail "explicit IPv6 disable did not set ${key}"
+    done
+    grep -Fxq 'net.ipv6.conf.lo.disable_ipv6 = 1' "$ipv6_apply/99-security-hardening.conf" \
+        || fail "explicit IPv6 disable did not persist lo"
+    run_ipv6_apply "$ipv6_apply" 0 || fail "preserved IPv6 disable follow-up failed"
+    grep -Fq 'previous explicit tool-managed IPv6 disable is retained' "$ipv6_apply/ipv6-report.txt" \
+        || fail "normal follow-up did not report preserved IPv6 disable"
+    for key in all default lo eth0 tailscale0 down0; do
+        [[ "$(cat "$ipv6_apply/proc/sys/net/ipv6/conf/$key/disable_ipv6")" == 1 ]] \
+            || fail "normal follow-up unexpectedly re-enabled ${key}"
+    done
+
+    local ipv6_forwarding="$case_root/interface-forwarding"
+    make_ipv6_tree "$ipv6_forwarding/proc/sys"
+    printf '1\n' > "$ipv6_forwarding/proc/sys/net/ipv6/conf/eth0/forwarding"
+    : > "$ipv6_forwarding/99-security-hardening.conf"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_PROC_SYS_ROOT="$ipv6_forwarding/proc/sys" \
+        HARDEN_SYSCTL_CONFIG="$ipv6_forwarding/99-security-hardening.conf" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; AGGRESSIVE=1; DISABLE_IPV6=1; log() { :; }; record_skip() { :; }
+            detect_ipv6_policy "$HARDEN_SYSCTL_CONFIG"
+            [[ "$IPV6_POLICY" == enabled-safety-blocked && "$IPV6_REASON" == *ipv6-forwarding-active* ]]
+        ' _ "$repo_root" || fail "active interface IPv6 forwarding did not block disable"
+
+    local ipv6_down_forwarding="$case_root/down-interface-forwarding"
+    make_ipv6_tree "$ipv6_down_forwarding/proc/sys"
+    printf '1\n' > "$ipv6_down_forwarding/proc/sys/net/ipv6/conf/down0/forwarding"
+    : > "$ipv6_down_forwarding/99-security-hardening.conf"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_PROC_SYS_ROOT="$ipv6_down_forwarding/proc/sys" \
+        HARDEN_SYSCTL_CONFIG="$ipv6_down_forwarding/99-security-hardening.conf" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; AGGRESSIVE=1; DISABLE_IPV6=1; log() { :; }; record_skip() { :; }
+            detect_ipv6_policy "$HARDEN_SYSCTL_CONFIG"
+            [[ "$IPV6_POLICY" == enabled-safety-blocked && "$IPV6_REASON" == *ipv6-forwarding-active* ]]
+        ' _ "$repo_root" || fail "DOWN interface IPv6 forwarding did not block disable"
+
+    local ipv6_force_forwarding="$case_root/down-interface-force-forwarding"
+    make_ipv6_tree "$ipv6_force_forwarding/proc/sys"
+    printf '0\n' > "$ipv6_force_forwarding/proc/sys/net/ipv6/conf/all/force_forwarding"
+    printf '0\n' > "$ipv6_force_forwarding/proc/sys/net/ipv6/conf/default/force_forwarding"
+    printf '1\n' > "$ipv6_force_forwarding/proc/sys/net/ipv6/conf/down0/force_forwarding"
+    : > "$ipv6_force_forwarding/99-security-hardening.conf"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_PROC_SYS_ROOT="$ipv6_force_forwarding/proc/sys" \
+        HARDEN_SYSCTL_CONFIG="$ipv6_force_forwarding/99-security-hardening.conf" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; AGGRESSIVE=1; DISABLE_IPV6=1; log() { :; }; record_skip() { :; }
+            detect_ipv6_policy "$HARDEN_SYSCTL_CONFIG"
+            [[ "$IPV6_POLICY" == enabled-safety-blocked && "$IPV6_REASON" == *ipv6-forwarding-active* ]]
+        ' _ "$repo_root" || fail "DOWN interface IPv6 force_forwarding did not block disable"
+
+    local ipv6_rollback="$case_root/rollback"
+    make_ipv6_tree "$ipv6_rollback/proc/sys"
+    printf '0\n' > "$ipv6_rollback/proc/sys/net/ipv6/conf/all/disable_ipv6"
+    printf '1\n' > "$ipv6_rollback/proc/sys/net/ipv6/conf/default/disable_ipv6"
+    printf '0\n' > "$ipv6_rollback/proc/sys/net/ipv6/conf/lo/disable_ipv6"
+    printf '1\n' > "$ipv6_rollback/proc/sys/net/ipv6/conf/eth0/disable_ipv6"
+    printf '0\n' > "$ipv6_rollback/proc/sys/net/ipv6/conf/tailscale0/disable_ipv6"
+    printf '1\n' > "$ipv6_rollback/proc/sys/net/ipv6/conf/down0/disable_ipv6"
+    printf 'old-config\n' > "$ipv6_rollback/99-security-hardening.conf"
+    run_ipv6_apply "$ipv6_rollback" 1 0 net.ipv6.conf.all.disable_ipv6 && fail "partial IPv6 sysctl reload unexpectedly succeeded"
+    [[ "$(cat "$ipv6_rollback/proc/sys/net/ipv6/conf/all/disable_ipv6")" == 0 \
+        && "$(cat "$ipv6_rollback/proc/sys/net/ipv6/conf/default/disable_ipv6")" == 1 \
+        && "$(cat "$ipv6_rollback/proc/sys/net/ipv6/conf/lo/disable_ipv6")" == 0 \
+        && "$(cat "$ipv6_rollback/proc/sys/net/ipv6/conf/eth0/disable_ipv6")" == 1 \
+        && "$(cat "$ipv6_rollback/proc/sys/net/ipv6/conf/tailscale0/disable_ipv6")" == 0 \
+        && "$(cat "$ipv6_rollback/proc/sys/net/ipv6/conf/down0/disable_ipv6")" == 1 ]] \
+        || fail "partial IPv6 sysctl reload did not restore exact runtime values"
+    grep -Fxq old-config "$ipv6_rollback/99-security-hardening.conf" \
+        || fail "partial IPv6 sysctl reload did not restore previous config"
+
+    local ipv6_preserved_failure="$case_root/preserved-disable-failure"
+    make_ipv6_tree "$ipv6_preserved_failure/proc/sys"
+    cat > "$ipv6_preserved_failure/99-security-hardening.conf" <<'EOF'
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+net.ipv6.conf.eth0.disable_ipv6 = 1
+net.ipv6.conf.tailscale0.disable_ipv6 = 1
+net.ipv6.conf.down0.disable_ipv6 = 1
+EOF
+    printf '0\n' > "$ipv6_preserved_failure/proc/sys/net/ipv6/conf/all/disable_ipv6"
+    printf '1\n' > "$ipv6_preserved_failure/proc/sys/net/ipv6/conf/default/disable_ipv6"
+    printf '0\n' > "$ipv6_preserved_failure/proc/sys/net/ipv6/conf/lo/disable_ipv6"
+    printf '1\n' > "$ipv6_preserved_failure/proc/sys/net/ipv6/conf/eth0/disable_ipv6"
+    printf '0\n' > "$ipv6_preserved_failure/proc/sys/net/ipv6/conf/tailscale0/disable_ipv6"
+    printf '1\n' > "$ipv6_preserved_failure/proc/sys/net/ipv6/conf/down0/disable_ipv6"
+    run_ipv6_apply "$ipv6_preserved_failure" 0 0 net.ipv6.conf.all.disable_ipv6 \
+        && fail "preserved IPv6 disable reload failure unexpectedly succeeded"
+    [[ "$(cat "$ipv6_preserved_failure/proc/sys/net/ipv6/conf/all/disable_ipv6")" == 0 \
+        && "$(cat "$ipv6_preserved_failure/proc/sys/net/ipv6/conf/default/disable_ipv6")" == 1 \
+        && "$(cat "$ipv6_preserved_failure/proc/sys/net/ipv6/conf/lo/disable_ipv6")" == 0 \
+        && "$(cat "$ipv6_preserved_failure/proc/sys/net/ipv6/conf/eth0/disable_ipv6")" == 1 \
+        && "$(cat "$ipv6_preserved_failure/proc/sys/net/ipv6/conf/tailscale0/disable_ipv6")" == 0 \
+        && "$(cat "$ipv6_preserved_failure/proc/sys/net/ipv6/conf/down0/disable_ipv6")" == 1 ]] \
+        || fail "preserved IPv6 disable reload failure did not restore exact pre-run runtime values"
+
+    local banner_root="$case_root/banner" issue issue_net
+    issue="$banner_root/issue"
+    issue_net="$banner_root/issue.net"
+    install -d "$banner_root"
+    printf 'old banner\n' > "$issue"; printf 'old network banner\n' > "$issue_net"; chmod 0600 "$issue" "$issue_net"
+    env HARDEN_SOURCE_ONLY=1 HARDEN_ISSUE_FILE="$issue" HARDEN_ISSUE_NET_FILE="$issue_net" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        MODE=apply; BACKUP_DIR="$2/backup"; CHANGE_LOG="$2/changes.tsv"; mkdir -p "$BACKUP_DIR"; : > "$CHANGE_LOG"
+        transaction_copy() { :; }; transaction_restore() { :; }
+        chown() { :; }
+        stat() {
+            [[ "$1" == -c && "$2" == "%U:%G:%a" ]] && { printf "root:root:644\n"; return 0; }
+            [[ "$1" == -c && "$2" == "%a" ]] && { printf "644\n"; return 0; }
+            command stat "$@"
+        }
+        install_managed_file() {
+            local destination="$1" mode="$2" temporary
+            MANAGED_FILE_CHANGED=0; temporary="$(mktemp)"; cat > "$temporary"
+            if [[ -f "$destination" ]] && cmp -s "$temporary" "$destination"; then rm -f "$temporary"; return 0; fi
+            mkdir -p -- "$(dirname -- "$destination")"; cp -- "$temporary" "$destination"; chmod "$mode" "$destination"; rm -f "$temporary"; MANAGED_FILE_CHANGED=1
+        }
+        configure_banners
+        expected="$(cat <<"EOF"
+*******************************************************************************
+                        AUTHORIZED ACCESS ONLY
+
+  This system is the private property of its owner. Unauthorized access,
+  use, modification, or disclosure of data on this system is prohibited
+  and may be subject to criminal prosecution under applicable law.
+
+  All activities on this system are monitored and recorded. By continuing,
+  you consent to this monitoring. Evidence of unauthorized use may be
+  disclosed to law enforcement authorities.
+
+  Disconnect IMMEDIATELY if you are not an authorized user.
+*******************************************************************************
+EOF
+)"
+        [[ "$(cat "$HARDEN_ISSUE_FILE")" == "$expected" && "$(cat "$HARDEN_ISSUE_NET_FILE")" == "$expected" ]]
+        cmp -s "$HARDEN_ISSUE_FILE" "$HARDEN_ISSUE_NET_FILE"
+        grep -Fq "AUTHORIZED ACCESS ONLY" "$HARDEN_ISSUE_FILE"
+        grep -Fq "monitored and recorded" "$HARDEN_ISSUE_FILE"
+        grep -Fq "law enforcement authorities" "$HARDEN_ISSUE_FILE"
+        [[ "$(stat -c %a "$HARDEN_ISSUE_FILE")" == 644 && "$(stat -c %a "$HARDEN_ISSUE_NET_FILE")" == 644 ]]
+        configure_banners
+    ' _ "$repo_root" "$banner_root" || fail "banner content, permissions, or idempotence failed"
+    env HARDEN_SOURCE_ONLY=1 HARDEN_ISSUE_FILE="$issue" HARDEN_ISSUE_NET_FILE="$issue_net" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        MODE=dry-run; configure_banners
+    ' _ "$repo_root" || fail "banner dry-run failed"
+
+    local motd_root="$case_root/motd" motd_dir motd_cache
+    motd_dir="$motd_root/update-motd.d"
+    motd_cache="$motd_root/motd.dynamic"
+    local motd_mock_exec=0
+    [[ "$(uname -s)" == MINGW* ]] && motd_mock_exec=1
+    install -d "$motd_dir"
+    for hook in 00-header 50-landscape-sysinfo 90-updates-available 98-reboot-required; do printf '#!/bin/sh\nexit 0\n' > "$motd_dir/$hook"; chmod 0755 "$motd_dir/$hook"; done
+    printf 'stale presentation\n' > "$motd_cache"
+    env HARDEN_SOURCE_ONLY=1 HARDEN_UPDATE_MOTD_DIR="$motd_dir" HARDEN_MOTD_CACHE="$motd_cache" MOTD_TEST_MOCK_EXEC="$motd_mock_exec" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        MODE=apply; AGGRESSIVE=1; OS_ID=ubuntu; BACKUP_DIR="$2/backup"; CHANGE_LOG="$2/changes.tsv"; mkdir -p "$BACKUP_DIR"; : > "$CHANGE_LOG"
+        transaction_copy() { cp -a -- "$1" "$BACKUP_DIR/$2"; }
+        transaction_restore() { cp -a -- "$BACKUP_DIR/$2" "$1"; chmod 0755 "$1"; }
+        if [[ "$MOTD_TEST_MOCK_EXEC" == 1 ]]; then
+            chmod() { [[ "$1" == a-x ]] && { : > "${2}.disabled"; return 0; }; command chmod "$@"; }
+        fi
+        configure_motd_presentation
+        if [[ "$MOTD_TEST_MOCK_EXEC" == 1 ]]; then
+            [[ -e "$HARDEN_UPDATE_MOTD_DIR/00-header.disabled" && -e "$HARDEN_UPDATE_MOTD_DIR/50-landscape-sysinfo.disabled" && -e "$HARDEN_UPDATE_MOTD_DIR/90-updates-available.disabled" ]]
+            [[ ! -e "$HARDEN_UPDATE_MOTD_DIR/98-reboot-required.disabled" && ! -e "$HARDEN_MOTD_CACHE" ]]
+        else
+            [[ ! -x "$HARDEN_UPDATE_MOTD_DIR/00-header" && ! -x "$HARDEN_UPDATE_MOTD_DIR/50-landscape-sysinfo" && ! -x "$HARDEN_UPDATE_MOTD_DIR/90-updates-available" ]]
+            [[ -x "$HARDEN_UPDATE_MOTD_DIR/98-reboot-required" && ! -e "$HARDEN_MOTD_CACHE" ]]
+        fi
+        transaction_restore "$HARDEN_UPDATE_MOTD_DIR/00-header" motd-hook-00-header
+        [[ "$MOTD_TEST_MOCK_EXEC" == 1 || -x "$HARDEN_UPDATE_MOTD_DIR/00-header" ]]
+    ' _ "$repo_root" "$motd_root" || fail "MOTD presentation classification, preservation, or rollback failed"
+    env HARDEN_SOURCE_ONLY=1 HARDEN_UPDATE_MOTD_DIR="$motd_dir" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        MODE=apply; AGGRESSIVE=1; OS_ID=debian; configure_motd_presentation
+        [[ "$MOTD_STATUS" == "N/A (no Ubuntu presentation hooks)" ]]
+    ' _ "$repo_root" || fail "Debian MOTD no-op failed"
+    ! grep -Eq 'apt(-get)?[[:space:]]+(purge|remove).*motd|apt(-get)?[[:space:]]+(purge|remove).*ubuntu-pro' "$repo_root/harden.sh" \
+        || fail "MOTD policy removes a package"
 }
 
 run_iowait_tests() {
@@ -2096,6 +2725,15 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
     compiler)
         run_compiler_tests
         ;;
+    packages)
+        run_packagekit_tests
+        run_package_upgrade_tests
+        run_residual_purge_tests
+        run_firewall_inventory_tests
+        ;;
+    residual)
+        run_residual_purge_tests
+        ;;
     deleted-open)
         run_deleted_open_tests
         ;;
@@ -2105,10 +2743,24 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
     uefi-mor)
         run_uefi_mor_tests
         ;;
+    ipv6-banner-motd-only)
+        run_ipv6_banner_motd_tests
+        ;;
+    ipv6-banner-motd)
+        run_ipv6_banner_motd_tests
+        run_rp_filter_tests
+        run_deleted_open_tests
+        run_login_timeout_tests
+        run_uefi_mor_tests
+        run_kernel_gate_test
+        ;;
     new-findings)
         run_lynis_summary_tests
         run_fail2ban_tests
         run_packagekit_tests
+        run_package_upgrade_tests
+        run_residual_purge_tests
+        run_firewall_inventory_tests
         run_compiler_tests
         run_binfmt_tests
         run_systemd_idempotency_tests
@@ -2116,6 +2768,7 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
         run_deleted_open_tests
         run_login_timeout_tests
         run_uefi_mor_tests
+        run_ipv6_banner_motd_tests
         run_rp_filter_tests
         run_iowait_tests
         ;;
@@ -2126,6 +2779,9 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
         run_lynis_summary_tests
         run_fail2ban_tests
         run_packagekit_tests
+        run_package_upgrade_tests
+        run_residual_purge_tests
+        run_firewall_inventory_tests
         run_compiler_tests
         run_binfmt_tests
         run_systemd_idempotency_tests
@@ -2133,6 +2789,7 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
         run_deleted_open_tests
         run_login_timeout_tests
         run_uefi_mor_tests
+        run_ipv6_banner_motd_tests
         run_rp_filter_tests
         run_iowait_tests
         ;;

@@ -124,6 +124,8 @@ sudo ./harden.sh --dry-run
 sudo ./harden.sh --dry-run --aggressive
 sudo ./harden.sh --apply
 sudo ./harden.sh --apply --aggressive
+# Only on an unequivocally unused IPv6 host, after reviewing the dry-run:
+sudo ./harden.sh --apply --aggressive --disable-ipv6
 ```
 
 Nicht-interaktives Remote Logging:
@@ -150,6 +152,12 @@ sudo ./harden.sh \
 - Interaktive Login-Shells erhalten standardmäßig `TMOUT=900`. Nichtinteraktive
   SSH-Kommandos, scp/sftp, Cron, systemd und Skripte werden nicht beeinflusst;
   ein bereits gesetztes `TMOUT` oder `HARDEN_SHELL_TMOUT` bleibt maßgeblich.
+- IPv6 bleibt standardmäßig aktiviert. `--disable-ipv6` ist nur zusammen mit
+  `--aggressive` ein explizites Opt-in und wird bei Tailscale, IPv6-Nutzung
+  oder einer unklaren Routing-Situation sicher verweigert.
+- Der aggressive Modus entfernt keine dynamischen-MOTD-Pakete oder Dienste;
+  er schaltet nur ausgewählte Ubuntu-Präsentations-Hooks ab und erhält die
+  technisch getrennte Reboot-Benachrichtigung.
 - Kein Lynis-Test wird deaktiviert; es gibt keine kosmetische Score-Manipulation.
 
 ## Ergebnisdateien

@@ -166,6 +166,102 @@ müssen unverändert bleiben. Das Projekt verwendet ausschließlich metadata-onl
 capture; ein btmp-Inhalts-Restore oder -Rollback findet nicht statt. SSH-Remote-Kommandos dürfen weiterhin nicht durch
 `TMOUT` beeinflusst werden.
 
+### Ubuntu-26.04.1-Retest IPv6, Banner und dynamisches MOTD (#9, #24, #25)
+
+Führe den Apply aus einer zweiten bestätigten SSH-/Recovery-Sitzung direkt
+ohne externe `tee`-Pipe aus. Eine IPv6-Deaktivierung ist kein Standardtest:
+zuerst wird nur die erkannte Policy geprüft. Tailscale-Prefs, SSH und die
+Firewall dürfen dabei unverändert bleiben.
+
+```bash
+sudo ./harden.sh --apply --aggressive
+sudo cat /root/ipv6-policy-report.txt
+cmp -s /etc/issue /etc/issue.net
+stat -c '%U:%G:%a %n' /etc/issue /etc/issue.net
+cat /etc/issue
+find /etc/update-motd.d -maxdepth 1 -type f -printf '%m %f\n' | sort
+sudo ./harden.sh --apply --aggressive
+```
+
+Der IPv6-Bericht muss Policy, Grund sowie effektive `all`-/`default`-/Interface-
+Werte nennen. Bei aktivem Tailscale, globaler Adresse, IPv6-Default- oder
+Policy-Route, Listener oder Forwarding bleibt IPv6 aktiviert und die sicheren
+Redirect-/Source-Route-Sysctls werden validiert. Auf dem normalen nicht
+forwardenden Host müssen `all` und `default` bei `accept_source_route=-1` und
+`forwarding=0` stehen; ein aktiver oder unklarer Forwarding-Zustand wird
+erhalten und blockiert eine Deaktivierung. Prüfe danach SSH und Tailscale
+einschließlich eines genehmigten `tailscale ping <TAILSCALE-PEER>`.
+
+Die beiden Pre-Login-Banner müssen byte-identisch, `root:root` und `0644` sein.
+Der bewusst ausführliche Text gehört ausschließlich in `/etc/issue` und
+`/etc/issue.net`, nicht in das Post-Login-MOTD. `accept_source_route=-1` ist
+eine absichtlich strengere Linux-Policy als Lynis 3.1.6 `prefval=0`: sie lehnt
+alle Routing-Header ab, während `>=0` noch Type 2 zulässt. Diese Abweichung
+wird dokumentiert, nicht durch ein Profil-Skip verborgen.
+
+Für die verbleibenden Paket-/Firewall-Findings zusätzlich prüfen:
+
+```bash
+sudo apt-get check
+sudo cat /root/firewall-rule-inventory.txt
+dpkg-query -W -f='${binary:Package}\t${Status}\n' | awk -F '\t' '$2 == "deinstall ok config-files"'
+test -e /var/run/reboot-required && cat /var/run/reboot-required.pkgs || true
+```
+
+Der Paketpfad darf nur `apt-get upgrade` ohne Removal oder Downgrade ausführen;
+ein Full-/Dist-Upgrade ist kein Testfall. FIRE-4513 bleibt sichtbar, wenn die
+Inventur keine eindeutig redundante, vom Tool selbst verantwortete Regel
+beweist. `LOGG-2190` mit ausschließlich `/memfd:* (deleted)` bleibt eine
+sichtbare akzeptierte Ausnahme; Tailscale-, SSH-, Fail2ban-, NAT- und
+Forwarding-Regeln sowie Automationspakete werden niemals zur Score-Optimierung
+gelöscht bzw. installiert.
+
+Bei verbliebenen `PKGS-7346`-Konfigurationen darf der finale Sweep nur
+eindeutig alte rc-Kernelpakete ohne installierten Eigentümer, `/boot`-Artefakt
+oder Boot-Symlink purgen. Auf UEFI darf rc-only `grub-pc` nur bei bestätigtem
+EFI-GRUB-Stack verschwinden; `grub2-common`, EFI-GRUB- und Shim-Pakete bleiben
+installiert. Vor und nach dem Apply daher gezielt prüfen:
+
+```bash
+uname -r
+dpkg-query -W -f='${binary:Package}\t${Status}\n' \
+  'linux-*' 'grub*' 'shim*' 2>/dev/null || true
+find /boot -maxdepth 1 -type f \( -name 'vmlinuz-*' -o -name 'initrd.img-*' -o -name 'System.map-*' -o -name 'config-*' \) -printf '%f\n' | sort
+test -d /sys/firmware/efi && find /boot/efi/EFI -type f -name '*.efi' -print
+sudo apt-get check
+```
+
+Ein Purge dieser reinen Konfigurationsreste darf weder den laufenden Kernel
+noch die aktuellen `/boot`-Artefakte ändern, `update-grub` auslösen oder für
+sich allein einen Reboot verlangen. Bei nicht eindeutiger Bootart oder
+Abhängigkeit muss `PKGS-7346` sichtbar bleiben.
+
+Nur auf einer nachweislich IPv6-unbenutzten Test-VM darf zusätzlich der
+explizite Opt-in geprüft werden:
+
+```bash
+sudo ./harden.sh --dry-run --aggressive --disable-ipv6
+sudo ./harden.sh --apply --aggressive --disable-ipv6
+sysctl net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6
+sudo ./harden.sh --apply --aggressive --disable-ipv6
+```
+
+Der erste Dry-run muss die Deaktivierung nur planen. Der Apply darf keine
+GRUB-Parameter setzen und muss die persistente sysctl-Policy sowie den
+kontrollierten Rückkehrweg dokumentieren. Prüfe für `all`, `default`, `lo` und
+jede weitere vorhandene IPv6-Instanz jeweils `disable_ipv6=1`. Ein späterer
+normaler Apply darf diesen vom Tool gesetzten Zustand nicht überraschend
+aufheben, sondern muss `disabled-preserved-existing` reporten. Der Zweitlauf
+muss konvergieren.
+
+`/etc/issue` und `/etc/issue.net` müssen exakt `Authorized access only.
+Disconnect if you are not authorized.` enthalten und mode `0644` haben;
+die vorhandene SSH-Banner-Konfiguration bleibt unangetastet. Auf Ubuntu dürfen
+nur Präsentations-Hooks wie Header, Inventar, Update-/Pro-/News-Hinweise nicht
+mehr ausführbar sein. Der `98-reboot-required`-Hook bleibt ausführbar. Es
+werden weder APT-/Ubuntu-Pro-/unattended-upgrades-Pakete noch Services entfernt.
+Ein zweiter Apply darf weder Banner noch Hook-Zustände erneut verändern.
+
 ### Ubuntu-26.04.1-Retest UEFI Memory Overwrite Request (#8)
 
 Der MOR-Pfad ist bewusst rein lesend. Die TCG-Spezifikation definiert
