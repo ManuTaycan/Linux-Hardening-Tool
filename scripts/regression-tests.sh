@@ -1052,13 +1052,13 @@ elif [[ " $* " == *' purge -y '* ]]; then
 fi
 EOF
     chmod +x "$mock_bin/dpkg-query" "$mock_bin/apt-get"
-    : > "$case_root/apt.log"; : > "$case_root/state"
-    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 RESIDUAL_APT_LOG="$case_root/apt.log" RESIDUAL_STATE_FILE="$case_root/state" bash -c '
+    : > "$case_root/apt.log"; : > "$case_root/state"; install -d "$case_root/boot"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 RESIDUAL_APT_LOG="$case_root/apt.log" RESIDUAL_STATE_FILE="$case_root/state" HARDEN_BOOT_DIR="$case_root/boot" bash -c '
         source "$1/harden.sh"; trap - ERR EXIT
         MODE=apply; CHANGE_LOG="$2/changes.tsv"; : > "$CHANGE_LOG"; BACKUP_DIR="$2/backup"; mkdir -p "$BACKUP_DIR"
         log() { :; }; record_change() { :; }; record_skip() { :; }; run_streamed() { "$@"; }
         dpkg-query() { if [[ -s "$RESIDUAL_STATE_FILE" ]]; then RESIDUAL_STATE=cleared command dpkg-query "$@"; else RESIDUAL_STATE=present command dpkg-query "$@"; fi; }
-        purge_removed_packages final
+        purge_removed_packages final || { printf "purge status: %s\n" "$RESIDUAL_PURGE_STATUS" >&2; cat "$RESIDUAL_APT_LOG" >&2; exit 1; }
         grep -Fq "purge -y safe-residual" "$RESIDUAL_APT_LOG" || { cat "$RESIDUAL_APT_LOG" >&2; exit 1; }
         ! grep -Fq safe-residual < <(dpkg-query -W) || { dpkg-query -W >&2; exit 1; }
     ' _ "$repo_root" "$case_root" || fail "residual package final sweep regression failed"
@@ -1148,7 +1148,7 @@ EOF
         HARDEN_EFI_BOOT_DIR="$fixture_root/efi" HARDEN_GRUB_DIR="$fixture_root/grub" bash -c '
             source "$1/harden.sh"; trap - ERR EXIT
             MODE=apply; REBOOT_REQUIRED=0; CHANGE_LOG="$2/target.tsv"; : > "$CHANGE_LOG"; mkdir -p "$HARDEN_EFI_RUNTIME_DIR"
-            log() { :; }; record_change() { :; }; record_skip() { :; }; run_streamed() { "$@"; }
+            log() { :; }; record_change() { :; }; record_skip() { printf "SKIP %s: %s\n" "$1" "$2" >&2; }; run_streamed() { "$@"; }
             purge_removed_packages final
             ! grep -E "^(linux-image-unsigned-7.0.0-14-generic|linux-main-modules-zfs-7.0.0-14-generic|linux-modules-7.0.0-14-generic|grub-pc)[[:space:]]" "$RESIDUAL_FIXTURE_STATUS"
             [[ "$RESIDUAL_PURGE_STATUS" == OK* && "$REBOOT_REQUIRED" -eq 0 ]]
