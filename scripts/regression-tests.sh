@@ -1007,6 +1007,23 @@ EOF
             upgrade_packages_safely
             [[ "$REBOOT_REQUIRED" -eq 1 && "$PACKAGE_UPGRADE_STATUS" == "OK (upgraded; reboot required)" ]]
         ' _ "$repo_root" "$case_root" || fail "package upgrade reboot marker regression failed"
+
+    local main_section refresh_line upgrade_line prepare_line backup_line update_count
+    main_section="$(sed -n '/^main()/,$p' "$repo_root/harden.sh")"
+    refresh_line="$(awk '/^[[:space:]]*refresh_apt_metadata[[:space:]]*$/ { print NR; exit }' <<<"$main_section")"
+    upgrade_line="$(awk '/^[[:space:]]*upgrade_packages_safely[[:space:]]*$/ { print NR; exit }' <<<"$main_section")"
+    prepare_line="$(awk '/^[[:space:]]*prepare_packages[[:space:]]*$/ { print NR; exit }' <<<"$main_section")"
+    backup_line="$(awk '/^[[:space:]]*backup_config[[:space:]]*$/ { print NR; exit }' <<<"$main_section")"
+    update_count="$(awk '!/^[[:space:]]*#/ && /run_streamed[[:space:]].*apt-get update/ {count++} END {print count+0}' "$repo_root/harden.sh")"
+    [[ "$update_count" == 1 && "$backup_line" -lt "$refresh_line" && "$refresh_line" -lt "$upgrade_line" && "$upgrade_line" -lt "$prepare_line" ]] \
+        || fail "Phase 03 APT refresh/upgrade/package-install order or single-update invariant regressed"
+
+    : > "$apt_log"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 PACKAGE_UPGRADE_APT_LOG="$apt_log" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        MODE=dry-run; log() { printf "%s\n" "$*"; }; refresh_apt_metadata; upgrade_packages_safely
+        [[ ! -s "$PACKAGE_UPGRADE_APT_LOG" && "$PACKAGE_UPGRADE_STATUS" == PLANNED* ]]
+    ' _ "$repo_root" || fail "Phase 03 APT dry-run performed a package operation"
 }
 
 run_residual_purge_tests() {

@@ -639,14 +639,16 @@ install_package() {
     return 0
 }
 
-prepare_packages() {
+refresh_apt_metadata() {
     if [[ "$MODE" == "apply" ]]; then
         log INFO "Refreshing APT metadata from configured repositories"
         run_streamed env DEBIAN_FRONTEND=noninteractive apt-get update
     else
-        log INFO "Would run apt-get update before package availability checks"
+        log INFO "Would run apt-get update"
     fi
+}
 
+prepare_packages() {
     local -a common_packages=(
         auditd audispd-plugins apparmor apparmor-utils fail2ban aide aide-common rsyslog
         libpam-pwquality needrestart unattended-upgrades debsums acct nftables
@@ -738,7 +740,7 @@ upgrade_packages_safely() {
     local simulation upgrades removals reboot_marker="${HARDEN_REBOOT_REQUIRED_FILE:-/var/run/reboot-required}"
     if [[ "$MODE" == "dry-run" ]]; then
         PACKAGE_UPGRADE_STATUS="PLANNED (simulation only; no package changes)"
-        log INFO "Would validate APT and simulate a conservative apt-get upgrade without removals or downgrades"
+        log INFO "Would simulate/apply conservative apt-get upgrade without removals or downgrades"
         return 0
     fi
     if ! run_streamed apt-get check; then
@@ -6109,9 +6111,10 @@ main() {
 
     phase 03 18 "Package Security"
     log WARN "Phase 03 installs and configures security packages and may legitimately take several minutes on a fresh server; package operations are not subject to artificial timeouts"
+    refresh_apt_metadata
+    upgrade_packages_safely
     prepare_packages
     configure_apt
-    upgrade_packages_safely
     configure_updates
     configure_debsums
     purge_removed_packages
