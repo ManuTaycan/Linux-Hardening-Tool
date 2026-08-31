@@ -17,7 +17,7 @@ umask 027
 
 readonly SCRIPT_VERSION="1.1.3"
 readonly LOG_FILE="${HARDEN_LOG_FILE:-/var/log/server-hardening.log}"
-readonly SYSTEMD_HARDENING_REPORT="/root/systemd-hardening-report.txt"
+readonly SYSTEMD_HARDENING_REPORT="${HARDEN_SYSTEMD_HARDENING_REPORT:-/root/systemd-hardening-report.txt}"
 readonly MAIN_PID="$BASHPID"
 
 MODE=""
@@ -67,6 +67,8 @@ AIDE_STATUS="NOT RUN"
 FAIL2BAN_STATUS="NOT RUN"
 UPDATES_STATUS="NOT RUN"
 PACKAGE_UPGRADE_STATUS="NOT RUN"
+NEEDRESTART_STATUS="NOT RUN"
+NEEDRESTART_REPORT="${HARDEN_NEEDRESTART_REPORT:-/root/needrestart-pending-report.txt}"
 RESIDUAL_PURGE_STATUS="NOT RUN"
 FIREWALL_RULE_HYGIENE_STATUS="NOT RUN"
 REMOTE_LOG_STATUS="DISABLED"
@@ -106,6 +108,9 @@ declare -A IPV6_RUNTIME_BEFORE=()
 declare -a IPV6_RUNTIME_INTERFACE_ORDER=()
 BANNER_STATUS="NOT RUN"
 MOTD_STATUS="NOT RUN"
+SSH_SYSTEMD_SAFETY_STATUS="NOT RUN"
+SSH_SYSTEMD_EARLY_MIGRATED=0
+SSH_SYSTEMD_LEGACY_RUNTIME=0
 
 readonly COLOR_RESET=$'\033[0m'
 readonly COLOR_DIM=$'\033[2m'
@@ -737,6 +742,59 @@ EOF
     fi
 }
 
+enable_needrestart_list_only() {
+    # needrestart documents NEEDRESTART_MODE=l as the apt-hook override for
+    # list-only operation. Export it for every package action in this process
+    # so access- and network-critical services are never auto-restarted.
+    NEEDRESTART_MODE=l
+    export NEEDRESTART_MODE
+    NEEDRESTART_STATUS="PROTECTED (official list-only mode active; pending scan not yet run)"
+    log INFO "needrestart list-only protection enabled for this hardening run; automatic service restarts are deferred and reported"
+}
+
+report_needrestart_pending() {
+    local output="" status=0 pending_services="" protected_pending=""
+    if [[ "$MODE" == dry-run ]]; then
+        NEEDRESTART_STATUS="PLANNED (list-only pending-service inventory)"
+        log INFO "Would run needrestart in batch/list-only mode and report pending service restarts"
+        return 0
+    fi
+    if ! command -v needrestart >/dev/null 2>&1; then
+        NEEDRESTART_STATUS="N/A (needrestart unavailable)"
+        record_skip "needrestart" "needrestart is unavailable; no pending-service inventory could be produced"
+        return 0
+    fi
+    output="$(env NEEDRESTART_MODE=l needrestart -b -r l 2>&1)" || status=$?
+    {
+        printf 'needrestart pending-service report\n'
+        printf 'Generated: %s\n' "$(timestamp)"
+        printf 'Mode: batch/list-only (no service restarts)\n'
+        printf 'Protected services: ssh/sshd, tailscaled, systemd-networkd, NetworkManager, networking, networkd-dispatcher, nftables, firewalld, and comparable access/network services\n\n'
+        printf '%s\n' "$output"
+    } > "$NEEDRESTART_REPORT"
+    chmod 0600 "$NEEDRESTART_REPORT"
+    [[ -z "$output" ]] || emit_block <<< "$output"
+    if [[ "$status" -ne 0 ]]; then
+        NEEDRESTART_STATUS="REVIEW REQUIRED (batch/list-only scan failed; report: ${NEEDRESTART_REPORT})"
+        record_skip "needrestart" "batch/list-only pending-service scan exited ${status}; inspect ${NEEDRESTART_REPORT}"
+        return 0
+    fi
+    pending_services="$(awk -F': ' '$1 == "NEEDRESTART-SVC" && $2 != "" {print $2}' <<< "$output")"
+    protected_pending="$(grep -Ei '(^|/)(ssh|sshd|tailscaled|systemd-networkd|NetworkManager|networking|networkd-dispatcher|nftables|firewalld)(\.service)?$' <<< "$pending_services" || true)"
+    if [[ -n "$pending_services" ]]; then
+        REBOOT_REQUIRED=1
+        NEEDRESTART_STATUS="PENDING (automatic restarts deferred; controlled reboot required; report: ${NEEDRESTART_REPORT})"
+        record_change "Recorded needrestart pending services without restarting them: ${pending_services//$'\n'/, }"
+        if [[ -n "$protected_pending" ]]; then
+            log WARN "Access/network-critical service restarts are pending and were deliberately deferred: ${protected_pending//$'\n'/, }"
+        fi
+    else
+        NEEDRESTART_STATUS="OK (no pending service restarts; report: ${NEEDRESTART_REPORT})"
+        record_change "Verified with needrestart batch/list-only mode that no service restarts are pending"
+    fi
+    return 0
+}
+
 upgrade_packages_safely() {
     local simulation upgrades removals reboot_marker="${HARDEN_REBOOT_REQUIRED_FILE:-/var/run/reboot-required}"
     if [[ "$MODE" == "dry-run" ]]; then
@@ -766,7 +824,7 @@ upgrade_packages_safely() {
         log INFO "APT upgrade simulation reports no upgradeable packages"
         return 0
     fi
-    if ! run_streamed env DEBIAN_FRONTEND=noninteractive apt-get -y --no-remove \
+    if ! run_streamed env NEEDRESTART_MODE=l DEBIAN_FRONTEND=noninteractive apt-get -y --no-remove \
         -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade; then
         PACKAGE_UPGRADE_STATUS="FAILED (apt-get upgrade)"
         record_skip "PKGS-7392" "conservative apt-get upgrade failed; inspect APT/dpkg output before retrying"
@@ -2879,6 +2937,140 @@ detect_ssh_context() {
     log INFO "SSH context: service=${SSH_SERVICE:-none}, local port=${SSH_PORT}, admin=${ADMIN_USER:-none}, admin-key=${ADMIN_KEY_READY}"
 }
 
+normalize_managed_ssh_dropin() {
+    local path="$1"
+    awk '
+        {
+            sub(/\r$/, "")
+            sub(/[[:space:]]*#.*/, "")
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+            if ($0 == "") next
+            gsub(/[[:space:]]*=[[:space:]]*/, "=")
+            print
+        }
+    ' "$path"
+}
+
+rollback_early_ssh_dropin() {
+    local destination="$1" reason="$2" was_active="$3"
+    transaction_restore "$destination" ssh-systemd-early-safety
+    run_streamed systemctl daemon-reload || true
+    if [[ "$was_active" -eq 1 ]]; then
+        # Never restart SSH, including the rollback path.
+        run_streamed systemctl reload "$SSH_SERVICE" || true
+    fi
+    SSH_SYSTEMD_SAFETY_STATUS="FAILED/ROLLED BACK (${reason})"
+    log ROLLBACK "${reason}; restored the prior managed SSH drop-in without restarting SSH"
+}
+
+migrate_legacy_ssh_private_tmp_early() {
+    local systemd_dir="${HARDEN_SYSTEMD_DIR:-/etc/systemd/system}"
+    local destination="" normalized="" runtime_private_tmp="unknown"
+    local was_active=0 runtime_legacy=0 stage="" verify_dir="" verify_unit=""
+    local preverify_file="$BACKUP_DIR/systemd-verify-${SSH_SERVICE:-ssh.service}-early-pre-install.txt"
+    local postverify_file="$BACKUP_DIR/systemd-verify-${SSH_SERVICE:-ssh.service}-early-installed.txt"
+    if [[ -z "$SSH_SERVICE" || -z "$SSHD_BIN" ]]; then
+        SSH_SYSTEMD_SAFETY_STATUS="N/A (SSH service or sshd unavailable)"
+        return 0
+    fi
+    destination="${systemd_dir}/${SSH_SERVICE}.d/99-hardening.conf"
+    if [[ ! -e "$destination" ]]; then
+        SSH_SYSTEMD_SAFETY_STATUS="NOT REQUIRED (managed SSH drop-in absent)"
+        return 0
+    fi
+    if [[ -L "$destination" || ! -f "$destination" ]]; then
+        SSH_SYSTEMD_SAFETY_STATUS="REVIEW REQUIRED (managed path is not a regular non-symlink file)"
+        record_skip "BOOT-5264:${SSH_SERVICE}" "refused early SSH migration because ${destination} is not a regular non-symlink file"
+        return 1
+    fi
+    normalized="$(normalize_managed_ssh_dropin "$destination")"
+    if [[ "$normalized" == $'[Service]\nUMask=0027' ]]; then
+        SSH_SYSTEMD_SAFETY_STATUS="OK (already UMask-only; no reload required)"
+        log INFO "Managed SSH systemd drop-in is already UMask-only; early reload is not required"
+        return 0
+    fi
+    if [[ "$normalized" != $'[Service]\nPrivateTmp=yes\nUMask=0027' \
+        && "$normalized" != $'[Service]\nUMask=0027\nPrivateTmp=yes' ]]; then
+        SSH_SYSTEMD_SAFETY_STATUS="NOT REQUIRED (no recognized legacy PrivateTmp+UMask policy)"
+        return 0
+    fi
+    if [[ "$MODE" == dry-run ]]; then
+        SSH_SYSTEMD_SAFETY_STATUS="PLANNED (legacy PrivateTmp+UMask to UMask-only before package upgrade)"
+        log INFO "Would migrate the managed SSH drop-in from PrivateTmp+UMask to UMask-only before package upgrade, validate it, and reload SSH without restart"
+        return 0
+    fi
+    if systemctl is-active --quiet "$SSH_SERVICE"; then
+        was_active=1
+        runtime_private_tmp="$(systemctl show "$SSH_SERVICE" --property=PrivateTmp --value 2>/dev/null || true)"
+        case "${runtime_private_tmp,,}" in
+            no|false|0) runtime_legacy=0 ;;
+            *) runtime_legacy=1 ;;
+        esac
+    fi
+    if ! "$SSHD_BIN" -t >/dev/null 2>&1; then
+        SSH_SYSTEMD_SAFETY_STATUS="FAILED (sshd -t rejected current configuration before migration)"
+        return 1
+    fi
+    stage="$(mktemp)" || { SSH_SYSTEMD_SAFETY_STATUS="FAILED (could not stage UMask-only drop-in)"; return 1; }
+    printf '[Service]\nUMask=0027\n' > "$stage"
+    verify_dir="$(mktemp -d)" || { rm -f -- "$stage"; SSH_SYSTEMD_SAFETY_STATUS="FAILED (could not create merged-unit verification directory)"; return 1; }
+    verify_unit="${verify_dir}/${SSH_SERVICE}"
+    if ! systemctl cat "$SSH_SERVICE" > "$verify_unit" 2> "$preverify_file"; then
+        rm -f -- "$stage" "$verify_unit"
+        rmdir -- "$verify_dir" 2>/dev/null || true
+        SSH_SYSTEMD_SAFETY_STATUS="FAILED (could not read merged SSH unit)"
+        return 1
+    fi
+    printf '\n# Early managed UMask-only candidate\n' >> "$verify_unit"
+    cat "$stage" >> "$verify_unit"
+    if ! systemd_verify_unit "$verify_unit" >> "$preverify_file" 2>&1; then
+        rm -f -- "$stage" "$verify_unit"
+        rmdir -- "$verify_dir" 2>/dev/null || true
+        SSH_SYSTEMD_SAFETY_STATUS="FAILED (merged-unit validation rejected candidate)"
+        return 1
+    fi
+    chmod 0600 "$preverify_file"
+    rm -f -- "$verify_unit"
+    rmdir -- "$verify_dir" 2>/dev/null || true
+    transaction_copy "$destination" ssh-systemd-early-safety
+    if ! install_managed_file "$destination" 0644 < "$stage"; then
+        rm -f -- "$stage"
+        rollback_early_ssh_dropin "$destination" "UMask-only drop-in installation failed" "$was_active"
+        return 1
+    fi
+    rm -f -- "$stage"
+    if ! systemd_verify_unit "$SSH_SERVICE" > "$postverify_file" 2>&1; then
+        rollback_early_ssh_dropin "$destination" "installed merged SSH unit validation failed" "$was_active"
+        return 1
+    fi
+    chmod 0600 "$postverify_file"
+    if ! "$SSHD_BIN" -t >/dev/null 2>&1; then
+        rollback_early_ssh_dropin "$destination" "sshd -t rejected the migrated configuration" "$was_active"
+        return 1
+    fi
+    if ! run_streamed systemctl daemon-reload; then
+        rollback_early_ssh_dropin "$destination" "systemd daemon-reload failed after SSH migration" "$was_active"
+        return 1
+    fi
+    if [[ "$was_active" -eq 1 ]]; then
+        if ! run_streamed systemctl reload "$SSH_SERVICE" || ! systemd_service_health_check "$SSH_SERVICE"; then
+            rollback_early_ssh_dropin "$destination" "SSH reload/health validation failed after early migration" "$was_active"
+            return 1
+        fi
+    fi
+    SSH_SYSTEMD_EARLY_MIGRATED=1
+    if [[ "$was_active" -eq 1 && "$runtime_legacy" -eq 1 ]]; then
+        SSH_SYSTEMD_LEGACY_RUNTIME=1
+        REBOOT_REQUIRED=1
+        SSH_SYSTEMD_SAFETY_STATUS="MIGRATED/PENDING REBOOT (running SSH may retain legacy PrivateTmp namespace; observed PrivateTmp=${runtime_private_tmp:-unknown})"
+        log WARN "The managed SSH drop-in is now UMask-only, but the running daemon may retain its legacy PrivateTmp namespace; SSH was not restarted and controlled reboot convergence is required"
+    else
+        SSH_SYSTEMD_SAFETY_STATUS="OK (migrated early to UMask-only; SSH reloaded without restart)"
+    fi
+    record_change "Migrated the managed SSH systemd drop-in to UMask=0027 only before package upgrade; merged unit and sshd validated, SSH reload-only policy enforced"
+    return 0
+}
+
 supported_ssh_list() {
     local query="$1"
     shift
@@ -3181,31 +3373,56 @@ EOF
     fi
 }
 
+FAIL2BAN_LAST_PING=""
+FAIL2BAN_LAST_JAIL=""
+FAIL2BAN_READINESS_ATTEMPTS=0
+
+fail2ban_runtime_ready_once() {
+    local ping_status=0 jail_status=0
+    if ! command -v fail2ban-client >/dev/null 2>&1; then
+        return 1
+    fi
+    FAIL2BAN_LAST_PING="$(fail2ban-client ping 2>&1)" || ping_status=$?
+    FAIL2BAN_LAST_JAIL="$(fail2ban-client status sshd 2>&1)" || jail_status=$?
+    systemctl is-active --quiet fail2ban.service \
+        && [[ "$ping_status" -eq 0 && "$jail_status" -eq 0 ]] \
+        && grep -Eiq 'pong|server replied' <<<"$FAIL2BAN_LAST_PING" \
+        && grep -Eiq 'status for the jail:[[:space:]]*sshd|jail.*sshd' <<<"$FAIL2BAN_LAST_JAIL"
+}
+
+wait_for_fail2ban_runtime() {
+    local attempts="${1:-10}" delay="${HARDEN_FAIL2BAN_READINESS_DELAY:-1}" attempt
+    [[ "$attempts" =~ ^[1-9][0-9]*$ ]] || attempts=10
+    [[ "$delay" =~ ^[0-9]+([.][0-9]+)?$ ]] || delay=1
+    FAIL2BAN_READINESS_ATTEMPTS=0
+    for ((attempt=1; attempt<=attempts; attempt++)); do
+        FAIL2BAN_READINESS_ATTEMPTS="$attempt"
+        if fail2ban_runtime_ready_once; then
+            return 0
+        fi
+        ((attempt == attempts)) || sleep "$delay"
+    done
+    return 1
+}
+
 verify_fail2ban_runtime() {
-    local attempts="${1:-1}" attempt ping_output="" jail_output="" report=""
+    local attempts="${1:-10}" report=""
     if ! command -v fail2ban-client >/dev/null 2>&1; then
         FAIL2BAN_STATUS="NOT AVAILABLE"
         return 1
     fi
     [[ -z "$BACKUP_DIR" ]] || report="$BACKUP_DIR/fail2ban-runtime.txt"
-    for ((attempt=1; attempt<=attempts; attempt++)); do
-        ping_output="$(fail2ban-client ping 2>&1 || true)"
-        jail_output="$(fail2ban-client status sshd 2>&1 || true)"
-        if systemctl is-active --quiet fail2ban.service \
-            && grep -Eiq 'pong|server replied' <<<"$ping_output" \
-            && grep -Eiq 'status for the jail:[[:space:]]*sshd|jail.*sshd' <<<"$jail_output"; then
+    if wait_for_fail2ban_runtime "$attempts"; then
             FAIL2BAN_STATUS="OK"
             [[ -z "$report" ]] || {
-                printf 'verified=%s\nping=%s\n%s\n' "$(timestamp)" "$ping_output" "$jail_output" > "$report"
+                printf 'verified=%s\nattempts=%s\nping=%s\n%s\n' "$(timestamp)" "$FAIL2BAN_READINESS_ATTEMPTS" "$FAIL2BAN_LAST_PING" "$FAIL2BAN_LAST_JAIL" > "$report"
                 chmod 0600 "$report"
             }
             return 0
-        fi
-        ((attempt == attempts)) || sleep 1
-    done
+    fi
     FAIL2BAN_STATUS="FAILED"
     [[ -z "$report" ]] || {
-        printf 'failed=%s\nping=%s\n%s\n' "$(timestamp)" "$ping_output" "$jail_output" > "$report"
+        printf 'failed=%s\nattempts=%s\nping=%s\n%s\n' "$(timestamp)" "$FAIL2BAN_READINESS_ATTEMPTS" "$FAIL2BAN_LAST_PING" "$FAIL2BAN_LAST_JAIL" > "$report"
         chmod 0600 "$report"
     }
     return 1
@@ -3216,11 +3433,21 @@ configure_fail2ban() {
         FAIL2BAN_STATUS="NOT AVAILABLE"
         return 0
     fi
-    local banaction="nftables-multiport"
-    [[ -f /etc/fail2ban/action.d/nftables-multiport.conf ]] || banaction="nftables"
-    transaction_copy /etc/fail2ban/jail.local fail2ban-global.local
-    transaction_copy /etc/fail2ban/jail.d/99-sshd-hardening.local fail2ban-jail.local
-    install_managed_file /etc/fail2ban/jail.local 0640 <<EOF
+    local fail2ban_dir="${HARDEN_FAIL2BAN_DIR:-/etc/fail2ban}"
+    local global_config="${fail2ban_dir}/jail.local" jail_config="${fail2ban_dir}/jail.d/99-sshd-hardening.local"
+    local global_candidate="" jail_candidate="" banaction="nftables-multiport"
+    local global_changed=0 jail_changed=0 config_changed=0 was_active=0 service_mutation_ok=1
+    [[ -f "${fail2ban_dir}/action.d/nftables-multiport.conf" ]] || banaction="nftables"
+
+    if [[ "$MODE" == "dry-run" ]]; then
+        log INFO "Would compare and, only if needed, update Fail2ban jail.local and SSH jail configuration"
+        log INFO "Would validate Fail2ban configuration before controlled activation or recovery"
+        FAIL2BAN_STATUS="PLANNED"
+        return 0
+    fi
+    global_candidate="$(mktemp)" || { FAIL2BAN_STATUS="FAILED"; return 1; }
+    jail_candidate="$(mktemp)" || { rm -f -- "$global_candidate"; FAIL2BAN_STATUS="FAILED"; return 1; }
+    cat > "$global_candidate" <<EOF
 # Managed by harden.sh. Site-wide update-safe overrides; vendor jail.conf is unchanged.
 [DEFAULT]
 backend = systemd
@@ -3232,7 +3459,7 @@ bantime.increment = true
 bantime.factor = 2
 bantime.maxtime = 1w
 EOF
-    install_managed_file /etc/fail2ban/jail.d/99-sshd-hardening.local 0640 <<EOF
+    cat > "$jail_candidate" <<EOF
 # Managed by harden.sh. SSH-specific override.
 [sshd]
 enabled = true
@@ -3240,25 +3467,79 @@ port = ${SSH_PORT}
 mode = aggressive
 maxretry = 4
 EOF
-    if [[ "$MODE" == "dry-run" ]]; then
-        FAIL2BAN_STATUS="PLANNED"
+    [[ -f "$global_config" ]] && cmp -s "$global_candidate" "$global_config" || global_changed=1
+    [[ -f "$jail_config" ]] && cmp -s "$jail_candidate" "$jail_config" || jail_changed=1
+    ((global_changed || jail_changed)) && config_changed=1
+    systemctl is-active --quiet fail2ban.service && was_active=1
+
+    if [[ "$config_changed" -eq 0 && "$was_active" -eq 1 ]]; then
+        rm -f -- "$global_candidate" "$jail_candidate"
+        if verify_fail2ban_runtime 10; then
+            FAIL2BAN_STATUS="OK"
+            log OK "Fail2ban configuration is already current and healthy; no enable, reload, or restart was needed"
+            return 0
+        fi
+        log WARN "Fail2ban configuration is current but runtime health is degraded; attempting one controlled restart"
+        if run_streamed systemctl restart fail2ban.service && verify_fail2ban_runtime 10; then
+            FAIL2BAN_STATUS="OK"
+            record_change "Recovered current Fail2ban configuration with one controlled restart"
+            return 0
+        fi
+        FAIL2BAN_STATUS="FAILED"
+        record_skip "DEB-0880" "Fail2ban configuration is current but did not become ready after one controlled recovery; see ${BACKUP_DIR}/fail2ban-runtime.txt"
         return 0
     fi
-    if run_streamed fail2ban-client -t \
-        && run_streamed systemctl enable --now fail2ban.service \
-        && run_streamed systemctl restart fail2ban.service; then
-        if verify_fail2ban_runtime 10; then
-            record_change "Enabled and validated Fail2ban SSH jail using nftables"
+
+    if [[ "$config_changed" -eq 1 ]]; then
+        transaction_copy "$global_config" fail2ban-global.local
+        transaction_copy "$jail_config" fail2ban-jail.local
+        if { [[ "$global_changed" -eq 0 ]] || install_managed_file "$global_config" 0640 < "$global_candidate"; } \
+            && { [[ "$jail_changed" -eq 0 ]] || install_managed_file "$jail_config" 0640 < "$jail_candidate"; } \
+            && run_streamed fail2ban-client -t; then
+            :
         else
-            record_skip "DEB-0880" "Fail2ban started but its socket/sshd jail did not become verifiably ready; see ${BACKUP_DIR}/fail2ban-runtime.txt"
+            rm -f -- "$global_candidate" "$jail_candidate"
+            transaction_restore "$global_config" fail2ban-global.local
+            transaction_restore "$jail_config" fail2ban-jail.local
+            FAIL2BAN_STATUS="FAILED/ROLLED BACK"
+            log ROLLBACK "Fail2ban configuration write or validation failed; prior configuration restored"
+            return 0
         fi
-    else
-        transaction_restore /etc/fail2ban/jail.local fail2ban-global.local
-        transaction_restore /etc/fail2ban/jail.d/99-sshd-hardening.local fail2ban-jail.local
-        run_streamed systemctl restart fail2ban.service || true
-        FAIL2BAN_STATUS="FAILED/ROLLED BACK"
-        log ROLLBACK "Fail2ban configuration failed validation or startup"
+    elif ! run_streamed fail2ban-client -t; then
+        FAIL2BAN_STATUS="FAILED"
+        record_skip "DEB-0880" "Current Fail2ban configuration failed validation before controlled activation or recovery"
+        return 0
     fi
+    rm -f -- "$global_candidate" "$jail_candidate"
+    if [[ "$was_active" -eq 1 ]]; then
+        run_streamed systemctl restart fail2ban.service || service_mutation_ok=0
+    else
+        run_streamed systemctl enable --now fail2ban.service || service_mutation_ok=0
+    fi
+    if [[ "$service_mutation_ok" -eq 1 ]] && verify_fail2ban_runtime 10; then
+        FAIL2BAN_STATUS="OK"
+        if [[ "$config_changed" -eq 1 ]]; then
+            record_change "Updated and validated Fail2ban SSH jail using nftables"
+        else
+            record_change "Enabled and validated current Fail2ban SSH jail using nftables"
+        fi
+        return 0
+    fi
+    if [[ "$config_changed" -eq 1 ]]; then
+        transaction_restore "$global_config" fail2ban-global.local
+        transaction_restore "$jail_config" fail2ban-jail.local
+        if [[ "$was_active" -eq 1 ]]; then
+            run_streamed systemctl restart fail2ban.service || true
+        else
+            run_streamed systemctl stop fail2ban.service || true
+        fi
+        FAIL2BAN_STATUS="FAILED/ROLLED BACK"
+        log ROLLBACK "Fail2ban did not become ready; prior configuration and activation state were restored"
+    else
+        FAIL2BAN_STATUS="FAILED"
+        record_skip "DEB-0880" "Fail2ban was enabled but its socket/sshd jail did not become verifiably ready; see ${BACKUP_DIR}/fail2ban-runtime.txt"
+    fi
+    return 0
 }
 
 failed_login_lastb_available() {
@@ -4463,6 +4744,76 @@ classify_systemd_exposure() {
     fi
 }
 
+systemd_service_classification() {
+    local service="$1"
+    case "$service" in
+        fail2ban.service)
+            printf '%s\n' "candidate: jail and firewall daemon; retained only with fail2ban ping and sshd-jail health. Residual exposure around 5.0 is accepted for root, firewall/netlink and configurable enforcement actions; no cosmetic score-only sandboxing is added"
+            ;;
+        unattended-upgrades.service)
+            printf '%s\n' "candidate: APT/dpkg maintainer scripts need host package write access; strict filesystem or syscall filters are intentionally excluded"
+            ;;
+        rsyslog.service|acct.service|acct-monthly-report.service|uuidd.service)
+            printf '%s\n' "candidate: service-specific sandbox with merged-unit validation and health check"
+            ;;
+        networkd-dispatcher.service)
+            printf '%s\n' "candidate: network-event helper; no extra mount, device, capability, or address-family restriction is assumed safe for operator hooks"
+            ;;
+        "$SSH_SERVICE")
+            printf '%s\n' "safety exception: SSH uses UMask only; PrivateTmp is removed because a daemon reload can leave older sessions in a stale private /tmp mount namespace"
+            ;;
+        tailscaled.service|dbus.service|dbus-broker.service|cron.service|crond.service|auditd.service|open-vm-tools.service|snapd.service|systemd-*|polkit.service|cloud-init*)
+            printf '%s\n' "excluded: host-critical IPC, audit, overlay, guest, scheduler, or network responsibility"
+            ;;
+        *) printf '%s\n' "observed: no generic sandbox is applied without a service-specific compatibility case" ;;
+    esac
+}
+
+systemd_service_activity() {
+    local service="$1"
+    if systemctl is-active --quiet "$service"; then
+        printf '%s\n' active
+    else
+        printf '%s\n' inactive
+    fi
+}
+
+write_systemd_hardening_report() {
+    local service="$1" activity="$2" before="$3" after="$4" controls="$5" classification="$6" validation="$7" health="$8" result="$9"
+    local delta="N/A"
+    if [[ "$before" =~ ^[0-9]+([.][0-9]+)?$ && "$after" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        delta="$(awk -v before="$before" -v after="$after" 'BEGIN { printf "%.1f", after - before }')"
+    fi
+    {
+        printf '[%s]\n' "$service"
+        printf 'active=%s\n' "$activity"
+        printf 'before-score=%s\n' "${before:-N/A}"
+        printf 'after-score=%s\n' "${after:-N/A}"
+        printf 'delta=%s\n' "$delta"
+        printf 'controls=%s\n' "${controls:-none}"
+        printf 'classification=%s\n' "$classification"
+        printf 'validation=%s\n' "$validation"
+        printf 'health=%s\n' "$health"
+        printf 'result=%s\n\n' "$result"
+    } >> "$SYSTEMD_HARDENING_REPORT"
+}
+
+systemd_service_health_check() {
+    local service="$1"
+    if ! systemctl is-active --quiet "$service"; then
+        return 1
+    fi
+    case "$service" in
+        fail2ban.service)
+            wait_for_fail2ban_runtime "${HARDEN_FAIL2BAN_SERVICE_READINESS_ATTEMPTS:-10}" || return 1
+            ;;
+    esac
+    if [[ -n "$SSH_SERVICE" && "$service" == "$SSH_SERVICE" ]]; then
+        [[ -n "$SSHD_BIN" ]] && "$SSHD_BIN" -t >/dev/null 2>&1 || return 1
+    fi
+    return 0
+}
+
 systemd_verify_unit() {
     local unit_or_file="$1" analyze_help=""
     analyze_help="$(systemd-analyze --help 2>&1 || true)"
@@ -4480,8 +4831,14 @@ rollback_service_dropin() {
     transaction_restore "$destination" "$transaction_label"
     run_streamed systemctl daemon-reload || true
     if [[ "$was_active" -eq 1 ]]; then
-        run_streamed systemctl "$health_action" "$service" \
-            || run_streamed systemctl restart "$service" || true
+        if [[ "$health_action" == reload ]]; then
+            # SSH must never be restarted as a rollback fallback: preserve
+            # established remote sessions and let the restored unit reload.
+            run_streamed systemctl reload "$service" || true
+        else
+            run_streamed systemctl "$health_action" "$service" \
+                || run_streamed systemctl restart "$service" || true
+        fi
     else
         systemctl stop "$service" >/dev/null 2>&1 || true
     fi
@@ -4491,8 +4848,8 @@ rollback_service_dropin() {
 }
 
 install_service_dropin() {
-    local service="$1" name="$2"
-    local destination="/etc/systemd/system/${service}.d/${name}.conf"
+    local service="$1" name="$2" controls="${3:-service-specific controls}"
+    local destination="${HARDEN_SYSTEMD_DIR:-/etc/systemd/system}/${service}.d/${name}.conf"
     if ! unit_file_exists "$service"; then
         cat >/dev/null
         return 0
@@ -4508,6 +4865,7 @@ install_service_dropin() {
     local preverify_file="$BACKUP_DIR/systemd-verify-${service//[^A-Za-z0-9_.-]/_}-pre-install.txt"
     local postverify_file="$BACKUP_DIR/systemd-verify-${service//[^A-Za-z0-9_.-]/_}-installed.txt"
     local before="" after="" was_active=0 health_action="restart" exposure_line="" exposure_outcome=""
+    local classification="" activity="" validation="not run" health="not run" score_gate=1 safety_reason=""
     local dropin_was_current=0
     local dropin_stage="" verify_dir="" verify_unit=""
     if ! dropin_stage="$(mktemp)"; then
@@ -4521,6 +4879,17 @@ install_service_dropin() {
     fi
     if [[ -f "$destination" ]] && cmp -s "$dropin_stage" "$destination"; then
         dropin_was_current=1
+    fi
+    classification="$(systemd_service_classification "$service")"
+    activity="$(systemd_service_activity "$service")"
+    measure_service_exposure "$service" before "$before_file"
+    before="$SYSTEMD_EXPOSURE_RESULT"
+    [[ -z "$before" ]] || SERVICE_EXPOSURE_BEFORE["$service"]="$before"
+    [[ "$activity" == active ]] && was_active=1
+    if [[ -n "$SSH_SERVICE" && "$service" == "$SSH_SERVICE" ]]; then
+        health_action="reload"
+        score_gate=0
+        safety_reason="SSH safety migration: PrivateTmp removed after stale private /tmp namespace diagnosis; UMask=0027 is retained independently of systemd-analyze exposure score"
     fi
     if ! verify_dir="$(mktemp -d)"; then
         rm -f -- "$dropin_stage"
@@ -4542,16 +4911,37 @@ install_service_dropin() {
         rm -f -- "$dropin_stage" "$verify_unit"
         rmdir -- "$verify_dir" 2>/dev/null || true
         log WARN "Pre-install systemd verification rejected the candidate drop-in for ${service}; see ${preverify_file}"
+        write_systemd_hardening_report "$service" "$activity" "$before" "" "$controls" "$classification" "candidate rejected before installation" "not run" "retained/no change"
         return 0
     fi
+    validation="candidate merged unit verified"
     chmod 0600 "$preverify_file"
     rm -f -- "$verify_unit"
     rmdir -- "$verify_dir" 2>/dev/null || true
-    measure_service_exposure "$service" before "$before_file"
-    before="$SYSTEMD_EXPOSURE_RESULT"
-    [[ -z "$before" ]] || SERVICE_EXPOSURE_BEFORE["$service"]="$before"
-    systemctl is-active --quiet "$service" && was_active=1
-    [[ -n "$SSH_SERVICE" && "$service" == "$SSH_SERVICE" ]] && health_action="reload"
+    if [[ "$dropin_was_current" -eq 1 ]]; then
+        if [[ "$was_active" -eq 1 ]] && ! systemd_service_health_check "$service"; then
+            write_systemd_hardening_report "$service" "$activity" "$before" "$before" "$controls" "$classification" "$validation" "failed (existing unit was not restarted)" "retained for operator review"
+            log WARN "Existing ${service} drop-in was left untouched because its health check failed; no restart was attempted"
+            rm -f -- "$dropin_stage"
+            return 0
+        fi
+        if [[ "$service" == fail2ban.service ]]; then
+            health="healthy/no restart required (Fail2ban ready after ${FAIL2BAN_READINESS_ATTEMPTS} check(s))"
+        else
+            health="healthy/no restart required"
+        fi
+        measure_service_exposure "$service" after "$after_file"
+        after="$SYSTEMD_EXPOSURE_RESULT"
+        [[ -z "$after" ]] || SERVICE_EXPOSURE_AFTER["$service"]="$after"
+        if [[ -n "$before" && -n "$after" ]]; then
+            printf -v exposure_line '%-32s %s -> %s' "$service" "$before" "$after"
+            SERVICE_EXPOSURE_SUMMARY+=("$exposure_line")
+        fi
+        write_systemd_hardening_report "$service" "$activity" "$before" "$after" "$controls" "$classification" "$validation" "$health" "already hardened/unchanged"
+        log OK "${service} drop-in is already valid and healthy; no write, daemon-reload, or restart was needed (${before:-N/A} -> ${after:-N/A})"
+        rm -f -- "$dropin_stage"
+        return 0
+    fi
     transaction_copy "$destination" "$transaction_label"
     if ! install_managed_file "$destination" 0644 < "$dropin_stage"; then
         rm -f -- "$dropin_stage"
@@ -4561,47 +4951,69 @@ install_service_dropin() {
     rm -f -- "$dropin_stage"
     if ! systemd_verify_unit "$service" > "$postverify_file" 2>&1; then
         rollback_service_dropin "$service" "$destination" "$transaction_label" "$was_active" "$health_action" "systemd-analyze verify rejected the drop-in"
+        write_systemd_hardening_report "$service" "$activity" "$before" "" "$controls" "$classification" "installed unit rejected" "not run" "rolled back"
         return 0
     fi
+    validation="installed merged unit verified"
     chmod 0600 "$postverify_file"
     if ! run_streamed systemctl daemon-reload; then
         rollback_service_dropin "$service" "$destination" "$transaction_label" "$was_active" "$health_action" "systemd daemon-reload failed"
+        write_systemd_hardening_report "$service" "$activity" "$before" "" "$controls" "$classification" "$validation; daemon-reload failed" "not run" "rolled back"
         return 0
     fi
+    if [[ -n "$SSH_SERVICE" && "$service" == "$SSH_SERVICE" ]] && ! "$SSHD_BIN" -t >/dev/null 2>&1; then
+        rollback_service_dropin "$service" "$destination" "$transaction_label" "$was_active" "$health_action" "sshd -t rejected the SSH safety migration"
+        write_systemd_hardening_report "$service" "$activity" "$before" "" "$controls" "$classification" "$validation; sshd -t failed" "not run" "rolled back"
+        return 0
+    fi
+    [[ -n "$SSH_SERVICE" && "$service" == "$SSH_SERVICE" ]] && validation="${validation}; sshd -t passed"
     if [[ "$was_active" -eq 1 ]]; then
-        if ! run_streamed systemctl "$health_action" "$service" || ! systemctl is-active --quiet "$service"; then
+        if ! run_streamed systemctl "$health_action" "$service" || ! systemd_service_health_check "$service"; then
             rollback_service_dropin "$service" "$destination" "$transaction_label" "$was_active" "$health_action" "active-service health check failed"
+            write_systemd_hardening_report "$service" "$activity" "$before" "" "$controls" "$classification" "$validation" "failed" "rolled back"
             return 0
         fi
+        if [[ "$service" == fail2ban.service ]]; then
+            health="healthy (Fail2ban ready after ${FAIL2BAN_READINESS_ATTEMPTS} check(s))"
+        else
+            health="healthy"
+        fi
     elif [[ "$service" == "uuidd.service" ]]; then
-        if ! run_streamed systemctl start "$service" || systemctl is-failed --quiet "$service"; then
+        if ! run_streamed systemctl start "$service" || systemctl is-failed --quiet "$service" || ! systemd_service_health_check "$service"; then
             rollback_service_dropin "$service" "$destination" "$transaction_label" "$was_active" "$health_action" "safe inactive-service health check failed"
+            write_systemd_hardening_report "$service" "$activity" "$before" "" "$controls" "$classification" "$validation" "failed" "rolled back"
             return 0
         fi
         run_streamed systemctl stop "$service" || true
+        health="healthy (safe transient start/stop)"
     elif systemctl is-failed --quiet "$service"; then
         rollback_service_dropin "$service" "$destination" "$transaction_label" "$was_active" "$health_action" "inactive service is in failed state"
+        write_systemd_hardening_report "$service" "$activity" "$before" "" "$controls" "$classification" "$validation" "failed" "rolled back"
         return 0
+    else
+        health="not active/not failed"
     fi
     measure_service_exposure "$service" after "$after_file"
     after="$SYSTEMD_EXPOSURE_RESULT"
     [[ -z "$after" ]] || SERVICE_EXPOSURE_AFTER["$service"]="$after"
-    SERVICES_HARDENED+=("$service")
+    exposure_outcome="$(classify_systemd_exposure "$before" "$after" 0)"
     if [[ -n "$before" && -n "$after" ]]; then
         printf -v exposure_line '%-32s %s -> %s' "$service" "$before" "$after"
-        SERVICE_EXPOSURE_SUMMARY+=("$exposure_line")
-        printf '%-36s %s -> %s\n' "$service" "$before" "$after" >> "$SYSTEMD_HARDENING_REPORT"
-        exposure_outcome="$(classify_systemd_exposure "$before" "$after" "$dropin_was_current")"
-        if [[ "$exposure_outcome" == decreased ]]; then
-            record_change "Installed and health-tested systemd hardening for ${service}; exposure ${before} -> ${after}"
-        elif [[ "$exposure_outcome" == unchanged ]]; then
-            log OK "${service} drop-in is already active and passed health checks; exposure unchanged/already hardened (${before} -> ${after})"
-        else
-            log WARN "${service} passed health checks but exposure did not decrease (${before} -> ${after})"
-        fi
+    fi
+    if [[ "$score_gate" -eq 1 && "$exposure_outcome" != decreased ]]; then
+        rollback_service_dropin "$service" "$destination" "$transaction_label" "$was_active" "$health_action" "exposure did not measurably decrease"
+        write_systemd_hardening_report "$service" "$activity" "$before" "$after" "$controls" "$classification" "$validation" "$health" "rolled back: score did not decrease"
+        log WARN "${service} passed health checks but the candidate was rolled back because exposure did not decrease (${before:-N/A} -> ${after:-N/A})"
+        return 0
+    fi
+    SERVICES_HARDENED+=("$service")
+    [[ -n "$exposure_line" ]] && SERVICE_EXPOSURE_SUMMARY+=("$exposure_line")
+    if [[ "$score_gate" -eq 0 ]]; then
+        write_systemd_hardening_report "$service" "$activity" "$before" "$after" "$controls" "$classification" "$validation" "$health" "kept: ${safety_reason}"
+        record_change "Migrated SSH systemd hardening to UMask=0027 only after merged-unit validation, sshd -t, reload, and active health check; PrivateTmp was removed for session safety"
     else
-        printf '%-36s exposure unavailable (before=%s, after=%s)\n' "$service" "${before:-N/A}" "${after:-N/A}" >> "$SYSTEMD_HARDENING_REPORT"
-        record_change "Installed and health-tested systemd hardening for ${service}; exposure score unavailable"
+        write_systemd_hardening_report "$service" "$activity" "$before" "$after" "$controls" "$classification" "$validation" "$health" "kept: measured exposure decrease"
+        record_change "Installed and health-tested systemd hardening for ${service}; exposure ${before} -> ${after}"
     fi
     return 0
 }
@@ -4611,7 +5023,7 @@ analyze_active_services() {
         log INFO "Would run systemd-analyze security SERVICE for every active service and retain the complete report"
         return 0
     fi
-    local report="$BACKUP_DIR/systemd-security-active-services.txt" active_units service rest
+    local report="$BACKUP_DIR/systemd-security-active-services.txt" active_units service rest score_file classification activity
     active_units="$(systemctl list-units --type=service --state=active --no-legend --plain 2>/dev/null || true)"
     : > "$report"
     chmod 0600 "$report"
@@ -4619,6 +5031,11 @@ analyze_active_services() {
         [[ "$service" == *.service ]] || continue
         printf '\n===== %s =====\n' "$service" >> "$report"
         systemd-analyze security --no-pager "$service" >> "$report" 2>&1 || true
+        score_file="$BACKUP_DIR/systemd-security-${service//[^A-Za-z0-9_.-]/_}-inventory.txt"
+        measure_service_exposure "$service" inventory "$score_file"
+        classification="$(systemd_service_classification "$service")"
+        activity="$(systemd_service_activity "$service")"
+        write_systemd_hardening_report "$service" "$activity" "$SYSTEMD_EXPOSURE_RESULT" "" "none" "$classification" "systemd-analyze inventory captured" "$activity" "observed before service-specific review"
     done <<<"$active_units"
     record_change "Ran systemd-analyze security individually for every active service; report: ${report}"
     return 0
@@ -4629,12 +5046,15 @@ harden_systemd_services() {
         {
             printf 'systemd hardening exposure report\n'
             printf 'Generated: %s\n\n' "$(timestamp)"
+            printf 'SSH early safety status: %s\n' "$SSH_SYSTEMD_SAFETY_STATUS"
+            printf 'needrestart protection: %s\n\n' "$NEEDRESTART_STATUS"
         } > "$SYSTEMD_HARDENING_REPORT"
         chmod 0600 "$SYSTEMD_HARDENING_REPORT"
     else
         log INFO "Would write measured systemd exposure changes to ${SYSTEMD_HARDENING_REPORT}"
     fi
-    install_service_dropin rsyslog.service 99-hardening <<'EOF'
+    analyze_active_services
+    install_service_dropin rsyslog.service 99-hardening "log-spool paths, namespace and kernel-view isolation" <<'EOF'
 [Service]
 NoNewPrivileges=yes
 PrivateTmp=yes
@@ -4658,7 +5078,7 @@ SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 UMask=0027
 EOF
-    install_service_dropin fail2ban.service 99-hardening <<'EOF'
+    install_service_dropin fail2ban.service 99-hardening "log/jail paths, private devices, kernel-view isolation, native syscall ABI" <<'EOF'
 [Service]
 NoNewPrivileges=yes
 PrivateTmp=yes
@@ -4684,13 +5104,12 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 UMask=0027
 EOF
     if [[ -n "$SSH_SERVICE" ]]; then
-        install_service_dropin "$SSH_SERVICE" 99-hardening <<'EOF'
+        install_service_dropin "$SSH_SERVICE" 99-hardening "SSH safety migration: UMask=0027 only; PrivateTmp deliberately removed" <<'EOF'
 [Service]
-PrivateTmp=yes
 UMask=0027
 EOF
     fi
-    install_service_dropin unattended-upgrades.service 99-hardening <<'EOF'
+    install_service_dropin unattended-upgrades.service 99-hardening "non-disruptive privilege, temporary-file, home and kernel-log isolation" <<'EOF'
 [Service]
 NoNewPrivileges=yes
 PrivateTmp=yes
@@ -4703,7 +5122,7 @@ RestrictRealtime=yes
 LockPersonality=yes
 UMask=0027
 EOF
-    install_service_dropin acct.service 99-hardening <<'EOF'
+    install_service_dropin acct.service 99-hardening "accounting-log write path, CAP_SYS_PACCT, namespace and kernel-view isolation" <<'EOF'
 [Service]
 NoNewPrivileges=yes
 PrivateTmp=yes
@@ -4727,7 +5146,7 @@ AmbientCapabilities=
 RestrictAddressFamilies=AF_UNIX
 UMask=0027
 EOF
-    install_service_dropin acct-monthly-report.service 99-hardening <<'EOF'
+    install_service_dropin acct-monthly-report.service 99-hardening "accounting report paths, private devices, namespaces and kernel-view isolation" <<'EOF'
 [Service]
 NoNewPrivileges=yes
 PrivateTmp=yes
@@ -4754,7 +5173,7 @@ AmbientCapabilities=
 RestrictAddressFamilies=AF_UNIX
 UMask=0027
 EOF
-    install_service_dropin uuidd.service 99-hardening <<'EOF'
+    install_service_dropin uuidd.service 99-hardening "uuidd runtime socket, private devices, namespaces and kernel-view isolation" <<'EOF'
 [Service]
 NoNewPrivileges=yes
 PrivateTmp=yes
@@ -4781,7 +5200,7 @@ AmbientCapabilities=
 RestrictAddressFamilies=AF_UNIX
 UMask=0027
 EOF
-    install_service_dropin networkd-dispatcher.service 99-hardening <<'EOF'
+    install_service_dropin networkd-dispatcher.service 99-hardening "existing narrow temporary-file, filesystem and kernel-view isolation only" <<'EOF'
 [Service]
 NoNewPrivileges=yes
 PrivateTmp=yes
@@ -4801,9 +5220,8 @@ SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 UMask=0027
 EOF
-    analyze_active_services
     record_skip "BOOT-5264:cron.service" "cron executes arbitrary administrator jobs, so a global sandbox would break its purpose"
-    record_skip "BOOT-5264:ssh.service" "only PrivateTmp/UMask are applied; stronger unit restrictions would propagate into sudo administrator sessions"
+    record_skip "BOOT-5264:ssh.service" "SSH is managed with UMask=0027 only; PrivateTmp is deliberately removed because reloads can leave existing sessions with a stale private /tmp namespace"
     record_skip "BOOT-5264:excluded-services" "dbus, cron, auditd, tailscaled, open-vm-tools, systemd-*, polkit, snapd, and cloud-init are not blindly sandboxed because their IPC, namespace, audit, overlay, or guest duties are host-critical"
     if [[ "$MODE" == "apply" ]]; then
         record_change "Wrote measured systemd hardening results to ${SYSTEMD_HARDENING_REPORT}"
@@ -6221,6 +6639,8 @@ Fail2ban           : ${FAIL2BAN_STATUS}
 Remote Logging     : ${REMOTE_LOG_STATUS}
 Automatic Updates  : ${UPDATES_STATUS}
 Package upgrade    : ${PACKAGE_UPGRADE_STATUS}
+needrestart        : ${NEEDRESTART_STATUS}
+needrestart report : $([[ "$MODE" == "apply" ]] && printf '%s' "$NEEDRESTART_REPORT" || printf 'not written in dry-run')
 Residual configs   : ${RESIDUAL_PURGE_STATUS}
 rp_filter Policy   : ${RP_FILTER_POLICY}
 rp_filter Runtime  : ${RP_FILTER_RUNTIME_STATUS}
@@ -6249,6 +6669,7 @@ Services hardened  : ${SERVICES_HARDENED[*]:-none}
 Service exposure   :
 ${service_exposure_lines}
 Exposure report    : $([[ "$MODE" == "apply" ]] && printf '%s' "$SYSTEMD_HARDENING_REPORT" || printf 'planned')
+SSH systemd safety : ${SSH_SYSTEMD_SAFETY_STATUS}
 Failed services    : ${failed}
 Rollbacks          : ${ROLLBACKS[*]:-none}
 Reboot required    : ${reboot}
@@ -6296,6 +6717,10 @@ main() {
 
     phase 03 18 "Package Security"
     log WARN "Phase 03 installs and configures security packages and may legitimately take several minutes on a fresh server; package operations are not subject to artificial timeouts"
+    detect_ssh_context
+    enable_needrestart_list_only
+    migrate_legacy_ssh_private_tmp_early \
+        || die "Early SSH PrivateTmp safety migration failed; refusing to begin package upgrades"
     refresh_apt_metadata
     upgrade_packages_safely
     prepare_packages
@@ -6303,7 +6728,7 @@ main() {
     configure_updates
     configure_debsums
     purge_removed_packages
-    detect_ssh_context
+    report_needrestart_pending
 
     phase 04 18 "Logging"
     configure_banners
@@ -6349,6 +6774,7 @@ main() {
     harden_systemd_services
     verify_disabled_services
     purge_removed_packages "final post-package-change"
+    report_needrestart_pending
 
     phase 12 18 "AppArmor"
     configure_apparmor

@@ -73,6 +73,59 @@ nächsten Boot mit noch schreibbarem Control bei 0 bleiben und die Unit darf
 nicht erfolgreich erscheinen. Sichere dann Diagnosebericht und Journal, ohne
 Tailscale-Prefs automatisch zu verändern.
 
+### Ubuntu-26.04.1-Retest systemd-Service-Exposure (#11)
+
+Führe den Apply aus einer bestätigten zweiten SSH-/Recovery-Sitzung direkt ohne
+externe `tee`-Pipe aus. Der Report muss für jeden aktiven Dienst Activity,
+Before-/After-Score, Delta, Controls, Klassifikation, Unit-Validierung und
+Health-Resultat enthalten. Ein neuer Drop-in bleibt nur bei messbar kleinerem
+Exposure bestehen; ein Verify- oder Health-Fehler muss den vorherigen Drop-in
+vollständig wiederherstellen.
+
+Die Phase-03-Reihenfolge muss im Log `Backup -> SSH-Kontext -> needrestart
+list-only -> frühe SSH-Migration -> apt-get update -> kontrolliertes Upgrade`
+zeigen. Der Batch-Report `/root/needrestart-pending-report.txt` muss alle
+ausstehenden Service-Restarts nennen; während des Laufs dürfen insbesondere
+SSH, Tailscale und Netzwerk-/Firewall-Dienste nicht automatisch neu gestartet
+werden.
+
+```bash
+sudo ./harden.sh --apply --aggressive
+sudo cat /root/systemd-hardening-report.txt
+systemctl is-active fail2ban.service ssh.service tailscaled.service
+sudo fail2ban-client ping
+sudo fail2ban-client status sshd
+sudo systemd-analyze security fail2ban.service unattended-upgrades.service networkd-dispatcher.service
+systemctl --failed --no-pager
+sudo ./harden.sh --apply --aggressive
+```
+
+Der zweite Lauf darf bei gültigen Drop-ins weder `systemctl daemon-reload` noch
+einen Service-Restart auslösen; die Scores bleiben stabil. SSH wird mit
+`UMask=0027` allein behandelt: `PrivateTmp` ist wegen der beschriebenen
+Sitzungs-Sicherheitsausnahme ausdrücklich entfernt. Tailscale, dbus, cron, auditd,
+open-vm-tools, snapd, systemd-Units, polkit, cloud-init sowie weitere
+Netzwerk-/Storage-kritische Dienste bleiben ohne generisches Sandbox-Profil.
+
+Prüfe die SSH-Safety-Migration aus einer bestätigten zweiten SSH- oder
+Recovery-Sitzung. Ein `ssh.service`-Restart kann ältere Sessions mit einem
+verwaisten PrivateTmp-Mount-Namespace zurücklassen, daher ist ausschließlich ein
+Reload zulässig:
+
+```bash
+sudo systemctl cat ssh.service
+sudo sshd -t
+sudo systemctl is-active ssh.service
+findmnt -T /tmp
+mktemp
+sudo grep -A9 '^\[ssh\.service\]' /root/systemd-hardening-report.txt
+sudo cat /root/needrestart-pending-report.txt
+sudo grep -E 'SSH systemd safety|needrestart|Reboot required' /var/log/server-hardening.log
+```
+
+Bei Validierungs- oder Health-Fehlern muss der vorherige Drop-in wiederhergestellt
+werden; das Script darf dabei niemals `systemctl restart ssh.service` verwenden.
+
 ### Ubuntu-26.04.1-Retest der rp_filter-Routingpolicy (#7)
 
 Führe den Apply direkt aus (ohne externes `tee`) und prüfe den vom Script

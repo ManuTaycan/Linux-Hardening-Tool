@@ -870,6 +870,129 @@ EOF
         ' _ "$repo_root" "$case_root/backup" || fail "Fail2ban readiness/runtime verification failed"
 }
 
+run_fail2ban_configuration_tests() {
+    local case_root="$test_root/fail2ban-configuration"
+    install -d "$case_root"
+    env HARDEN_SOURCE_ONLY=1 HARDEN_FAIL2BAN_DIR="$case_root/etc/fail2ban" \
+        HARDEN_FAIL2BAN_READINESS_DELAY=0 bash -c '
+            source "$1/harden.sh"
+            trap - ERR EXIT
+            test_dir="$2"; MODE=apply; SSH_SERVICE=ssh.service; SSH_PORT=22
+            FAIL2BAN_TEST_READY_AFTER=1; FAIL2BAN_TEST_VALIDATE=ok
+            install -d "$HARDEN_FAIL2BAN_DIR/jail.d"
+            : > "$test_dir/commands"; printf active > "$test_dir/state"; : > "$test_dir/readiness"
+            systemctl() {
+                printf "%s " "$@" >> "$test_dir/commands"; printf "\n" >> "$test_dir/commands"
+                case "${1:-}" in
+                    is-active) [[ "${2:-}" == --quiet && "${3:-}" == fail2ban.service && "$(cat "$test_dir/state")" == active ]] ;;
+                    restart)
+                        [[ "${2:-}" == fail2ban.service ]] || return 1
+                        if [[ "$FAIL2BAN_TEST_RESTART_FAIL_ONCE" == 1 && ! -e "$test_dir/restart-failed" ]]; then
+                            : > "$test_dir/restart-failed"; return 1
+                        fi
+                        printf active > "$test_dir/state"
+                        ;;
+                    enable) [[ "${2:-}" == --now && "${3:-}" == fail2ban.service ]] && printf active > "$test_dir/state" ;;
+                    stop) [[ "${2:-}" == fail2ban.service ]] && printf inactive > "$test_dir/state" ;;
+                    *) return 0 ;;
+                esac
+            }
+            fail2ban-client() {
+                case "${1:-}" in
+                    -t) [[ "$FAIL2BAN_TEST_VALIDATE" == ok ]] ;;
+                    ping)
+                        count="$(cat "$test_dir/readiness")"; count=$((count + 1)); printf "%s" "$count" > "$test_dir/readiness"
+                        [[ "$count" -ge "$FAIL2BAN_TEST_READY_AFTER" ]] && { printf "Server replied: pong\n"; return 0; }
+                        return 1
+                        ;;
+                    status)
+                        [[ "$(cat "$test_dir/readiness")" -ge "$FAIL2BAN_TEST_READY_AFTER" ]] && { printf "Status for the jail: sshd\n"; return 0; }
+                        return 1
+                        ;;
+                    *) return 1 ;;
+                esac
+            }
+            install_managed_file() {
+                local destination="$1" mode="$2" temporary
+                MANAGED_FILE_CHANGED=0; temporary="$(mktemp)" || return 1
+                cat > "$temporary" || { rm -f -- "$temporary"; return 1; }
+                install -d "$(dirname -- "$destination")" || { rm -f -- "$temporary"; return 1; }
+                if [[ -f "$destination" ]] && cmp -s "$temporary" "$destination"; then rm -f -- "$temporary"; return 0; fi
+                install -m "$mode" "$temporary" "$destination" && MANAGED_FILE_CHANGED=1
+                rm -f -- "$temporary"
+            }
+            transaction_copy() {
+                local source="$1" label="$2" target=""
+                target="$BACKUP_DIR/transactions/$label"
+                mkdir -p "$(dirname -- "$target")"
+                if [[ -e "$source" ]]; then cp -- "$source" "$target"; else : > "${target}.absent"; fi
+            }
+            transaction_restore() {
+                local destination="$1" label="$2" saved=""
+                saved="$BACKUP_DIR/transactions/$label"
+                if [[ -e "${saved}.absent" ]]; then rm -f -- "$destination"; elif [[ -e "$saved" ]]; then cp -- "$saved" "$destination"; fi
+            }
+            reset_case() {
+                local label="$1"
+                BACKUP_DIR="$test_dir/$label-backup"; CHANGE_LOG="$test_dir/$label-changes"; mkdir -p "$BACKUP_DIR"; : > "$CHANGE_LOG"
+                printf active > "$test_dir/state"; : > "$test_dir/commands"; : > "$test_dir/readiness"; rm -f -- "$test_dir/restart-failed"
+                FAIL2BAN_TEST_READY_AFTER=1; FAIL2BAN_TEST_VALIDATE=ok; FAIL2BAN_TEST_RESTART_FAIL_ONCE=0; FAIL2BAN_STATUS=""
+            }
+            make_current() {
+                reset_case prepare
+                configure_fail2ban
+                [[ "$FAIL2BAN_STATUS" == OK ]]
+            }
+            command_count() { grep -Ec "^$1 " "$test_dir/commands" || true; }
+
+            make_current
+            reset_case converged
+            configure_fail2ban
+            [[ "$FAIL2BAN_STATUS" == OK ]]
+            [[ "$(command_count restart)" == 0 && "$(command_count enable)" == 0 ]]
+
+            printf "# changed\n" > "$HARDEN_FAIL2BAN_DIR/jail.local"
+            reset_case changed
+            FAIL2BAN_TEST_READY_AFTER=2
+            configure_fail2ban
+            [[ "$FAIL2BAN_STATUS" == OK && "$FAIL2BAN_READINESS_ATTEMPTS" == 2 ]]
+            [[ "$(command_count restart)" == 1 && "$(command_count enable)" == 0 ]]
+
+            make_current
+            reset_case inactive
+            printf inactive > "$test_dir/state"
+            configure_fail2ban
+            [[ "$FAIL2BAN_STATUS" == OK ]]
+            [[ "$(command_count enable)" == 1 && "$(command_count restart)" == 0 ]]
+
+            make_current
+            reset_case unhealthy
+            FAIL2BAN_TEST_READY_AFTER=99
+            configure_fail2ban
+            [[ "$FAIL2BAN_STATUS" == FAILED ]]
+            [[ "$(command_count restart)" == 1 && "$(command_count enable)" == 0 ]]
+
+            make_current
+            printf "# pre-existing local configuration\n" > "$HARDEN_FAIL2BAN_DIR/jail.local"
+            cp "$HARDEN_FAIL2BAN_DIR/jail.local" "$test_dir/pre-failure-jail.local"
+            reset_case rollback
+            FAIL2BAN_TEST_VALIDATE=failed
+            configure_fail2ban
+            [[ "$FAIL2BAN_STATUS" == FAILED/ROLLED\ BACK ]]
+            cmp -s "$test_dir/pre-failure-jail.local" "$HARDEN_FAIL2BAN_DIR/jail.local"
+            [[ "$(command_count restart)" == 0 && "$(command_count enable)" == 0 ]]
+
+            make_current
+            printf "# pre-existing restart rollback configuration\n" > "$HARDEN_FAIL2BAN_DIR/jail.local"
+            cp "$HARDEN_FAIL2BAN_DIR/jail.local" "$test_dir/pre-restart-failure-jail.local"
+            reset_case restart-rollback
+            FAIL2BAN_TEST_RESTART_FAIL_ONCE=1
+            configure_fail2ban
+            [[ "$FAIL2BAN_STATUS" == FAILED/ROLLED\ BACK ]]
+            cmp -s "$test_dir/pre-restart-failure-jail.local" "$HARDEN_FAIL2BAN_DIR/jail.local"
+        ' _ "$repo_root" "$case_root" || fail "Fail2ban configuration idempotency/recovery regression failed"
+}
+
 run_packagekit_tests() {
     local case_root="$test_root/packagekit" mock_bin="$test_root/packagekit/bin"
     local apt_log="$test_root/packagekit/apt.log"
@@ -978,6 +1101,7 @@ case "${1:-}" in
         ;;
     -y)
         [[ "${PACKAGE_UPGRADE_TEST_CASE:-}" == upgrades ]] || exit 64
+        [[ "${NEEDRESTART_MODE:-}" == l ]] || exit 65
         ;;
     *) exit 64 ;;
 esac
@@ -1008,15 +1132,20 @@ EOF
             [[ "$REBOOT_REQUIRED" -eq 1 && "$PACKAGE_UPGRADE_STATUS" == "OK (upgraded; reboot required)" ]]
         ' _ "$repo_root" "$case_root" || fail "package upgrade reboot marker regression failed"
 
-    local main_section refresh_line upgrade_line prepare_line backup_line update_count
+    local main_section detect_line guard_line migration_line refresh_line upgrade_line prepare_line backup_line update_count
     main_section="$(sed -n '/^main()/,$p' "$repo_root/harden.sh")"
+    detect_line="$(awk '/^[[:space:]]*detect_ssh_context[[:space:]]*$/ { print NR; exit }' <<<"$main_section")"
+    guard_line="$(awk '/^[[:space:]]*enable_needrestart_list_only[[:space:]]*$/ { print NR; exit }' <<<"$main_section")"
+    migration_line="$(awk '/^[[:space:]]*migrate_legacy_ssh_private_tmp_early/ { print NR; exit }' <<<"$main_section")"
     refresh_line="$(awk '/^[[:space:]]*refresh_apt_metadata[[:space:]]*$/ { print NR; exit }' <<<"$main_section")"
     upgrade_line="$(awk '/^[[:space:]]*upgrade_packages_safely[[:space:]]*$/ { print NR; exit }' <<<"$main_section")"
     prepare_line="$(awk '/^[[:space:]]*prepare_packages[[:space:]]*$/ { print NR; exit }' <<<"$main_section")"
     backup_line="$(awk '/^[[:space:]]*backup_config[[:space:]]*$/ { print NR; exit }' <<<"$main_section")"
     update_count="$(awk '!/^[[:space:]]*#/ && /run_streamed[[:space:]].*apt-get update/ {count++} END {print count+0}' "$repo_root/harden.sh")"
-    [[ "$update_count" == 1 && "$backup_line" -lt "$refresh_line" && "$refresh_line" -lt "$upgrade_line" && "$upgrade_line" -lt "$prepare_line" ]] \
-        || fail "Phase 03 APT refresh/upgrade/package-install order or single-update invariant regressed"
+    [[ "$update_count" == 1 && "$backup_line" -lt "$detect_line" && "$detect_line" -lt "$guard_line" \
+        && "$guard_line" -lt "$migration_line" && "$migration_line" -lt "$refresh_line" \
+        && "$refresh_line" -lt "$upgrade_line" && "$upgrade_line" -lt "$prepare_line" ]] \
+        || fail "backup/early-SSH/needrestart/APT/package-install order or single-update invariant regressed"
 
     : > "$apt_log"
     env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 PACKAGE_UPGRADE_APT_LOG="$apt_log" bash -c '
@@ -1024,6 +1153,25 @@ EOF
         MODE=dry-run; log() { printf "%s\n" "$*"; }; refresh_apt_metadata; upgrade_packages_safely
         [[ ! -s "$PACKAGE_UPGRADE_APT_LOG" && "$PACKAGE_UPGRADE_STATUS" == PLANNED* ]]
     ' _ "$repo_root" || fail "Phase 03 APT dry-run performed a package operation"
+
+    cat > "$mock_bin/needrestart" <<'EOF'
+#!/usr/bin/env bash
+[[ "${NEEDRESTART_MODE:-}" == l && "$*" == *"-b"* && "$*" == *"-r l"* ]] || exit 66
+printf 'NEEDRESTART-VER: 3.11\n'
+printf 'NEEDRESTART-SVC: ssh.service\n'
+printf 'NEEDRESTART-SVC: tailscaled.service\n'
+EOF
+    chmod +x "$mock_bin/needrestart"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_NEEDRESTART_REPORT="$case_root/needrestart-report.txt" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        MODE=apply; BACKUP_DIR="$2"; CHANGE_LOG="$2/needrestart-changes"; : > "$CHANGE_LOG"; REBOOT_REQUIRED=0
+        enable_needrestart_list_only
+        report_needrestart_pending
+        [[ "$NEEDRESTART_MODE" == l && "$REBOOT_REQUIRED" -eq 1 ]]
+        [[ "$NEEDRESTART_STATUS" == PENDING* ]]
+        grep -Fq "NEEDRESTART-SVC: ssh.service" "$NEEDRESTART_REPORT"
+        grep -Fq "NEEDRESTART-SVC: tailscaled.service" "$NEEDRESTART_REPORT"
+    ' _ "$repo_root" "$case_root" || fail "needrestart list-only critical-service pending report regression failed"
 }
 
 run_residual_purge_tests() {
@@ -1488,6 +1636,225 @@ run_systemd_idempotency_tests() {
         [[ "$(classify_systemd_exposure 3.4 3.4 0)" == not-decreased ]]
         [[ "$(classify_systemd_exposure 3.4 3.5 1)" == not-decreased ]]
     ' _ "$repo_root" || fail "systemd exposure idempotency classification failed"
+
+    local case_root="$test_root/systemd-exposure"
+    install -d "$case_root"
+    env HARDEN_SOURCE_ONLY=1 HARDEN_SYSTEMD_DIR="$case_root/systemd" HARDEN_SYSTEMD_HARDENING_REPORT="$case_root/report" HARDEN_FAIL2BAN_SERVICE_READINESS_ATTEMPTS=3 HARDEN_FAIL2BAN_READINESS_DELAY=0 bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        test_dir="$2"; MODE=apply; BACKUP_DIR="$test_dir/backup"; CHANGE_LOG="$test_dir/changes"; : > "$CHANGE_LOG"; mkdir -p "$BACKUP_DIR"; : > "$SYSTEMD_HARDENING_REPORT"; : > "$test_dir/commands"
+        unit_file_exists() { return 0; }
+        systemctl() { printf "%s " "$@" >> "$test_dir/commands"; printf "\n" >> "$test_dir/commands"; case "${1:-} ${2:-}" in "is-active --quiet") return 0 ;; "is-failed --quiet") return 1 ;; cat*) printf "[Service]\nExecStart=/bin/true\n" ;; esac; return 0; }
+        systemd_verify_unit() { return 0; }
+        transaction_copy() { :; }; transaction_restore() { rm -f -- "$1"; }
+        install_managed_file() { local destination="$1" mode="$2"; mkdir -p -- "$(dirname -- "$destination")"; cat > "$destination"; chmod "$mode" "$destination"; }
+        run_streamed() { "$@"; }
+        : > "$test_dir/fail2ban-attempt"
+        fail2ban-client() {
+            fail2ban_attempt="$(cat "$test_dir/fail2ban-attempt")"
+            case "$1" in
+                ping) fail2ban_attempt=$((fail2ban_attempt + 1)); printf "%s" "$fail2ban_attempt" > "$test_dir/fail2ban-attempt"; [[ "$fail2ban_attempt" -ge 2 ]] && { printf "Server replied: pong\\n"; return 0; } ;;
+                status) [[ "$fail2ban_attempt" -ge 2 ]] && { printf "Status for the jail: sshd\\n"; return 0; } ;;
+            esac
+            return 1
+        }
+        measure_service_exposure() { [[ "$2" == before ]] && SYSTEMD_EXPOSURE_RESULT=5.0 || SYSTEMD_EXPOSURE_RESULT=4.4; : > "$3"; }
+        install_service_dropin fail2ban.service 99-hardening "test control" <<EOF
+[Service]
+PrivateDevices=yes
+EOF
+        [[ -f "$HARDEN_SYSTEMD_DIR/fail2ban.service.d/99-hardening.conf" ]] \
+            && grep -Fq "restart fail2ban.service" "$test_dir/commands" \
+            && grep -Fq "before-score=5.0" "$SYSTEMD_HARDENING_REPORT" \
+            && grep -Fq "after-score=4.4" "$SYSTEMD_HARDENING_REPORT" \
+            && grep -Fq "Fail2ban ready after 2 check(s)" "$SYSTEMD_HARDENING_REPORT" \
+            && grep -Fq "result=kept: measured exposure decrease" "$SYSTEMD_HARDENING_REPORT" \
+            || exit 1
+    ' _ "$repo_root" "$case_root" || fail "measurable systemd exposure improvement regression failed"
+
+    env HARDEN_SOURCE_ONLY=1 HARDEN_SYSTEMD_DIR="$case_root/no-gain-systemd" HARDEN_SYSTEMD_HARDENING_REPORT="$case_root/no-gain-report" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        MODE=apply; BACKUP_DIR="$2/no-gain-backup"; CHANGE_LOG="$2/no-gain-changes"; : > "$CHANGE_LOG"; mkdir -p "$BACKUP_DIR"; : > "$SYSTEMD_HARDENING_REPORT"
+        unit_file_exists() { return 0; }; systemctl() { case "${1:-} ${2:-}" in "is-active --quiet") return 0 ;; "is-failed --quiet") return 1 ;; cat*) printf "[Service]\nExecStart=/bin/true\n" ;; esac; return 0; }
+        systemd_verify_unit() { return 0; }; transaction_copy() { :; }; transaction_restore() { rm -f -- "$1"; }
+        install_managed_file() { local destination="$1" mode="$2"; mkdir -p -- "$(dirname -- "$destination")"; cat > "$destination"; chmod "$mode" "$destination"; }; run_streamed() { "$@"; }; systemd_service_health_check() { return 0; }
+        measure_service_exposure() { SYSTEMD_EXPOSURE_RESULT=5.0; : > "$3"; }
+        install_service_dropin fail2ban.service 99-hardening "test control" <<EOF
+[Service]
+PrivateDevices=yes
+EOF
+        [[ ! -e "$HARDEN_SYSTEMD_DIR/fail2ban.service.d/99-hardening.conf" ]]
+        grep -Fq "rolled back: score did not decrease" "$SYSTEMD_HARDENING_REPORT"
+    ' _ "$repo_root" "$case_root" || fail "non-improving systemd sandbox was not rolled back"
+
+    env HARDEN_SOURCE_ONLY=1 HARDEN_SYSTEMD_DIR="$case_root/verify-systemd" HARDEN_SYSTEMD_HARDENING_REPORT="$case_root/verify-report" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        MODE=apply; BACKUP_DIR="$2/verify-backup"; CHANGE_LOG="$2/verify-changes"; : > "$CHANGE_LOG"; mkdir -p "$BACKUP_DIR"; : > "$SYSTEMD_HARDENING_REPORT"
+        unit_file_exists() { return 0; }; systemctl() { case "$1" in cat) printf "[Service]\nExecStart=/bin/true\n" ;; esac; return 0; }; systemd_verify_unit() { return 1; }
+        measure_service_exposure() { SYSTEMD_EXPOSURE_RESULT=5.0; : > "$3"; }
+        install_service_dropin fail2ban.service 99-hardening "test control" <<EOF
+[Service]
+PrivateDevices=yes
+EOF
+        [[ ! -e "$HARDEN_SYSTEMD_DIR/fail2ban.service.d/99-hardening.conf" ]]
+        grep -Fq "candidate rejected before installation" "$SYSTEMD_HARDENING_REPORT"
+    ' _ "$repo_root" "$case_root" || fail "invalid candidate systemd unit was installed"
+
+    env HARDEN_SOURCE_ONLY=1 HARDEN_SYSTEMD_DIR="$case_root/health-systemd" HARDEN_SYSTEMD_HARDENING_REPORT="$case_root/health-report" HARDEN_FAIL2BAN_SERVICE_READINESS_ATTEMPTS=3 HARDEN_FAIL2BAN_READINESS_DELAY=0 bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        test_dir="$2"; MODE=apply; BACKUP_DIR="$test_dir/health-backup"; CHANGE_LOG="$test_dir/health-changes"; : > "$CHANGE_LOG"; mkdir -p "$BACKUP_DIR"; : > "$SYSTEMD_HARDENING_REPORT"
+        unit_file_exists() { return 0; }; systemctl() { case "${1:-} ${2:-}" in "is-active --quiet") return 0 ;; "is-failed --quiet") return 1 ;; cat*) printf "[Service]\nExecStart=/bin/true\n" ;; esac; return 0; }; systemd_verify_unit() { return 0; }; transaction_copy() { :; }; transaction_restore() { rm -f -- "$1"; }
+        : > "$test_dir/health-check-pings"
+        install_managed_file() { local destination="$1" mode="$2"; mkdir -p -- "$(dirname -- "$destination")"; cat > "$destination"; chmod "$mode" "$destination"; }; run_streamed() { "$@"; }; fail2ban-client() { if [[ "$1" == ping ]]; then count="$(cat "$test_dir/health-check-pings")"; printf "%s" "$((count + 1))" > "$test_dir/health-check-pings"; fi; return 1; }
+        measure_service_exposure() { [[ "$2" == before ]] && SYSTEMD_EXPOSURE_RESULT=5.0 || SYSTEMD_EXPOSURE_RESULT=4.4; : > "$3"; }
+        install_service_dropin fail2ban.service 99-hardening "test control" <<EOF
+[Service]
+PrivateDevices=yes
+EOF
+        [[ ! -e "$HARDEN_SYSTEMD_DIR/fail2ban.service.d/99-hardening.conf" ]]
+        [[ "$(cat "$test_dir/health-check-pings")" == 3 ]]
+        grep -Fq "health=failed" "$SYSTEMD_HARDENING_REPORT"
+    ' _ "$repo_root" "$case_root" || fail "unhealthy systemd service did not roll back its drop-in"
+
+    env HARDEN_SOURCE_ONLY=1 HARDEN_SYSTEMD_DIR="$case_root/converged-systemd" HARDEN_SYSTEMD_HARDENING_REPORT="$case_root/converged-report" HARDEN_FAIL2BAN_SERVICE_READINESS_ATTEMPTS=3 HARDEN_FAIL2BAN_READINESS_DELAY=0 bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        test_dir="$2"; MODE=apply; BACKUP_DIR="$test_dir/converged-backup"; CHANGE_LOG="$test_dir/converged-changes"; : > "$CHANGE_LOG"; mkdir -p "$BACKUP_DIR" "$HARDEN_SYSTEMD_DIR/fail2ban.service.d"; : > "$SYSTEMD_HARDENING_REPORT"; : > "$test_dir/converged-commands"
+        printf "[Service]\nPrivateDevices=yes\n" > "$HARDEN_SYSTEMD_DIR/fail2ban.service.d/99-hardening.conf"
+        unit_file_exists() { return 0; }; systemctl() { printf "%s " "$@" >> "$test_dir/converged-commands"; printf "\n" >> "$test_dir/converged-commands"; case "${1:-} ${2:-}" in "is-active --quiet") return 0 ;; cat*) printf "[Service]\nExecStart=/bin/true\n" ;; esac; return 0; }; systemd_verify_unit() { return 0; }; run_streamed() { "$@"; }; fail2ban-client() { [[ "$1" == ping ]] && printf "Server replied: pong\n" || printf "Status for the jail: sshd\n"; }
+        measure_service_exposure() { SYSTEMD_EXPOSURE_RESULT=4.4; : > "$3"; }
+        install_service_dropin fail2ban.service 99-hardening "test control" <<EOF
+[Service]
+PrivateDevices=yes
+EOF
+        ! grep -Eq "daemon-reload|restart fail2ban.service" "$test_dir/converged-commands"
+        ! grep -Fq "PrivateMounts=yes" "$HARDEN_SYSTEMD_DIR/fail2ban.service.d/99-hardening.conf"
+        grep -Fq "already hardened/unchanged" "$SYSTEMD_HARDENING_REPORT"
+    ' _ "$repo_root" "$case_root" || fail "converged systemd drop-in caused a restart or rewrite"
+
+    env HARDEN_SOURCE_ONLY=1 HARDEN_SYSTEMD_DIR="$case_root/early-ssh-systemd" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        test_dir="$2"; MODE=apply; SSH_SERVICE=ssh.service; SSHD_BIN=/bin/true; BACKUP_DIR="$test_dir/early-ssh-backup"; CHANGE_LOG="$test_dir/early-ssh-changes"; : > "$CHANGE_LOG"; mkdir -p "$BACKUP_DIR" "$HARDEN_SYSTEMD_DIR/ssh.service.d"; : > "$test_dir/early-ssh-commands"; REBOOT_REQUIRED=0
+        printf "[Service]\\nPrivateTmp=yes\\nUMask=0027\\n" > "$HARDEN_SYSTEMD_DIR/ssh.service.d/99-hardening.conf"
+        systemctl() { printf "%s " "$@" >> "$test_dir/early-ssh-commands"; printf "\\n" >> "$test_dir/early-ssh-commands"; case "${1:-} ${2:-}" in "is-active --quiet") return 0 ;; "show ssh.service") printf "yes\\n" ;; cat*) printf "[Service]\\nExecStart=/bin/true\\n" ;; esac; return 0; }; systemd_verify_unit() { return 0; }
+        transaction_copy() { cp -- "$1" "$test_dir/early-ssh-original"; }; transaction_restore() { cp -- "$test_dir/early-ssh-original" "$1"; }
+        install_managed_file() { local destination="$1" mode="$2"; mkdir -p -- "$(dirname -- "$destination")"; cat > "$destination"; chmod "$mode" "$destination"; }; run_streamed() { "$@"; }
+        migrate_legacy_ssh_private_tmp_early
+        grep -Fxq "UMask=0027" "$HARDEN_SYSTEMD_DIR/ssh.service.d/99-hardening.conf"
+        ! grep -Fq "PrivateTmp" "$HARDEN_SYSTEMD_DIR/ssh.service.d/99-hardening.conf"
+        grep -Fq "reload ssh.service" "$test_dir/early-ssh-commands"
+        ! grep -Fq "restart ssh.service" "$test_dir/early-ssh-commands"
+        [[ "$SSH_SYSTEMD_EARLY_MIGRATED" -eq 1 && "$SSH_SYSTEMD_LEGACY_RUNTIME" -eq 1 && "$REBOOT_REQUIRED" -eq 1 ]]
+        [[ "$SSH_SYSTEMD_SAFETY_STATUS" == "MIGRATED/PENDING REBOOT"* ]]
+    ' _ "$repo_root" "$case_root" || fail "early legacy SSH migration/reboot convergence regression failed"
+
+    env HARDEN_SOURCE_ONLY=1 HARDEN_SYSTEMD_DIR="$case_root/early-ssh-current-systemd" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        test_dir="$2"; MODE=apply; SSH_SERVICE=ssh.service; SSHD_BIN=/bin/true; BACKUP_DIR="$test_dir/early-ssh-current-backup"; CHANGE_LOG="$test_dir/early-ssh-current-changes"; : > "$CHANGE_LOG"; mkdir -p "$BACKUP_DIR" "$HARDEN_SYSTEMD_DIR/ssh.service.d"; : > "$test_dir/early-ssh-current-commands"; REBOOT_REQUIRED=0
+        printf "[Service]\\nUMask=0027\\n" > "$HARDEN_SYSTEMD_DIR/ssh.service.d/99-hardening.conf"
+        systemctl() { printf "%s " "$@" >> "$test_dir/early-ssh-current-commands"; printf "\\n" >> "$test_dir/early-ssh-current-commands"; return 0; }
+        migrate_legacy_ssh_private_tmp_early
+        [[ "$SSH_SYSTEMD_SAFETY_STATUS" == "OK (already UMask-only; no reload required)" ]]
+        [[ ! -s "$test_dir/early-ssh-current-commands" && "$REBOOT_REQUIRED" -eq 0 ]]
+    ' _ "$repo_root" "$case_root" || fail "fresh UMask-only SSH state performed an unnecessary reload"
+
+    env HARDEN_SOURCE_ONLY=1 HARDEN_SYSTEMD_DIR="$case_root/early-ssh-reload-failure-systemd" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        test_dir="$2"; MODE=apply; SSH_SERVICE=ssh.service; SSHD_BIN=/bin/true; BACKUP_DIR="$test_dir/early-ssh-reload-failure-backup"; CHANGE_LOG="$test_dir/early-ssh-reload-failure-changes"; : > "$CHANGE_LOG"; mkdir -p "$BACKUP_DIR" "$HARDEN_SYSTEMD_DIR/ssh.service.d"; : > "$test_dir/early-ssh-reload-failure-commands"
+        printf "[Service]\\nPrivateTmp=yes\\nUMask=0027\\n" > "$HARDEN_SYSTEMD_DIR/ssh.service.d/99-hardening.conf"
+        systemctl() { printf "%s " "$@" >> "$test_dir/early-ssh-reload-failure-commands"; printf "\\n" >> "$test_dir/early-ssh-reload-failure-commands"; case "${1:-} ${2:-}" in "is-active --quiet") return 0 ;; "show ssh.service") printf "yes\\n" ;; cat*) printf "[Service]\\nExecStart=/bin/true\\n" ;; "reload ssh.service") return 1 ;; esac; return 0; }; systemd_verify_unit() { return 0; }
+        transaction_copy() { cp -- "$1" "$test_dir/early-ssh-reload-failure-original"; }; transaction_restore() { cp -- "$test_dir/early-ssh-reload-failure-original" "$1"; }
+        install_managed_file() { local destination="$1" mode="$2"; mkdir -p -- "$(dirname -- "$destination")"; cat > "$destination"; chmod "$mode" "$destination"; }; run_streamed() { "$@"; }
+        ! migrate_legacy_ssh_private_tmp_early
+        grep -Fq "PrivateTmp=yes" "$HARDEN_SYSTEMD_DIR/ssh.service.d/99-hardening.conf"
+        ! grep -Fq "restart ssh.service" "$test_dir/early-ssh-reload-failure-commands"
+        [[ "$SSH_SYSTEMD_SAFETY_STATUS" == FAILED/ROLLED\ BACK* ]]
+    ' _ "$repo_root" "$case_root" || fail "early SSH reload failure did not roll back without restart"
+
+    cat > "$case_root/sshd-second-check-fails" <<'EOF'
+#!/usr/bin/env bash
+count="$(cat "$SSH_TEST_CHECK_COUNT" 2>/dev/null || printf 0)"
+count=$((count + 1))
+printf '%s\n' "$count" > "$SSH_TEST_CHECK_COUNT"
+[[ "$count" -ne 2 ]]
+EOF
+    chmod +x "$case_root/sshd-second-check-fails"
+    env HARDEN_SOURCE_ONLY=1 HARDEN_SYSTEMD_DIR="$case_root/early-ssh-sshd-failure-systemd" SSH_TEST_CHECK_COUNT="$case_root/sshd-check-count" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        test_dir="$2"; MODE=apply; SSH_SERVICE=ssh.service; SSHD_BIN="$test_dir/sshd-second-check-fails"; BACKUP_DIR="$test_dir/early-ssh-sshd-failure-backup"; CHANGE_LOG="$test_dir/early-ssh-sshd-failure-changes"; : > "$CHANGE_LOG"; mkdir -p "$BACKUP_DIR" "$HARDEN_SYSTEMD_DIR/ssh.service.d"; : > "$test_dir/early-ssh-sshd-failure-commands"
+        printf "[Service]\\nPrivateTmp=yes\\nUMask=0027\\n" > "$HARDEN_SYSTEMD_DIR/ssh.service.d/99-hardening.conf"
+        systemctl() { printf "%s " "$@" >> "$test_dir/early-ssh-sshd-failure-commands"; printf "\\n" >> "$test_dir/early-ssh-sshd-failure-commands"; case "${1:-} ${2:-}" in "is-active --quiet") return 0 ;; "show ssh.service") printf "yes\\n" ;; cat*) printf "[Service]\\nExecStart=/bin/true\\n" ;; esac; return 0; }; systemd_verify_unit() { return 0; }
+        transaction_copy() { cp -- "$1" "$test_dir/early-ssh-sshd-failure-original"; }; transaction_restore() { cp -- "$test_dir/early-ssh-sshd-failure-original" "$1"; }
+        install_managed_file() { local destination="$1" mode="$2"; mkdir -p -- "$(dirname -- "$destination")"; cat > "$destination"; chmod "$mode" "$destination"; }; run_streamed() { "$@"; }
+        ! migrate_legacy_ssh_private_tmp_early
+        grep -Fq "PrivateTmp=yes" "$HARDEN_SYSTEMD_DIR/ssh.service.d/99-hardening.conf"
+        ! grep -Fq "restart ssh.service" "$test_dir/early-ssh-sshd-failure-commands"
+        [[ "$SSH_SYSTEMD_SAFETY_STATUS" == FAILED/ROLLED\ BACK* ]]
+    ' _ "$repo_root" "$case_root" || fail "early SSH sshd -t failure did not roll back safely"
+
+    env HARDEN_SOURCE_ONLY=1 HARDEN_SYSTEMD_DIR="$case_root/ssh-migration-systemd" HARDEN_SYSTEMD_HARDENING_REPORT="$case_root/ssh-migration-report" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        test_dir="$2"; MODE=apply; SSH_SERVICE=ssh.service; SSHD_BIN=/bin/true; BACKUP_DIR="$test_dir/ssh-migration-backup"; CHANGE_LOG="$test_dir/ssh-migration-changes"; : > "$CHANGE_LOG"; mkdir -p "$BACKUP_DIR" "$HARDEN_SYSTEMD_DIR/ssh.service.d"; : > "$SYSTEMD_HARDENING_REPORT"; : > "$test_dir/ssh-migration-commands"
+        printf "[Service]\\nPrivateTmp=yes\\nUMask=0027\\n" > "$HARDEN_SYSTEMD_DIR/ssh.service.d/99-hardening.conf"
+        unit_file_exists() { return 0; }; systemctl() { printf "%s " "$@" >> "$test_dir/ssh-migration-commands"; printf "\\n" >> "$test_dir/ssh-migration-commands"; case "${1:-} ${2:-}" in "is-active --quiet") return 0 ;; "is-failed --quiet") return 1 ;; cat*) printf "[Service]\\nExecStart=/bin/true\\n" ;; esac; return 0; }; systemd_verify_unit() { return 0; }
+        transaction_copy() { cp -- "$1" "$test_dir/ssh-migration-original"; }; transaction_restore() { cp -- "$test_dir/ssh-migration-original" "$1"; }
+        install_managed_file() { local destination="$1" mode="$2"; mkdir -p -- "$(dirname -- "$destination")"; cat > "$destination"; chmod "$mode" "$destination"; }; run_streamed() { "$@"; }; systemd_service_health_check() { return 0; }
+        measure_service_exposure() { SYSTEMD_EXPOSURE_RESULT=9.2; : > "$3"; }
+        install_service_dropin ssh.service 99-hardening "SSH safety migration" <<EOF
+[Service]
+UMask=0027
+EOF
+        grep -Fxq "UMask=0027" "$HARDEN_SYSTEMD_DIR/ssh.service.d/99-hardening.conf"
+        ! grep -Fq "PrivateTmp" "$HARDEN_SYSTEMD_DIR/ssh.service.d/99-hardening.conf"
+        grep -Fq "reload ssh.service" "$test_dir/ssh-migration-commands"
+        ! grep -Fq "restart ssh.service" "$test_dir/ssh-migration-commands"
+        grep -Fq "SSH safety migration: PrivateTmp removed" "$SYSTEMD_HARDENING_REPORT"
+    ' _ "$repo_root" "$case_root" || fail "SSH PrivateTmp migration did not retain the UMask-only safety exception"
+
+    env HARDEN_SOURCE_ONLY=1 HARDEN_SYSTEMD_DIR="$case_root/ssh-rollback-systemd" HARDEN_SYSTEMD_HARDENING_REPORT="$case_root/ssh-rollback-report" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        test_dir="$2"; MODE=apply; SSH_SERVICE=ssh.service; SSHD_BIN=/bin/true; BACKUP_DIR="$test_dir/ssh-rollback-backup"; CHANGE_LOG="$test_dir/ssh-rollback-changes"; : > "$CHANGE_LOG"; mkdir -p "$BACKUP_DIR" "$HARDEN_SYSTEMD_DIR/ssh.service.d"; : > "$SYSTEMD_HARDENING_REPORT"; : > "$test_dir/ssh-rollback-commands"
+        printf "[Service]\\nPrivateTmp=yes\\nUMask=0027\\n" > "$HARDEN_SYSTEMD_DIR/ssh.service.d/99-hardening.conf"
+        unit_file_exists() { return 0; }; systemctl() { printf "%s " "$@" >> "$test_dir/ssh-rollback-commands"; printf "\\n" >> "$test_dir/ssh-rollback-commands"; case "${1:-} ${2:-}" in "is-active --quiet") return 0 ;; "is-failed --quiet") return 1 ;; cat*) printf "[Service]\\nExecStart=/bin/true\\n" ;; esac; return 0; }; systemd_verify_unit() { return 0; }
+        transaction_copy() { cp -- "$1" "$test_dir/ssh-rollback-original"; }; transaction_restore() { cp -- "$test_dir/ssh-rollback-original" "$1"; }
+        install_managed_file() { local destination="$1" mode="$2"; mkdir -p -- "$(dirname -- "$destination")"; cat > "$destination"; chmod "$mode" "$destination"; }; run_streamed() { "$@"; }; systemd_service_health_check() { return 1; }
+        measure_service_exposure() { SYSTEMD_EXPOSURE_RESULT=9.2; : > "$3"; }
+        install_service_dropin ssh.service 99-hardening "SSH safety migration" <<EOF
+[Service]
+UMask=0027
+EOF
+        grep -Fq "PrivateTmp=yes" "$HARDEN_SYSTEMD_DIR/ssh.service.d/99-hardening.conf"
+        grep -Fq "reload ssh.service" "$test_dir/ssh-rollback-commands"
+        ! grep -Fq "restart ssh.service" "$test_dir/ssh-rollback-commands"
+        grep -Fq "health=failed" "$SYSTEMD_HARDENING_REPORT"
+    ' _ "$repo_root" "$case_root" || fail "SSH migration health rollback restarted SSH or lost the prior drop-in"
+
+    env HARDEN_SOURCE_ONLY=1 HARDEN_SYSTEMD_DIR="$case_root/ssh-converged-systemd" HARDEN_SYSTEMD_HARDENING_REPORT="$case_root/ssh-converged-report" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        test_dir="$2"; MODE=apply; SSH_SERVICE=ssh.service; SSHD_BIN=/bin/true; BACKUP_DIR="$test_dir/ssh-converged-backup"; CHANGE_LOG="$test_dir/ssh-converged-changes"; : > "$CHANGE_LOG"; mkdir -p "$BACKUP_DIR" "$HARDEN_SYSTEMD_DIR/ssh.service.d"; : > "$SYSTEMD_HARDENING_REPORT"; : > "$test_dir/ssh-converged-commands"
+        printf "[Service]\\nUMask=0027\\n" > "$HARDEN_SYSTEMD_DIR/ssh.service.d/99-hardening.conf"
+        unit_file_exists() { return 0; }; systemctl() { printf "%s " "$@" >> "$test_dir/ssh-converged-commands"; printf "\\n" >> "$test_dir/ssh-converged-commands"; case "${1:-} ${2:-}" in "is-active --quiet") return 0 ;; cat*) printf "[Service]\\nExecStart=/bin/true\\n" ;; esac; return 0; }; systemd_verify_unit() { return 0; }; run_streamed() { "$@"; }; systemd_service_health_check() { return 0; }
+        measure_service_exposure() { SYSTEMD_EXPOSURE_RESULT=9.2; : > "$3"; }
+        install_service_dropin ssh.service 99-hardening "SSH safety migration" <<EOF
+[Service]
+UMask=0027
+EOF
+        ! grep -Eq "daemon-reload|reload ssh.service|restart ssh.service" "$test_dir/ssh-converged-commands"
+        grep -Fq "already hardened/unchanged" "$SYSTEMD_HARDENING_REPORT"
+    ' _ "$repo_root" "$case_root" || fail "converged SSH UMask-only drop-in caused a reload or restart"
+
+    env HARDEN_SOURCE_ONLY=1 bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        SSH_SERVICE=ssh.service
+        [[ "$(systemd_service_classification ssh.service)" == "safety exception:"* ]]
+        [[ "$(systemd_service_classification tailscaled.service)" == excluded:* ]]
+        [[ "$(systemd_service_classification networkd-dispatcher.service)" == candidate:* ]]
+        section="$(sed -n "/^harden_systemd_services()/,/^}/p" "$1/harden.sh")"
+        ! grep -Eq "install_service_dropin (tailscaled|dbus|cron|auditd|open-vm-tools|snapd|systemd-|polkit|cloud-init)" <<<"$section"
+        ssh_block="$(sed -n "/install_service_dropin \"\$SSH_SERVICE\"/,/EOF/p" "$1/harden.sh")"
+        ! grep -Fq "PrivateTmp=yes" <<<"$ssh_block"; grep -Fxq "UMask=0027" <<<"$ssh_block"
+        systemctl() { [[ "$1 $2" == "is-active --quiet" ]]; }
+        SSHD_BIN=/bin/true; systemd_service_health_check ssh.service
+        SSHD_BIN=/bin/false; ! systemd_service_health_check ssh.service
+    ' _ "$repo_root" || fail "protected service or SSH preservation regression failed"
 }
 
 run_runtime_noop_tests() {
@@ -1647,7 +2014,7 @@ EOF
         upgrade_section="$(sed -n "/^upgrade_packages_safely()/,/^}/p" "$1/harden.sh")"
         grep -Fq "reboot_marker=\"\${HARDEN_REBOOT_REQUIRED_FILE:-/var/run/reboot-required}\"" <<<"$upgrade_section"
         grep -Fq "PACKAGE_UPGRADE_STATUS=\"OK (upgraded; reboot required)\"" <<<"$upgrade_section"
-        [[ "$(grep -Fc "REBOOT_REQUIRED=1" "$1/harden.sh")" == 5 ]]
+        [[ "$(grep -Fc "REBOOT_REQUIRED=1" "$1/harden.sh")" == 7 ]]
     ' _ "$repo_root" || fail "initramfs/GRUB/reboot-required change gating regressed"
 }
 
@@ -2725,6 +3092,9 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
     compiler)
         run_compiler_tests
         ;;
+    systemd)
+        run_systemd_idempotency_tests
+        ;;
     packages)
         run_packagekit_tests
         run_package_upgrade_tests
@@ -2757,6 +3127,7 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
     new-findings)
         run_lynis_summary_tests
         run_fail2ban_tests
+        run_fail2ban_configuration_tests
         run_packagekit_tests
         run_package_upgrade_tests
         run_residual_purge_tests
@@ -2778,6 +3149,7 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
         run_kernel_gate_test
         run_lynis_summary_tests
         run_fail2ban_tests
+        run_fail2ban_configuration_tests
         run_packagekit_tests
         run_package_upgrade_tests
         run_residual_purge_tests
