@@ -82,6 +82,13 @@ Health-Resultat enthalten. Ein neuer Drop-in bleibt nur bei messbar kleinerem
 Exposure bestehen; ein Verify- oder Health-Fehler muss den vorherigen Drop-in
 vollständig wiederherstellen.
 
+Die Phase-03-Reihenfolge muss im Log `Backup -> SSH-Kontext -> needrestart
+list-only -> frühe SSH-Migration -> apt-get update -> kontrolliertes Upgrade`
+zeigen. Der Batch-Report `/root/needrestart-pending-report.txt` muss alle
+ausstehenden Service-Restarts nennen; während des Laufs dürfen insbesondere
+SSH, Tailscale und Netzwerk-/Firewall-Dienste nicht automatisch neu gestartet
+werden.
+
 ```bash
 sudo ./harden.sh --apply --aggressive
 sudo cat /root/systemd-hardening-report.txt
@@ -112,6 +119,8 @@ sudo systemctl is-active ssh.service
 findmnt -T /tmp
 mktemp
 sudo grep -A9 '^\[ssh\.service\]' /root/systemd-hardening-report.txt
+sudo cat /root/needrestart-pending-report.txt
+sudo grep -E 'SSH systemd safety|needrestart|Reboot required' /var/log/server-hardening.log
 ```
 
 Bei Validierungs- oder Health-Fehlern muss der vorherige Drop-in wiederhergestellt

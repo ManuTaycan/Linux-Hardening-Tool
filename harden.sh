@@ -67,6 +67,8 @@ AIDE_STATUS="NOT RUN"
 FAIL2BAN_STATUS="NOT RUN"
 UPDATES_STATUS="NOT RUN"
 PACKAGE_UPGRADE_STATUS="NOT RUN"
+NEEDRESTART_STATUS="NOT RUN"
+NEEDRESTART_REPORT="${HARDEN_NEEDRESTART_REPORT:-/root/needrestart-pending-report.txt}"
 RESIDUAL_PURGE_STATUS="NOT RUN"
 FIREWALL_RULE_HYGIENE_STATUS="NOT RUN"
 REMOTE_LOG_STATUS="DISABLED"
@@ -106,6 +108,9 @@ declare -A IPV6_RUNTIME_BEFORE=()
 declare -a IPV6_RUNTIME_INTERFACE_ORDER=()
 BANNER_STATUS="NOT RUN"
 MOTD_STATUS="NOT RUN"
+SSH_SYSTEMD_SAFETY_STATUS="NOT RUN"
+SSH_SYSTEMD_EARLY_MIGRATED=0
+SSH_SYSTEMD_LEGACY_RUNTIME=0
 
 readonly COLOR_RESET=$'\033[0m'
 readonly COLOR_DIM=$'\033[2m'
@@ -737,6 +742,59 @@ EOF
     fi
 }
 
+enable_needrestart_list_only() {
+    # needrestart documents NEEDRESTART_MODE=l as the apt-hook override for
+    # list-only operation. Export it for every package action in this process
+    # so access- and network-critical services are never auto-restarted.
+    NEEDRESTART_MODE=l
+    export NEEDRESTART_MODE
+    NEEDRESTART_STATUS="PROTECTED (official list-only mode active; pending scan not yet run)"
+    log INFO "needrestart list-only protection enabled for this hardening run; automatic service restarts are deferred and reported"
+}
+
+report_needrestart_pending() {
+    local output="" status=0 pending_services="" protected_pending=""
+    if [[ "$MODE" == dry-run ]]; then
+        NEEDRESTART_STATUS="PLANNED (list-only pending-service inventory)"
+        log INFO "Would run needrestart in batch/list-only mode and report pending service restarts"
+        return 0
+    fi
+    if ! command -v needrestart >/dev/null 2>&1; then
+        NEEDRESTART_STATUS="N/A (needrestart unavailable)"
+        record_skip "needrestart" "needrestart is unavailable; no pending-service inventory could be produced"
+        return 0
+    fi
+    output="$(env NEEDRESTART_MODE=l needrestart -b -r l 2>&1)" || status=$?
+    {
+        printf 'needrestart pending-service report\n'
+        printf 'Generated: %s\n' "$(timestamp)"
+        printf 'Mode: batch/list-only (no service restarts)\n'
+        printf 'Protected services: ssh/sshd, tailscaled, systemd-networkd, NetworkManager, networking, networkd-dispatcher, nftables, firewalld, and comparable access/network services\n\n'
+        printf '%s\n' "$output"
+    } > "$NEEDRESTART_REPORT"
+    chmod 0600 "$NEEDRESTART_REPORT"
+    [[ -z "$output" ]] || emit_block <<< "$output"
+    if [[ "$status" -ne 0 ]]; then
+        NEEDRESTART_STATUS="REVIEW REQUIRED (batch/list-only scan failed; report: ${NEEDRESTART_REPORT})"
+        record_skip "needrestart" "batch/list-only pending-service scan exited ${status}; inspect ${NEEDRESTART_REPORT}"
+        return 0
+    fi
+    pending_services="$(awk -F': ' '$1 == "NEEDRESTART-SVC" && $2 != "" {print $2}' <<< "$output")"
+    protected_pending="$(grep -Ei '(^|/)(ssh|sshd|tailscaled|systemd-networkd|NetworkManager|networking|networkd-dispatcher|nftables|firewalld)(\.service)?$' <<< "$pending_services" || true)"
+    if [[ -n "$pending_services" ]]; then
+        REBOOT_REQUIRED=1
+        NEEDRESTART_STATUS="PENDING (automatic restarts deferred; controlled reboot required; report: ${NEEDRESTART_REPORT})"
+        record_change "Recorded needrestart pending services without restarting them: ${pending_services//$'\n'/, }"
+        if [[ -n "$protected_pending" ]]; then
+            log WARN "Access/network-critical service restarts are pending and were deliberately deferred: ${protected_pending//$'\n'/, }"
+        fi
+    else
+        NEEDRESTART_STATUS="OK (no pending service restarts; report: ${NEEDRESTART_REPORT})"
+        record_change "Verified with needrestart batch/list-only mode that no service restarts are pending"
+    fi
+    return 0
+}
+
 upgrade_packages_safely() {
     local simulation upgrades removals reboot_marker="${HARDEN_REBOOT_REQUIRED_FILE:-/var/run/reboot-required}"
     if [[ "$MODE" == "dry-run" ]]; then
@@ -766,7 +824,7 @@ upgrade_packages_safely() {
         log INFO "APT upgrade simulation reports no upgradeable packages"
         return 0
     fi
-    if ! run_streamed env DEBIAN_FRONTEND=noninteractive apt-get -y --no-remove \
+    if ! run_streamed env NEEDRESTART_MODE=l DEBIAN_FRONTEND=noninteractive apt-get -y --no-remove \
         -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade; then
         PACKAGE_UPGRADE_STATUS="FAILED (apt-get upgrade)"
         record_skip "PKGS-7392" "conservative apt-get upgrade failed; inspect APT/dpkg output before retrying"
@@ -2879,6 +2937,140 @@ detect_ssh_context() {
     log INFO "SSH context: service=${SSH_SERVICE:-none}, local port=${SSH_PORT}, admin=${ADMIN_USER:-none}, admin-key=${ADMIN_KEY_READY}"
 }
 
+normalize_managed_ssh_dropin() {
+    local path="$1"
+    awk '
+        {
+            sub(/\r$/, "")
+            sub(/[[:space:]]*#.*/, "")
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+            if ($0 == "") next
+            gsub(/[[:space:]]*=[[:space:]]*/, "=")
+            print
+        }
+    ' "$path"
+}
+
+rollback_early_ssh_dropin() {
+    local destination="$1" reason="$2" was_active="$3"
+    transaction_restore "$destination" ssh-systemd-early-safety
+    run_streamed systemctl daemon-reload || true
+    if [[ "$was_active" -eq 1 ]]; then
+        # Never restart SSH, including the rollback path.
+        run_streamed systemctl reload "$SSH_SERVICE" || true
+    fi
+    SSH_SYSTEMD_SAFETY_STATUS="FAILED/ROLLED BACK (${reason})"
+    log ROLLBACK "${reason}; restored the prior managed SSH drop-in without restarting SSH"
+}
+
+migrate_legacy_ssh_private_tmp_early() {
+    local systemd_dir="${HARDEN_SYSTEMD_DIR:-/etc/systemd/system}"
+    local destination="" normalized="" runtime_private_tmp="unknown"
+    local was_active=0 runtime_legacy=0 stage="" verify_dir="" verify_unit=""
+    local preverify_file="$BACKUP_DIR/systemd-verify-${SSH_SERVICE:-ssh.service}-early-pre-install.txt"
+    local postverify_file="$BACKUP_DIR/systemd-verify-${SSH_SERVICE:-ssh.service}-early-installed.txt"
+    if [[ -z "$SSH_SERVICE" || -z "$SSHD_BIN" ]]; then
+        SSH_SYSTEMD_SAFETY_STATUS="N/A (SSH service or sshd unavailable)"
+        return 0
+    fi
+    destination="${systemd_dir}/${SSH_SERVICE}.d/99-hardening.conf"
+    if [[ ! -e "$destination" ]]; then
+        SSH_SYSTEMD_SAFETY_STATUS="NOT REQUIRED (managed SSH drop-in absent)"
+        return 0
+    fi
+    if [[ -L "$destination" || ! -f "$destination" ]]; then
+        SSH_SYSTEMD_SAFETY_STATUS="REVIEW REQUIRED (managed path is not a regular non-symlink file)"
+        record_skip "BOOT-5264:${SSH_SERVICE}" "refused early SSH migration because ${destination} is not a regular non-symlink file"
+        return 1
+    fi
+    normalized="$(normalize_managed_ssh_dropin "$destination")"
+    if [[ "$normalized" == $'[Service]\nUMask=0027' ]]; then
+        SSH_SYSTEMD_SAFETY_STATUS="OK (already UMask-only; no reload required)"
+        log INFO "Managed SSH systemd drop-in is already UMask-only; early reload is not required"
+        return 0
+    fi
+    if [[ "$normalized" != $'[Service]\nPrivateTmp=yes\nUMask=0027' \
+        && "$normalized" != $'[Service]\nUMask=0027\nPrivateTmp=yes' ]]; then
+        SSH_SYSTEMD_SAFETY_STATUS="NOT REQUIRED (no recognized legacy PrivateTmp+UMask policy)"
+        return 0
+    fi
+    if [[ "$MODE" == dry-run ]]; then
+        SSH_SYSTEMD_SAFETY_STATUS="PLANNED (legacy PrivateTmp+UMask to UMask-only before package upgrade)"
+        log INFO "Would migrate the managed SSH drop-in from PrivateTmp+UMask to UMask-only before package upgrade, validate it, and reload SSH without restart"
+        return 0
+    fi
+    if systemctl is-active --quiet "$SSH_SERVICE"; then
+        was_active=1
+        runtime_private_tmp="$(systemctl show "$SSH_SERVICE" --property=PrivateTmp --value 2>/dev/null || true)"
+        case "${runtime_private_tmp,,}" in
+            no|false|0) runtime_legacy=0 ;;
+            *) runtime_legacy=1 ;;
+        esac
+    fi
+    if ! "$SSHD_BIN" -t >/dev/null 2>&1; then
+        SSH_SYSTEMD_SAFETY_STATUS="FAILED (sshd -t rejected current configuration before migration)"
+        return 1
+    fi
+    stage="$(mktemp)" || { SSH_SYSTEMD_SAFETY_STATUS="FAILED (could not stage UMask-only drop-in)"; return 1; }
+    printf '[Service]\nUMask=0027\n' > "$stage"
+    verify_dir="$(mktemp -d)" || { rm -f -- "$stage"; SSH_SYSTEMD_SAFETY_STATUS="FAILED (could not create merged-unit verification directory)"; return 1; }
+    verify_unit="${verify_dir}/${SSH_SERVICE}"
+    if ! systemctl cat "$SSH_SERVICE" > "$verify_unit" 2> "$preverify_file"; then
+        rm -f -- "$stage" "$verify_unit"
+        rmdir -- "$verify_dir" 2>/dev/null || true
+        SSH_SYSTEMD_SAFETY_STATUS="FAILED (could not read merged SSH unit)"
+        return 1
+    fi
+    printf '\n# Early managed UMask-only candidate\n' >> "$verify_unit"
+    cat "$stage" >> "$verify_unit"
+    if ! systemd_verify_unit "$verify_unit" >> "$preverify_file" 2>&1; then
+        rm -f -- "$stage" "$verify_unit"
+        rmdir -- "$verify_dir" 2>/dev/null || true
+        SSH_SYSTEMD_SAFETY_STATUS="FAILED (merged-unit validation rejected candidate)"
+        return 1
+    fi
+    chmod 0600 "$preverify_file"
+    rm -f -- "$verify_unit"
+    rmdir -- "$verify_dir" 2>/dev/null || true
+    transaction_copy "$destination" ssh-systemd-early-safety
+    if ! install_managed_file "$destination" 0644 < "$stage"; then
+        rm -f -- "$stage"
+        rollback_early_ssh_dropin "$destination" "UMask-only drop-in installation failed" "$was_active"
+        return 1
+    fi
+    rm -f -- "$stage"
+    if ! systemd_verify_unit "$SSH_SERVICE" > "$postverify_file" 2>&1; then
+        rollback_early_ssh_dropin "$destination" "installed merged SSH unit validation failed" "$was_active"
+        return 1
+    fi
+    chmod 0600 "$postverify_file"
+    if ! "$SSHD_BIN" -t >/dev/null 2>&1; then
+        rollback_early_ssh_dropin "$destination" "sshd -t rejected the migrated configuration" "$was_active"
+        return 1
+    fi
+    if ! run_streamed systemctl daemon-reload; then
+        rollback_early_ssh_dropin "$destination" "systemd daemon-reload failed after SSH migration" "$was_active"
+        return 1
+    fi
+    if [[ "$was_active" -eq 1 ]]; then
+        if ! run_streamed systemctl reload "$SSH_SERVICE" || ! systemd_service_health_check "$SSH_SERVICE"; then
+            rollback_early_ssh_dropin "$destination" "SSH reload/health validation failed after early migration" "$was_active"
+            return 1
+        fi
+    fi
+    SSH_SYSTEMD_EARLY_MIGRATED=1
+    if [[ "$was_active" -eq 1 && "$runtime_legacy" -eq 1 ]]; then
+        SSH_SYSTEMD_LEGACY_RUNTIME=1
+        REBOOT_REQUIRED=1
+        SSH_SYSTEMD_SAFETY_STATUS="MIGRATED/PENDING REBOOT (running SSH may retain legacy PrivateTmp namespace; observed PrivateTmp=${runtime_private_tmp:-unknown})"
+        log WARN "The managed SSH drop-in is now UMask-only, but the running daemon may retain its legacy PrivateTmp namespace; SSH was not restarted and controlled reboot convergence is required"
+    else
+        SSH_SYSTEMD_SAFETY_STATUS="OK (migrated early to UMask-only; SSH reloaded without restart)"
+    fi
+    record_change "Migrated the managed SSH systemd drop-in to UMask=0027 only before package upgrade; merged unit and sshd validated, SSH reload-only policy enforced"
+    return 0
+}
+
 supported_ssh_list() {
     local query="$1"
     shift
@@ -4759,6 +4951,8 @@ harden_systemd_services() {
         {
             printf 'systemd hardening exposure report\n'
             printf 'Generated: %s\n\n' "$(timestamp)"
+            printf 'SSH early safety status: %s\n' "$SSH_SYSTEMD_SAFETY_STATUS"
+            printf 'needrestart protection: %s\n\n' "$NEEDRESTART_STATUS"
         } > "$SYSTEMD_HARDENING_REPORT"
         chmod 0600 "$SYSTEMD_HARDENING_REPORT"
     else
@@ -6351,6 +6545,8 @@ Fail2ban           : ${FAIL2BAN_STATUS}
 Remote Logging     : ${REMOTE_LOG_STATUS}
 Automatic Updates  : ${UPDATES_STATUS}
 Package upgrade    : ${PACKAGE_UPGRADE_STATUS}
+needrestart        : ${NEEDRESTART_STATUS}
+needrestart report : $([[ "$MODE" == "apply" ]] && printf '%s' "$NEEDRESTART_REPORT" || printf 'not written in dry-run')
 Residual configs   : ${RESIDUAL_PURGE_STATUS}
 rp_filter Policy   : ${RP_FILTER_POLICY}
 rp_filter Runtime  : ${RP_FILTER_RUNTIME_STATUS}
@@ -6379,6 +6575,7 @@ Services hardened  : ${SERVICES_HARDENED[*]:-none}
 Service exposure   :
 ${service_exposure_lines}
 Exposure report    : $([[ "$MODE" == "apply" ]] && printf '%s' "$SYSTEMD_HARDENING_REPORT" || printf 'planned')
+SSH systemd safety : ${SSH_SYSTEMD_SAFETY_STATUS}
 Failed services    : ${failed}
 Rollbacks          : ${ROLLBACKS[*]:-none}
 Reboot required    : ${reboot}
@@ -6426,6 +6623,10 @@ main() {
 
     phase 03 18 "Package Security"
     log WARN "Phase 03 installs and configures security packages and may legitimately take several minutes on a fresh server; package operations are not subject to artificial timeouts"
+    detect_ssh_context
+    enable_needrestart_list_only
+    migrate_legacy_ssh_private_tmp_early \
+        || die "Early SSH PrivateTmp safety migration failed; refusing to begin package upgrades"
     refresh_apt_metadata
     upgrade_packages_safely
     prepare_packages
@@ -6433,7 +6634,7 @@ main() {
     configure_updates
     configure_debsums
     purge_removed_packages
-    detect_ssh_context
+    report_needrestart_pending
 
     phase 04 18 "Logging"
     configure_banners
@@ -6479,6 +6680,7 @@ main() {
     harden_systemd_services
     verify_disabled_services
     purge_removed_packages "final post-package-change"
+    report_needrestart_pending
 
     phase 12 18 "AppArmor"
     configure_apparmor

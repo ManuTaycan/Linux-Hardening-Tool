@@ -19,9 +19,13 @@ für 1.1.3 wird erst nach dem vollständigen Zielsystemtest erstellt.
 - SSH's managed service drop-in now migrates from `PrivateTmp` plus `UMask` to
   `UMask=0027` only. A target diagnosis confirmed that a restarted ssh.service
   can leave an older session in a stale private `/tmp` mount namespace. The
-  migration validates the merged unit and `sshd -t`, reloads (never restarts)
-  SSH, and retains this session-safety correction even when its exposure score
-  is unchanged.
+  migration now runs immediately after Phase 02 backup and before every Phase
+  03 package change, validates the merged unit and `sshd -t`, reloads (never
+  restarts) SSH, and retains this session-safety correction even when its
+  exposure score is unchanged. The officially supported needrestart list-only
+  mode defers all package-hook restarts for the hardening process, records
+  pending services, and requires controlled reboot convergence when an active
+  legacy SSH PrivateTmp namespace or pending service remains.
 - Ubuntu target-test follow-up: Phase 03 now performs one controlled
   `apt-get upgrade` only after `apt-get check` and a locale-stable simulation;
   removals and downgrade signals block the operation, conffiles use conservative

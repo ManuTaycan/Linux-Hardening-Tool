@@ -978,6 +978,7 @@ case "${1:-}" in
         ;;
     -y)
         [[ "${PACKAGE_UPGRADE_TEST_CASE:-}" == upgrades ]] || exit 64
+        [[ "${NEEDRESTART_MODE:-}" == l ]] || exit 65
         ;;
     *) exit 64 ;;
 esac
@@ -1008,15 +1009,20 @@ EOF
             [[ "$REBOOT_REQUIRED" -eq 1 && "$PACKAGE_UPGRADE_STATUS" == "OK (upgraded; reboot required)" ]]
         ' _ "$repo_root" "$case_root" || fail "package upgrade reboot marker regression failed"
 
-    local main_section refresh_line upgrade_line prepare_line backup_line update_count
+    local main_section detect_line guard_line migration_line refresh_line upgrade_line prepare_line backup_line update_count
     main_section="$(sed -n '/^main()/,$p' "$repo_root/harden.sh")"
+    detect_line="$(awk '/^[[:space:]]*detect_ssh_context[[:space:]]*$/ { print NR; exit }' <<<"$main_section")"
+    guard_line="$(awk '/^[[:space:]]*enable_needrestart_list_only[[:space:]]*$/ { print NR; exit }' <<<"$main_section")"
+    migration_line="$(awk '/^[[:space:]]*migrate_legacy_ssh_private_tmp_early/ { print NR; exit }' <<<"$main_section")"
     refresh_line="$(awk '/^[[:space:]]*refresh_apt_metadata[[:space:]]*$/ { print NR; exit }' <<<"$main_section")"
     upgrade_line="$(awk '/^[[:space:]]*upgrade_packages_safely[[:space:]]*$/ { print NR; exit }' <<<"$main_section")"
     prepare_line="$(awk '/^[[:space:]]*prepare_packages[[:space:]]*$/ { print NR; exit }' <<<"$main_section")"
     backup_line="$(awk '/^[[:space:]]*backup_config[[:space:]]*$/ { print NR; exit }' <<<"$main_section")"
     update_count="$(awk '!/^[[:space:]]*#/ && /run_streamed[[:space:]].*apt-get update/ {count++} END {print count+0}' "$repo_root/harden.sh")"
-    [[ "$update_count" == 1 && "$backup_line" -lt "$refresh_line" && "$refresh_line" -lt "$upgrade_line" && "$upgrade_line" -lt "$prepare_line" ]] \
-        || fail "Phase 03 APT refresh/upgrade/package-install order or single-update invariant regressed"
+    [[ "$update_count" == 1 && "$backup_line" -lt "$detect_line" && "$detect_line" -lt "$guard_line" \
+        && "$guard_line" -lt "$migration_line" && "$migration_line" -lt "$refresh_line" \
+        && "$refresh_line" -lt "$upgrade_line" && "$upgrade_line" -lt "$prepare_line" ]] \
+        || fail "backup/early-SSH/needrestart/APT/package-install order or single-update invariant regressed"
 
     : > "$apt_log"
     env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 PACKAGE_UPGRADE_APT_LOG="$apt_log" bash -c '
@@ -1024,6 +1030,25 @@ EOF
         MODE=dry-run; log() { printf "%s\n" "$*"; }; refresh_apt_metadata; upgrade_packages_safely
         [[ ! -s "$PACKAGE_UPGRADE_APT_LOG" && "$PACKAGE_UPGRADE_STATUS" == PLANNED* ]]
     ' _ "$repo_root" || fail "Phase 03 APT dry-run performed a package operation"
+
+    cat > "$mock_bin/needrestart" <<'EOF'
+#!/usr/bin/env bash
+[[ "${NEEDRESTART_MODE:-}" == l && "$*" == *"-b"* && "$*" == *"-r l"* ]] || exit 66
+printf 'NEEDRESTART-VER: 3.11\n'
+printf 'NEEDRESTART-SVC: ssh.service\n'
+printf 'NEEDRESTART-SVC: tailscaled.service\n'
+EOF
+    chmod +x "$mock_bin/needrestart"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_NEEDRESTART_REPORT="$case_root/needrestart-report.txt" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        MODE=apply; BACKUP_DIR="$2"; CHANGE_LOG="$2/needrestart-changes"; : > "$CHANGE_LOG"; REBOOT_REQUIRED=0
+        enable_needrestart_list_only
+        report_needrestart_pending
+        [[ "$NEEDRESTART_MODE" == l && "$REBOOT_REQUIRED" -eq 1 ]]
+        [[ "$NEEDRESTART_STATUS" == PENDING* ]]
+        grep -Fq "NEEDRESTART-SVC: ssh.service" "$NEEDRESTART_REPORT"
+        grep -Fq "NEEDRESTART-SVC: tailscaled.service" "$NEEDRESTART_REPORT"
+    ' _ "$repo_root" "$case_root" || fail "needrestart list-only critical-service pending report regression failed"
 }
 
 run_residual_purge_tests() {
@@ -1570,6 +1595,66 @@ EOF
         grep -Fq "already hardened/unchanged" "$SYSTEMD_HARDENING_REPORT"
     ' _ "$repo_root" "$case_root" || fail "converged systemd drop-in caused a restart or rewrite"
 
+    env HARDEN_SOURCE_ONLY=1 HARDEN_SYSTEMD_DIR="$case_root/early-ssh-systemd" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        test_dir="$2"; MODE=apply; SSH_SERVICE=ssh.service; SSHD_BIN=/bin/true; BACKUP_DIR="$test_dir/early-ssh-backup"; CHANGE_LOG="$test_dir/early-ssh-changes"; : > "$CHANGE_LOG"; mkdir -p "$BACKUP_DIR" "$HARDEN_SYSTEMD_DIR/ssh.service.d"; : > "$test_dir/early-ssh-commands"; REBOOT_REQUIRED=0
+        printf "[Service]\\nPrivateTmp=yes\\nUMask=0027\\n" > "$HARDEN_SYSTEMD_DIR/ssh.service.d/99-hardening.conf"
+        systemctl() { printf "%s " "$@" >> "$test_dir/early-ssh-commands"; printf "\\n" >> "$test_dir/early-ssh-commands"; case "${1:-} ${2:-}" in "is-active --quiet") return 0 ;; "show ssh.service") printf "yes\\n" ;; cat*) printf "[Service]\\nExecStart=/bin/true\\n" ;; esac; return 0; }; systemd_verify_unit() { return 0; }
+        transaction_copy() { cp -- "$1" "$test_dir/early-ssh-original"; }; transaction_restore() { cp -- "$test_dir/early-ssh-original" "$1"; }
+        install_managed_file() { local destination="$1" mode="$2"; mkdir -p -- "$(dirname -- "$destination")"; cat > "$destination"; chmod "$mode" "$destination"; }; run_streamed() { "$@"; }
+        migrate_legacy_ssh_private_tmp_early
+        grep -Fxq "UMask=0027" "$HARDEN_SYSTEMD_DIR/ssh.service.d/99-hardening.conf"
+        ! grep -Fq "PrivateTmp" "$HARDEN_SYSTEMD_DIR/ssh.service.d/99-hardening.conf"
+        grep -Fq "reload ssh.service" "$test_dir/early-ssh-commands"
+        ! grep -Fq "restart ssh.service" "$test_dir/early-ssh-commands"
+        [[ "$SSH_SYSTEMD_EARLY_MIGRATED" -eq 1 && "$SSH_SYSTEMD_LEGACY_RUNTIME" -eq 1 && "$REBOOT_REQUIRED" -eq 1 ]]
+        [[ "$SSH_SYSTEMD_SAFETY_STATUS" == "MIGRATED/PENDING REBOOT"* ]]
+    ' _ "$repo_root" "$case_root" || fail "early legacy SSH migration/reboot convergence regression failed"
+
+    env HARDEN_SOURCE_ONLY=1 HARDEN_SYSTEMD_DIR="$case_root/early-ssh-current-systemd" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        test_dir="$2"; MODE=apply; SSH_SERVICE=ssh.service; SSHD_BIN=/bin/true; BACKUP_DIR="$test_dir/early-ssh-current-backup"; CHANGE_LOG="$test_dir/early-ssh-current-changes"; : > "$CHANGE_LOG"; mkdir -p "$BACKUP_DIR" "$HARDEN_SYSTEMD_DIR/ssh.service.d"; : > "$test_dir/early-ssh-current-commands"; REBOOT_REQUIRED=0
+        printf "[Service]\\nUMask=0027\\n" > "$HARDEN_SYSTEMD_DIR/ssh.service.d/99-hardening.conf"
+        systemctl() { printf "%s " "$@" >> "$test_dir/early-ssh-current-commands"; printf "\\n" >> "$test_dir/early-ssh-current-commands"; return 0; }
+        migrate_legacy_ssh_private_tmp_early
+        [[ "$SSH_SYSTEMD_SAFETY_STATUS" == "OK (already UMask-only; no reload required)" ]]
+        [[ ! -s "$test_dir/early-ssh-current-commands" && "$REBOOT_REQUIRED" -eq 0 ]]
+    ' _ "$repo_root" "$case_root" || fail "fresh UMask-only SSH state performed an unnecessary reload"
+
+    env HARDEN_SOURCE_ONLY=1 HARDEN_SYSTEMD_DIR="$case_root/early-ssh-reload-failure-systemd" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        test_dir="$2"; MODE=apply; SSH_SERVICE=ssh.service; SSHD_BIN=/bin/true; BACKUP_DIR="$test_dir/early-ssh-reload-failure-backup"; CHANGE_LOG="$test_dir/early-ssh-reload-failure-changes"; : > "$CHANGE_LOG"; mkdir -p "$BACKUP_DIR" "$HARDEN_SYSTEMD_DIR/ssh.service.d"; : > "$test_dir/early-ssh-reload-failure-commands"
+        printf "[Service]\\nPrivateTmp=yes\\nUMask=0027\\n" > "$HARDEN_SYSTEMD_DIR/ssh.service.d/99-hardening.conf"
+        systemctl() { printf "%s " "$@" >> "$test_dir/early-ssh-reload-failure-commands"; printf "\\n" >> "$test_dir/early-ssh-reload-failure-commands"; case "${1:-} ${2:-}" in "is-active --quiet") return 0 ;; "show ssh.service") printf "yes\\n" ;; cat*) printf "[Service]\\nExecStart=/bin/true\\n" ;; "reload ssh.service") return 1 ;; esac; return 0; }; systemd_verify_unit() { return 0; }
+        transaction_copy() { cp -- "$1" "$test_dir/early-ssh-reload-failure-original"; }; transaction_restore() { cp -- "$test_dir/early-ssh-reload-failure-original" "$1"; }
+        install_managed_file() { local destination="$1" mode="$2"; mkdir -p -- "$(dirname -- "$destination")"; cat > "$destination"; chmod "$mode" "$destination"; }; run_streamed() { "$@"; }
+        ! migrate_legacy_ssh_private_tmp_early
+        grep -Fq "PrivateTmp=yes" "$HARDEN_SYSTEMD_DIR/ssh.service.d/99-hardening.conf"
+        ! grep -Fq "restart ssh.service" "$test_dir/early-ssh-reload-failure-commands"
+        [[ "$SSH_SYSTEMD_SAFETY_STATUS" == FAILED/ROLLED\ BACK* ]]
+    ' _ "$repo_root" "$case_root" || fail "early SSH reload failure did not roll back without restart"
+
+    cat > "$case_root/sshd-second-check-fails" <<'EOF'
+#!/usr/bin/env bash
+count="$(cat "$SSH_TEST_CHECK_COUNT" 2>/dev/null || printf 0)"
+count=$((count + 1))
+printf '%s\n' "$count" > "$SSH_TEST_CHECK_COUNT"
+[[ "$count" -ne 2 ]]
+EOF
+    chmod +x "$case_root/sshd-second-check-fails"
+    env HARDEN_SOURCE_ONLY=1 HARDEN_SYSTEMD_DIR="$case_root/early-ssh-sshd-failure-systemd" SSH_TEST_CHECK_COUNT="$case_root/sshd-check-count" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        test_dir="$2"; MODE=apply; SSH_SERVICE=ssh.service; SSHD_BIN="$test_dir/sshd-second-check-fails"; BACKUP_DIR="$test_dir/early-ssh-sshd-failure-backup"; CHANGE_LOG="$test_dir/early-ssh-sshd-failure-changes"; : > "$CHANGE_LOG"; mkdir -p "$BACKUP_DIR" "$HARDEN_SYSTEMD_DIR/ssh.service.d"; : > "$test_dir/early-ssh-sshd-failure-commands"
+        printf "[Service]\\nPrivateTmp=yes\\nUMask=0027\\n" > "$HARDEN_SYSTEMD_DIR/ssh.service.d/99-hardening.conf"
+        systemctl() { printf "%s " "$@" >> "$test_dir/early-ssh-sshd-failure-commands"; printf "\\n" >> "$test_dir/early-ssh-sshd-failure-commands"; case "${1:-} ${2:-}" in "is-active --quiet") return 0 ;; "show ssh.service") printf "yes\\n" ;; cat*) printf "[Service]\\nExecStart=/bin/true\\n" ;; esac; return 0; }; systemd_verify_unit() { return 0; }
+        transaction_copy() { cp -- "$1" "$test_dir/early-ssh-sshd-failure-original"; }; transaction_restore() { cp -- "$test_dir/early-ssh-sshd-failure-original" "$1"; }
+        install_managed_file() { local destination="$1" mode="$2"; mkdir -p -- "$(dirname -- "$destination")"; cat > "$destination"; chmod "$mode" "$destination"; }; run_streamed() { "$@"; }
+        ! migrate_legacy_ssh_private_tmp_early
+        grep -Fq "PrivateTmp=yes" "$HARDEN_SYSTEMD_DIR/ssh.service.d/99-hardening.conf"
+        ! grep -Fq "restart ssh.service" "$test_dir/early-ssh-sshd-failure-commands"
+        [[ "$SSH_SYSTEMD_SAFETY_STATUS" == FAILED/ROLLED\ BACK* ]]
+    ' _ "$repo_root" "$case_root" || fail "early SSH sshd -t failure did not roll back safely"
+
     env HARDEN_SOURCE_ONLY=1 HARDEN_SYSTEMD_DIR="$case_root/ssh-migration-systemd" HARDEN_SYSTEMD_HARDENING_REPORT="$case_root/ssh-migration-report" bash -c '
         source "$1/harden.sh"; trap - ERR EXIT
         test_dir="$2"; MODE=apply; SSH_SERVICE=ssh.service; SSHD_BIN=/bin/true; BACKUP_DIR="$test_dir/ssh-migration-backup"; CHANGE_LOG="$test_dir/ssh-migration-changes"; : > "$CHANGE_LOG"; mkdir -p "$BACKUP_DIR" "$HARDEN_SYSTEMD_DIR/ssh.service.d"; : > "$SYSTEMD_HARDENING_REPORT"; : > "$test_dir/ssh-migration-commands"
@@ -1794,7 +1879,7 @@ EOF
         upgrade_section="$(sed -n "/^upgrade_packages_safely()/,/^}/p" "$1/harden.sh")"
         grep -Fq "reboot_marker=\"\${HARDEN_REBOOT_REQUIRED_FILE:-/var/run/reboot-required}\"" <<<"$upgrade_section"
         grep -Fq "PACKAGE_UPGRADE_STATUS=\"OK (upgraded; reboot required)\"" <<<"$upgrade_section"
-        [[ "$(grep -Fc "REBOOT_REQUIRED=1" "$1/harden.sh")" == 5 ]]
+        [[ "$(grep -Fc "REBOOT_REQUIRED=1" "$1/harden.sh")" == 7 ]]
     ' _ "$repo_root" || fail "initramfs/GRUB/reboot-required change gating regressed"
 }
 
