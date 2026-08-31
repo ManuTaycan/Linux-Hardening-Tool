@@ -1476,7 +1476,10 @@ EOF
         grep -Fq "INITRAMFS_POLICY_CHANGED" <<<"$kernel_section"
         grep -Fq "Managed module policy is unchanged" <<<"$kernel_section"
         grep -Fq "grub_config_changed" <<<"$grub_section"
-        [[ "$(grep -Fc "REBOOT_REQUIRED=1" "$1/harden.sh")" == 4 ]]
+        upgrade_section="$(sed -n "/^upgrade_packages_safely()/,/^}/p" "$1/harden.sh")"
+        grep -Fq "reboot_marker=\"\${HARDEN_REBOOT_REQUIRED_FILE:-/var/run/reboot-required}\"" <<<"$upgrade_section"
+        grep -Fq "PACKAGE_UPGRADE_STATUS=\"OK (upgraded; reboot required)\"" <<<"$upgrade_section"
+        [[ "$(grep -Fc "REBOOT_REQUIRED=1" "$1/harden.sh")" == 5 ]]
     ' _ "$repo_root" || fail "initramfs/GRUB/reboot-required change gating regressed"
 }
 
