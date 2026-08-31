@@ -870,6 +870,129 @@ EOF
         ' _ "$repo_root" "$case_root/backup" || fail "Fail2ban readiness/runtime verification failed"
 }
 
+run_fail2ban_configuration_tests() {
+    local case_root="$test_root/fail2ban-configuration"
+    install -d "$case_root"
+    env HARDEN_SOURCE_ONLY=1 HARDEN_FAIL2BAN_DIR="$case_root/etc/fail2ban" \
+        HARDEN_FAIL2BAN_READINESS_DELAY=0 bash -c '
+            source "$1/harden.sh"
+            trap - ERR EXIT
+            test_dir="$2"; MODE=apply; SSH_SERVICE=ssh.service; SSH_PORT=22
+            FAIL2BAN_TEST_READY_AFTER=1; FAIL2BAN_TEST_VALIDATE=ok
+            install -d "$HARDEN_FAIL2BAN_DIR/jail.d"
+            : > "$test_dir/commands"; printf active > "$test_dir/state"; : > "$test_dir/readiness"
+            systemctl() {
+                printf "%s " "$@" >> "$test_dir/commands"; printf "\n" >> "$test_dir/commands"
+                case "${1:-}" in
+                    is-active) [[ "${2:-}" == --quiet && "${3:-}" == fail2ban.service && "$(cat "$test_dir/state")" == active ]] ;;
+                    restart)
+                        [[ "${2:-}" == fail2ban.service ]] || return 1
+                        if [[ "$FAIL2BAN_TEST_RESTART_FAIL_ONCE" == 1 && ! -e "$test_dir/restart-failed" ]]; then
+                            : > "$test_dir/restart-failed"; return 1
+                        fi
+                        printf active > "$test_dir/state"
+                        ;;
+                    enable) [[ "${2:-}" == --now && "${3:-}" == fail2ban.service ]] && printf active > "$test_dir/state" ;;
+                    stop) [[ "${2:-}" == fail2ban.service ]] && printf inactive > "$test_dir/state" ;;
+                    *) return 0 ;;
+                esac
+            }
+            fail2ban-client() {
+                case "${1:-}" in
+                    -t) [[ "$FAIL2BAN_TEST_VALIDATE" == ok ]] ;;
+                    ping)
+                        count="$(cat "$test_dir/readiness")"; count=$((count + 1)); printf "%s" "$count" > "$test_dir/readiness"
+                        [[ "$count" -ge "$FAIL2BAN_TEST_READY_AFTER" ]] && { printf "Server replied: pong\n"; return 0; }
+                        return 1
+                        ;;
+                    status)
+                        [[ "$(cat "$test_dir/readiness")" -ge "$FAIL2BAN_TEST_READY_AFTER" ]] && { printf "Status for the jail: sshd\n"; return 0; }
+                        return 1
+                        ;;
+                    *) return 1 ;;
+                esac
+            }
+            install_managed_file() {
+                local destination="$1" mode="$2" temporary
+                MANAGED_FILE_CHANGED=0; temporary="$(mktemp)" || return 1
+                cat > "$temporary" || { rm -f -- "$temporary"; return 1; }
+                install -d "$(dirname -- "$destination")" || { rm -f -- "$temporary"; return 1; }
+                if [[ -f "$destination" ]] && cmp -s "$temporary" "$destination"; then rm -f -- "$temporary"; return 0; fi
+                install -m "$mode" "$temporary" "$destination" && MANAGED_FILE_CHANGED=1
+                rm -f -- "$temporary"
+            }
+            transaction_copy() {
+                local source="$1" label="$2" target=""
+                target="$BACKUP_DIR/transactions/$label"
+                mkdir -p "$(dirname -- "$target")"
+                if [[ -e "$source" ]]; then cp -- "$source" "$target"; else : > "${target}.absent"; fi
+            }
+            transaction_restore() {
+                local destination="$1" label="$2" saved=""
+                saved="$BACKUP_DIR/transactions/$label"
+                if [[ -e "${saved}.absent" ]]; then rm -f -- "$destination"; elif [[ -e "$saved" ]]; then cp -- "$saved" "$destination"; fi
+            }
+            reset_case() {
+                local label="$1"
+                BACKUP_DIR="$test_dir/$label-backup"; CHANGE_LOG="$test_dir/$label-changes"; mkdir -p "$BACKUP_DIR"; : > "$CHANGE_LOG"
+                printf active > "$test_dir/state"; : > "$test_dir/commands"; : > "$test_dir/readiness"; rm -f -- "$test_dir/restart-failed"
+                FAIL2BAN_TEST_READY_AFTER=1; FAIL2BAN_TEST_VALIDATE=ok; FAIL2BAN_TEST_RESTART_FAIL_ONCE=0; FAIL2BAN_STATUS=""
+            }
+            make_current() {
+                reset_case prepare
+                configure_fail2ban
+                [[ "$FAIL2BAN_STATUS" == OK ]]
+            }
+            command_count() { grep -Ec "^$1 " "$test_dir/commands" || true; }
+
+            make_current
+            reset_case converged
+            configure_fail2ban
+            [[ "$FAIL2BAN_STATUS" == OK ]]
+            [[ "$(command_count restart)" == 0 && "$(command_count enable)" == 0 ]]
+
+            printf "# changed\n" > "$HARDEN_FAIL2BAN_DIR/jail.local"
+            reset_case changed
+            FAIL2BAN_TEST_READY_AFTER=2
+            configure_fail2ban
+            [[ "$FAIL2BAN_STATUS" == OK && "$FAIL2BAN_READINESS_ATTEMPTS" == 2 ]]
+            [[ "$(command_count restart)" == 1 && "$(command_count enable)" == 0 ]]
+
+            make_current
+            reset_case inactive
+            printf inactive > "$test_dir/state"
+            configure_fail2ban
+            [[ "$FAIL2BAN_STATUS" == OK ]]
+            [[ "$(command_count enable)" == 1 && "$(command_count restart)" == 0 ]]
+
+            make_current
+            reset_case unhealthy
+            FAIL2BAN_TEST_READY_AFTER=99
+            configure_fail2ban
+            [[ "$FAIL2BAN_STATUS" == FAILED ]]
+            [[ "$(command_count restart)" == 1 && "$(command_count enable)" == 0 ]]
+
+            make_current
+            printf "# pre-existing local configuration\n" > "$HARDEN_FAIL2BAN_DIR/jail.local"
+            cp "$HARDEN_FAIL2BAN_DIR/jail.local" "$test_dir/pre-failure-jail.local"
+            reset_case rollback
+            FAIL2BAN_TEST_VALIDATE=failed
+            configure_fail2ban
+            [[ "$FAIL2BAN_STATUS" == FAILED/ROLLED\ BACK ]]
+            cmp -s "$test_dir/pre-failure-jail.local" "$HARDEN_FAIL2BAN_DIR/jail.local"
+            [[ "$(command_count restart)" == 0 && "$(command_count enable)" == 0 ]]
+
+            make_current
+            printf "# pre-existing restart rollback configuration\n" > "$HARDEN_FAIL2BAN_DIR/jail.local"
+            cp "$HARDEN_FAIL2BAN_DIR/jail.local" "$test_dir/pre-restart-failure-jail.local"
+            reset_case restart-rollback
+            FAIL2BAN_TEST_RESTART_FAIL_ONCE=1
+            configure_fail2ban
+            [[ "$FAIL2BAN_STATUS" == FAILED/ROLLED\ BACK ]]
+            cmp -s "$test_dir/pre-restart-failure-jail.local" "$HARDEN_FAIL2BAN_DIR/jail.local"
+        ' _ "$repo_root" "$case_root" || fail "Fail2ban configuration idempotency/recovery regression failed"
+}
+
 run_packagekit_tests() {
     local case_root="$test_root/packagekit" mock_bin="$test_root/packagekit/bin"
     local apt_log="$test_root/packagekit/apt.log"
@@ -3004,6 +3127,7 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
     new-findings)
         run_lynis_summary_tests
         run_fail2ban_tests
+        run_fail2ban_configuration_tests
         run_packagekit_tests
         run_package_upgrade_tests
         run_residual_purge_tests
@@ -3025,6 +3149,7 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
         run_kernel_gate_test
         run_lynis_summary_tests
         run_fail2ban_tests
+        run_fail2ban_configuration_tests
         run_packagekit_tests
         run_package_upgrade_tests
         run_residual_purge_tests

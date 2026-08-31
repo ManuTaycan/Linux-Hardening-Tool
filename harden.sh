@@ -3433,11 +3433,21 @@ configure_fail2ban() {
         FAIL2BAN_STATUS="NOT AVAILABLE"
         return 0
     fi
-    local banaction="nftables-multiport"
-    [[ -f /etc/fail2ban/action.d/nftables-multiport.conf ]] || banaction="nftables"
-    transaction_copy /etc/fail2ban/jail.local fail2ban-global.local
-    transaction_copy /etc/fail2ban/jail.d/99-sshd-hardening.local fail2ban-jail.local
-    install_managed_file /etc/fail2ban/jail.local 0640 <<EOF
+    local fail2ban_dir="${HARDEN_FAIL2BAN_DIR:-/etc/fail2ban}"
+    local global_config="${fail2ban_dir}/jail.local" jail_config="${fail2ban_dir}/jail.d/99-sshd-hardening.local"
+    local global_candidate="" jail_candidate="" banaction="nftables-multiport"
+    local global_changed=0 jail_changed=0 config_changed=0 was_active=0 service_mutation_ok=1
+    [[ -f "${fail2ban_dir}/action.d/nftables-multiport.conf" ]] || banaction="nftables"
+
+    if [[ "$MODE" == "dry-run" ]]; then
+        log INFO "Would compare and, only if needed, update Fail2ban jail.local and SSH jail configuration"
+        log INFO "Would validate Fail2ban configuration before controlled activation or recovery"
+        FAIL2BAN_STATUS="PLANNED"
+        return 0
+    fi
+    global_candidate="$(mktemp)" || { FAIL2BAN_STATUS="FAILED"; return 1; }
+    jail_candidate="$(mktemp)" || { rm -f -- "$global_candidate"; FAIL2BAN_STATUS="FAILED"; return 1; }
+    cat > "$global_candidate" <<EOF
 # Managed by harden.sh. Site-wide update-safe overrides; vendor jail.conf is unchanged.
 [DEFAULT]
 backend = systemd
@@ -3449,7 +3459,7 @@ bantime.increment = true
 bantime.factor = 2
 bantime.maxtime = 1w
 EOF
-    install_managed_file /etc/fail2ban/jail.d/99-sshd-hardening.local 0640 <<EOF
+    cat > "$jail_candidate" <<EOF
 # Managed by harden.sh. SSH-specific override.
 [sshd]
 enabled = true
@@ -3457,25 +3467,79 @@ port = ${SSH_PORT}
 mode = aggressive
 maxretry = 4
 EOF
-    if [[ "$MODE" == "dry-run" ]]; then
-        FAIL2BAN_STATUS="PLANNED"
+    [[ -f "$global_config" ]] && cmp -s "$global_candidate" "$global_config" || global_changed=1
+    [[ -f "$jail_config" ]] && cmp -s "$jail_candidate" "$jail_config" || jail_changed=1
+    ((global_changed || jail_changed)) && config_changed=1
+    systemctl is-active --quiet fail2ban.service && was_active=1
+
+    if [[ "$config_changed" -eq 0 && "$was_active" -eq 1 ]]; then
+        rm -f -- "$global_candidate" "$jail_candidate"
+        if verify_fail2ban_runtime 10; then
+            FAIL2BAN_STATUS="OK"
+            log OK "Fail2ban configuration is already current and healthy; no enable, reload, or restart was needed"
+            return 0
+        fi
+        log WARN "Fail2ban configuration is current but runtime health is degraded; attempting one controlled restart"
+        if run_streamed systemctl restart fail2ban.service && verify_fail2ban_runtime 10; then
+            FAIL2BAN_STATUS="OK"
+            record_change "Recovered current Fail2ban configuration with one controlled restart"
+            return 0
+        fi
+        FAIL2BAN_STATUS="FAILED"
+        record_skip "DEB-0880" "Fail2ban configuration is current but did not become ready after one controlled recovery; see ${BACKUP_DIR}/fail2ban-runtime.txt"
         return 0
     fi
-    if run_streamed fail2ban-client -t \
-        && run_streamed systemctl enable --now fail2ban.service \
-        && run_streamed systemctl restart fail2ban.service; then
-        if verify_fail2ban_runtime 10; then
-            record_change "Enabled and validated Fail2ban SSH jail using nftables"
+
+    if [[ "$config_changed" -eq 1 ]]; then
+        transaction_copy "$global_config" fail2ban-global.local
+        transaction_copy "$jail_config" fail2ban-jail.local
+        if { [[ "$global_changed" -eq 0 ]] || install_managed_file "$global_config" 0640 < "$global_candidate"; } \
+            && { [[ "$jail_changed" -eq 0 ]] || install_managed_file "$jail_config" 0640 < "$jail_candidate"; } \
+            && run_streamed fail2ban-client -t; then
+            :
         else
-            record_skip "DEB-0880" "Fail2ban started but its socket/sshd jail did not become verifiably ready; see ${BACKUP_DIR}/fail2ban-runtime.txt"
+            rm -f -- "$global_candidate" "$jail_candidate"
+            transaction_restore "$global_config" fail2ban-global.local
+            transaction_restore "$jail_config" fail2ban-jail.local
+            FAIL2BAN_STATUS="FAILED/ROLLED BACK"
+            log ROLLBACK "Fail2ban configuration write or validation failed; prior configuration restored"
+            return 0
         fi
-    else
-        transaction_restore /etc/fail2ban/jail.local fail2ban-global.local
-        transaction_restore /etc/fail2ban/jail.d/99-sshd-hardening.local fail2ban-jail.local
-        run_streamed systemctl restart fail2ban.service || true
-        FAIL2BAN_STATUS="FAILED/ROLLED BACK"
-        log ROLLBACK "Fail2ban configuration failed validation or startup"
+    elif ! run_streamed fail2ban-client -t; then
+        FAIL2BAN_STATUS="FAILED"
+        record_skip "DEB-0880" "Current Fail2ban configuration failed validation before controlled activation or recovery"
+        return 0
     fi
+    rm -f -- "$global_candidate" "$jail_candidate"
+    if [[ "$was_active" -eq 1 ]]; then
+        run_streamed systemctl restart fail2ban.service || service_mutation_ok=0
+    else
+        run_streamed systemctl enable --now fail2ban.service || service_mutation_ok=0
+    fi
+    if [[ "$service_mutation_ok" -eq 1 ]] && verify_fail2ban_runtime 10; then
+        FAIL2BAN_STATUS="OK"
+        if [[ "$config_changed" -eq 1 ]]; then
+            record_change "Updated and validated Fail2ban SSH jail using nftables"
+        else
+            record_change "Enabled and validated current Fail2ban SSH jail using nftables"
+        fi
+        return 0
+    fi
+    if [[ "$config_changed" -eq 1 ]]; then
+        transaction_restore "$global_config" fail2ban-global.local
+        transaction_restore "$jail_config" fail2ban-jail.local
+        if [[ "$was_active" -eq 1 ]]; then
+            run_streamed systemctl restart fail2ban.service || true
+        else
+            run_streamed systemctl stop fail2ban.service || true
+        fi
+        FAIL2BAN_STATUS="FAILED/ROLLED BACK"
+        log ROLLBACK "Fail2ban did not become ready; prior configuration and activation state were restored"
+    else
+        FAIL2BAN_STATUS="FAILED"
+        record_skip "DEB-0880" "Fail2ban was enabled but its socket/sshd jail did not become verifiably ready; see ${BACKUP_DIR}/fail2ban-runtime.txt"
+    fi
+    return 0
 }
 
 failed_login_lastb_available() {
