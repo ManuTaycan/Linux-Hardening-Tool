@@ -786,7 +786,7 @@ upgrade_packages_safely() {
 
 purge_removed_packages() {
     local stage="${1:-routine}" package status simulation removals remaining reason
-    local -a residual=() safe=() verified=() protected=() dependency_removals=()
+    local -a residual=() safe=() verified=() protected=() dependency_removals=() simulated_removals=()
     declare -A requested=()
     mapfile -t residual < <(dpkg-query -W -f='${binary:Package}\t${Status}\n' 2>/dev/null | awk -F '\t' '$2 == "deinstall ok config-files" {print $1}')
     if ((${#residual[@]} == 0)); then
@@ -836,7 +836,9 @@ purge_removed_packages() {
         record_skip "PKGS-7346" "APT simulation included a protected dependency; nothing was purged"
         return 0
     fi
-    for package in $removals; do
+    mapfile -t simulated_removals <<<"$removals"
+    for package in "${simulated_removals[@]}"; do
+        [[ -n "$package" ]] || continue
         [[ -n "${requested[$package]+requested}" ]] || dependency_removals+=("$package")
     done
     if ((${#dependency_removals[@]})); then
