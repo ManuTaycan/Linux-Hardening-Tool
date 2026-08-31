@@ -216,6 +216,26 @@ sichtbare akzeptierte Ausnahme; Tailscale-, SSH-, Fail2ban-, NAT- und
 Forwarding-Regeln sowie Automationspakete werden niemals zur Score-Optimierung
 gelöscht bzw. installiert.
 
+Bei verbliebenen `PKGS-7346`-Konfigurationen darf der finale Sweep nur
+eindeutig alte rc-Kernelpakete ohne installierten Eigentümer, `/boot`-Artefakt
+oder Boot-Symlink purgen. Auf UEFI darf rc-only `grub-pc` nur bei bestätigtem
+EFI-GRUB-Stack verschwinden; `grub2-common`, EFI-GRUB- und Shim-Pakete bleiben
+installiert. Vor und nach dem Apply daher gezielt prüfen:
+
+```bash
+uname -r
+dpkg-query -W -f='${binary:Package}\t${Status}\n' \
+  'linux-*' 'grub*' 'shim*' 2>/dev/null || true
+find /boot -maxdepth 1 -type f \( -name 'vmlinuz-*' -o -name 'initrd.img-*' -o -name 'System.map-*' -o -name 'config-*' \) -printf '%f\n' | sort
+test -d /sys/firmware/efi && find /boot/efi/EFI -type f -name '*.efi' -print
+sudo apt-get check
+```
+
+Ein Purge dieser reinen Konfigurationsreste darf weder den laufenden Kernel
+noch die aktuellen `/boot`-Artefakte ändern, `update-grub` auslösen oder für
+sich allein einen Reboot verlangen. Bei nicht eindeutiger Bootart oder
+Abhängigkeit muss `PKGS-7346` sichtbar bleiben.
+
 Nur auf einer nachweislich IPv6-unbenutzten Test-VM darf zusätzlich der
 explizite Opt-in geprüft werden:
 

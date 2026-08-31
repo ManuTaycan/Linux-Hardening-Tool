@@ -67,6 +67,7 @@ AIDE_STATUS="NOT RUN"
 FAIL2BAN_STATUS="NOT RUN"
 UPDATES_STATUS="NOT RUN"
 PACKAGE_UPGRADE_STATUS="NOT RUN"
+RESIDUAL_PURGE_STATUS="NOT RUN"
 FIREWALL_RULE_HYGIENE_STATUS="NOT RUN"
 REMOTE_LOG_STATUS="DISABLED"
 USE_COLOR=0
@@ -786,27 +787,174 @@ upgrade_packages_safely() {
     return 0
 }
 
+kernel_residual_version() {
+    local package="${1%%:*}" version=""
+    if [[ "$package" =~ ^linux-(image|image-unsigned|modules|modules-extra)-(.+)$ ]]; then
+        version="${BASH_REMATCH[2]}"
+    elif [[ "$package" =~ ^linux-main-modules-.+-([0-9]+(\.[0-9]+)+-[0-9]+-[[:alnum:].+~-]+)$ ]]; then
+        version="${BASH_REMATCH[1]}"
+    else
+        return 1
+    fi
+    [[ "$version" =~ ^[0-9]+(\.[0-9]+)+-[0-9]+-[[:alnum:].+~-]+$ ]] || return 1
+    printf '%s\n' "$version"
+}
+
+kernel_version_has_installed_package() {
+    local version="$1" inventory
+    inventory="$(dpkg-query -W -f='${binary:Package}\t${Status}\n' 2>/dev/null)" || return 2
+    awk -F '\t' -v version="$version" '
+            $2 == "install ok installed" {
+                package=$1
+                sub(/:[^:]+$/, "", package)
+                if (length(package) > length(version) && substr(package, length(package) - length(version)) == "-" version) {
+                    found=1
+                }
+            }
+            END { exit(found ? 0 : 1) }
+        ' <<<"$inventory"
+}
+
+kernel_residual_boot_artifacts_exist() {
+    local version="$1" boot_dir="${HARDEN_BOOT_DIR:-/boot}" artifact
+    [[ -d "$boot_dir" && -r "$boot_dir" ]] || return 2
+    for artifact in "${boot_dir}/vmlinuz-${version}" "${boot_dir}/initrd.img-${version}" \
+        "${boot_dir}/System.map-${version}" "${boot_dir}/config-${version}"; do
+        [[ -e "$artifact" || -L "$artifact" ]] && return 0
+    done
+    return 1
+}
+
+kernel_residual_is_boot_target() {
+    local version="$1" boot_dir="${HARDEN_BOOT_DIR:-/boot}" link target
+    local link_root="${HARDEN_BOOT_SYMLINK_DIR:-/}"
+    for link in "${link_root%/}/vmlinuz" "${link_root%/}/initrd.img" \
+        "${boot_dir}/vmlinuz" "${boot_dir}/initrd.img"; do
+        [[ -e "$link" || -L "$link" ]] || continue
+        target="$(readlink -f -- "$link" 2>/dev/null || true)"
+        [[ -n "$target" ]] || return 2
+        [[ "${target##*/}" == *-"${version}" ]] && return 0
+    done
+    return 1
+}
+
+efi_grub_stack_is_valid() {
+    local efi_runtime="${HARDEN_EFI_RUNTIME_DIR:-/sys/firmware/efi}"
+    local efi_boot_dir="${HARDEN_EFI_BOOT_DIR:-/boot/efi}"
+    local grub_dir="${HARDEN_GRUB_DIR:-/boot/grub}"
+    local efi_binary
+    [[ -d "$efi_runtime" && -f "${grub_dir}/grub.cfg" && -d "${efi_boot_dir}/EFI" ]] || return 1
+    efi_binary="$(find "${efi_boot_dir}/EFI" -type f -iname '*.efi' -print -quit 2>/dev/null || true)"
+    [[ -n "$efi_binary" ]] || return 1
+    dpkg-query -W -f='${binary:Package}\t${Status}\n' 2>/dev/null | \
+        awk -F '\t' '
+            $2 == "install ok installed" {
+                package=$1
+                sub(/:[^:]+$/, "", package)
+                if (package ~ /^grub-efi-(amd64|arm64|ia32)$/) found=1
+            }
+            END { exit(found ? 0 : 1) }
+        '
+}
+
+current_kernel_boot_manifest() {
+    local boot_dir="${HARDEN_BOOT_DIR:-/boot}" kernel="$1" artifact
+    for artifact in "${boot_dir}/vmlinuz-${kernel}" "${boot_dir}/initrd.img-${kernel}" \
+        "${boot_dir}/System.map-${kernel}" "${boot_dir}/config-${kernel}"; do
+        [[ -e "$artifact" || -L "$artifact" ]] || continue
+        sha256sum -- "$artifact" 2>/dev/null || return 1
+    done
+}
+
+residual_package_is_eligible() {
+    local package="$1" current_kernel="$2" version inspection_status
+    case "${package%%:*}" in
+        grub-pc)
+            if efi_grub_stack_is_valid; then
+                return 0
+            fi
+            printf '%s\n' "grub-pc residual retained: UEFI runtime, EFI GRUB packages, EFI boot files, or grub.cfg could not be verified"
+            return 1
+            ;;
+        linux-image-generic*|linux-generic*|linux-headers-generic*|linux-meta*|linux-signed-generic*)
+            printf '%s\n' "kernel meta package retained"
+            return 1
+            ;;
+        linux-image-*|linux-modules-*|linux-main-modules-*)
+            version="$(kernel_residual_version "$package" 2>/dev/null || true)"
+            if [[ -z "$version" ]]; then
+                printf '%s\n' "kernel package name/version is ambiguous"
+                return 1
+            fi
+            if [[ "$version" == "$current_kernel" ]]; then
+                printf '%s\n' "running kernel version ${version} is never purged"
+                return 1
+            fi
+            if kernel_version_has_installed_package "$version"; then
+                printf '%s\n' "an installed package still owns kernel version ${version}"
+                return 1
+            else
+                inspection_status=$?
+                if ((inspection_status != 1)); then
+                    printf '%s\n' "installed package inventory could not be inspected for kernel version ${version}"
+                    return 1
+                fi
+            fi
+            if kernel_residual_boot_artifacts_exist "$version"; then
+                printf '%s\n' "matching /boot artifact exists for kernel version ${version}"
+                return 1
+            else
+                inspection_status=$?
+                if ((inspection_status != 1)); then
+                    printf '%s\n' "/boot artifacts could not be inspected for kernel version ${version}"
+                    return 1
+                fi
+            fi
+            if kernel_residual_is_boot_target "$version"; then
+                printf '%s\n' "kernel version ${version} is referenced by a boot symlink"
+                return 1
+            else
+                inspection_status=$?
+                if ((inspection_status != 1)); then
+                    printf '%s\n' "boot symlink target could not be inspected for kernel version ${version}"
+                    return 1
+                fi
+            fi
+            return 0
+            ;;
+        linux-*|grub*|shim*|systemd*|openssh*|sudo*|tailscale*|nftables*|iptables*|netplan*|network-manager*|ifupdown*|cloud-init*)
+            printf '%s\n' "protected boot, kernel, SSH, network, or host-critical package"
+            return 1
+            ;;
+        *) return 0 ;;
+    esac
+}
+
 purge_removed_packages() {
-    local stage="${1:-routine}" package status simulation removals remaining reason
+    local stage="${1:-routine}" package status simulation removals remaining reason eligibility_reason
+    local current_kernel boot_manifest reboot_required_before validation_failed=0
     local -a residual=() safe=() verified=() protected=() dependency_removals=() simulated_removals=()
     declare -A requested=()
     mapfile -t residual < <(dpkg-query -W -f='${binary:Package}\t${Status}\n' 2>/dev/null | awk -F '\t' '$2 == "deinstall ok config-files" {print $1}')
     if ((${#residual[@]} == 0)); then
+        RESIDUAL_PURGE_STATUS="OK (no residual configurations)"
         log INFO "No residual package configurations found"
         return 0
     fi
+    current_kernel="$(uname -r)"
     for package in "${residual[@]}"; do
-        case "$package" in
-            linux-*|grub*|shim*|systemd*|openssh*|sudo*|tailscale*|nftables*|iptables*|netplan*|network-manager*|ifupdown*|cloud-init*)
-                protected+=("$package")
-                ;;
-            *) safe+=("$package") ;;
-        esac
+        eligibility_reason="$(residual_package_is_eligible "$package" "$current_kernel" 2>/dev/null || true)"
+        if [[ -n "$eligibility_reason" ]]; then
+            protected+=("${package}: ${eligibility_reason}")
+        else
+            safe+=("$package")
+        fi
     done
     if ((${#protected[@]})); then
-        record_skip "PKGS-7346" "protected residual boot/kernel/SSH/network package configurations were retained: ${protected[*]}"
+        record_skip "PKGS-7346" "protected or unverifiable residual configurations were retained: ${protected[*]}"
     fi
     if ((${#safe[@]} == 0)); then
+        RESIDUAL_PURGE_STATUS="OK (no safely purgeable residual configurations)"
         log INFO "No non-protected residual package configurations are eligible for purge"
         return 0
     fi
@@ -821,41 +969,73 @@ purge_removed_packages() {
     done
     safe=("${verified[@]}")
     if ((${#safe[@]} == 0)); then
+        RESIDUAL_PURGE_STATUS="OK (no twice-verified residual configurations)"
         log INFO "No twice-verified residual configurations remain eligible for purge"
         return 0
     fi
     if [[ "$MODE" == "dry-run" ]]; then
+        RESIDUAL_PURGE_STATUS="PLANNED (simulation only; no package changes)"
         log INFO "Would perform ${stage} residual-config simulation and purge only non-protected packages: ${safe[*]}"
         return 0
     fi
     for package in "${safe[@]}"; do requested["$package"]=1; done
     simulation="$(LC_ALL=C apt-get -s purge "${safe[@]}" 2>&1)" || {
+        RESIDUAL_PURGE_STATUS="REVIEW REQUIRED (APT simulation failed)"
         record_skip "PKGS-7346" "APT simulation failed; nothing was purged"
         return 0
     }
     removals="$(parse_apt_purge_packages <<<"$simulation")"
-    if grep -E '^(linux-|grub|shim|systemd|openssh|sudo|tailscale|nftables|iptables|netplan|network-manager|ifupdown|cloud-init)' <<<"$removals" >/dev/null; then
-        record_skip "PKGS-7346" "APT simulation included a protected dependency; nothing was purged"
-        return 0
-    fi
     mapfile -t simulated_removals <<<"$removals"
+    for package in "${safe[@]}"; do
+        if ! grep -Fxq "$package" <<<"$removals"; then
+            RESIDUAL_PURGE_STATUS="REVIEW REQUIRED (APT simulation did not confirm every requested purge)"
+            record_skip "PKGS-7346" "APT simulation did not explicitly confirm residual package ${package}; nothing was purged"
+            return 0
+        fi
+    done
     for package in "${simulated_removals[@]}"; do
         [[ -n "$package" ]] || continue
         [[ -n "${requested[$package]+requested}" ]] || dependency_removals+=("$package")
     done
     if ((${#dependency_removals[@]})); then
         printf -v reason '%s, ' "${dependency_removals[@]}"
+        RESIDUAL_PURGE_STATUS="REVIEW REQUIRED (APT simulation proposed unrequested removals)"
         record_skip "PKGS-7346" "APT simulation would purge unrequested package configurations: ${reason%, }; nothing was purged"
         return 0
     fi
+    boot_manifest="$(current_kernel_boot_manifest "$current_kernel")" || {
+        RESIDUAL_PURGE_STATUS="REVIEW REQUIRED (could not capture running-kernel /boot manifest)"
+        record_skip "PKGS-7346" "running-kernel /boot manifest could not be captured; nothing was purged"
+        return 0
+    }
+    reboot_required_before="$REBOOT_REQUIRED"
     if run_streamed env DEBIAN_FRONTEND=noninteractive apt-get purge -y "${safe[@]}"; then
         PACKAGES_REMOVED+=("${safe[@]}")
+        for package in "${safe[@]}"; do
+            status="$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)"
+            [[ "$status" == "deinstall ok config-files" ]] && validation_failed=1
+        done
+        [[ "$(uname -r)" == "$current_kernel" ]] || validation_failed=1
+        [[ "$(current_kernel_boot_manifest "$current_kernel")" == "$boot_manifest" ]] || validation_failed=1
+        for package in "${safe[@]}"; do
+            if [[ "${package%%:*}" == grub-pc ]] && ! efi_grub_stack_is_valid; then validation_failed=1; fi
+        done
+        if ! run_streamed apt-get check; then validation_failed=1; fi
+        if ((validation_failed)); then
+            RESIDUAL_PURGE_STATUS="FAILED/REVIEW REQUIRED (post-purge validation failed)"
+            record_skip "PKGS-7346" "post-purge validation failed; review dpkg status, APT health, running kernel, /boot, and EFI GRUB state before treating residual configurations as resolved"
+            return 1
+        fi
+        REBOOT_REQUIRED="$reboot_required_before"
+        RESIDUAL_PURGE_STATUS="OK (selected residual configurations purged and validated)"
         mapfile -t remaining < <(dpkg-query -W -f='${binary:Package}\t${Status}\n' 2>/dev/null | awk -F '\t' '$2 == "deinstall ok config-files" {print $1}')
         if ((${#remaining[@]})); then
-            record_skip "PKGS-7346" "residual configurations remain after ${stage} sweep: ${remaining[*]}; see protected/dependency simulation reasons"
-        else
-            record_change "Purged only simulated, non-protected residual package configurations during ${stage} sweep: ${safe[*]}"
+            record_skip "PKGS-7346" "other residual configurations remain after ${stage} sweep: ${remaining[*]}; see protected/dependency simulation reasons"
         fi
+        record_change "Purged only simulated, validated residual package configurations during ${stage} sweep: ${safe[*]}"
+    else
+        RESIDUAL_PURGE_STATUS="REVIEW REQUIRED (APT purge failed)"
+        record_skip "PKGS-7346" "simulated residual purge failed during apply; no successful purge was recorded"
     fi
 }
 
@@ -6037,6 +6217,7 @@ Fail2ban           : ${FAIL2BAN_STATUS}
 Remote Logging     : ${REMOTE_LOG_STATUS}
 Automatic Updates  : ${UPDATES_STATUS}
 Package upgrade    : ${PACKAGE_UPGRADE_STATUS}
+Residual configs   : ${RESIDUAL_PURGE_STATUS}
 rp_filter Policy   : ${RP_FILTER_POLICY}
 rp_filter Runtime  : ${RP_FILTER_RUNTIME_STATUS}
 rp_filter Report   : $([[ "$MODE" == "apply" ]] && printf '%s' "${HARDEN_RP_FILTER_REPORT:-/root/tailscale-rp-filter-report.txt}" || printf 'not written in dry-run')

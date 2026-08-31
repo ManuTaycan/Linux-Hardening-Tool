@@ -1069,6 +1069,157 @@ EOF
         purge_removed_packages final
         [[ ! -s "$RESIDUAL_APT_LOG" ]]
     ' _ "$repo_root" "$case_root" || fail "residual package unrequested purge was not blocked"
+
+    local fixture_root fixture_status fixture_log
+    fixture_root="$case_root/boot-fixtures"
+    fixture_status="$fixture_root/status.tsv"
+    fixture_log="$fixture_root/apt.log"
+    install -d "$fixture_root/bin" "$fixture_root/boot" "$fixture_root/efi/EFI/ubuntu" "$fixture_root/grub" "$fixture_root/links"
+    cat > "$fixture_root/bin/uname" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "${RESIDUAL_KERNEL_VERSION:-7.0.0-30-generic}"
+EOF
+    cat > "$fixture_root/bin/readlink" <<'EOF'
+#!/usr/bin/env bash
+[[ -n "${RESIDUAL_BOOT_TARGET:-}" ]] || exit 1
+printf '%s\n' "$RESIDUAL_BOOT_TARGET"
+EOF
+    cat > "$fixture_root/bin/dpkg-query" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+fmt="${2:-}" package="${3:-}"
+emit() {
+    local name="$1" status="$2"
+    case "$fmt" in
+        *'${binary:Package}'*) printf '%s\t%s\n' "$name" "$status" ;;
+        *'${db:Status-Abbrev}'*) [[ "$status" == 'install ok installed' ]] && printf 'ii \n' || printf 'rc \n' ;;
+        *) printf '%s\n' "$status" ;;
+    esac
+}
+if [[ -z "$package" ]]; then
+    while IFS=$'\t' read -r name status; do [[ -n "$name" ]] && emit "$name" "$status"; done < "$RESIDUAL_FIXTURE_STATUS"
+else
+    while IFS=$'\t' read -r name status; do
+        [[ "$name" == "$package" ]] && { emit "$name" "$status"; exit 0; }
+    done < "$RESIDUAL_FIXTURE_STATUS"
+fi
+EOF
+    cat > "$fixture_root/bin/apt-get" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == -s ]]; then
+    shift
+    [[ "${1:-}" == purge ]] || exit 1
+    shift
+    for package in "$@"; do printf 'Purg %s [1.0]\n' "$package"; done
+    if [[ "${RESIDUAL_SIM_EXTRA:-0}" == 1 ]]; then printf 'Purg unrelated-installed [1.0]\n'; fi
+elif [[ "${1:-}" == check ]]; then
+    exit 0
+elif [[ "${1:-}" == purge ]]; then
+    printf '%s\n' "$*" >> "$RESIDUAL_FIXTURE_APT_LOG"
+    for package in "$@"; do
+        [[ "$package" == -y ]] && continue
+        awk -F '\t' -v package="$package" '$1 != package {print $0}' "$RESIDUAL_FIXTURE_STATUS" > "${RESIDUAL_FIXTURE_STATUS}.next"
+        mv "${RESIDUAL_FIXTURE_STATUS}.next" "$RESIDUAL_FIXTURE_STATUS"
+    done
+else
+    exit 1
+fi
+EOF
+    chmod +x "$fixture_root/bin/uname" "$fixture_root/bin/readlink" "$fixture_root/bin/dpkg-query" "$fixture_root/bin/apt-get"
+    printf 'grub configuration\n' > "$fixture_root/grub/grub.cfg"
+    printf 'efi binary\n' > "$fixture_root/efi/EFI/ubuntu/shimx64.efi"
+    for artifact in vmlinuz initrd.img System.map config; do printf 'current %s\n' "$artifact" > "$fixture_root/boot/${artifact}-7.0.0-30-generic"; done
+
+    cat > "$fixture_status" <<'EOF'
+linux-image-7.0.0-30-generic	install ok installed
+linux-image-unsigned-7.0.0-14-generic	deinstall ok config-files
+linux-main-modules-zfs-7.0.0-14-generic	deinstall ok config-files
+linux-modules-7.0.0-14-generic	deinstall ok config-files
+grub-pc	deinstall ok config-files
+grub-efi-amd64	install ok installed
+grub-efi-amd64-bin	install ok installed
+grub2-common	install ok installed
+shim-signed	install ok installed
+EOF
+    : > "$fixture_log"
+    env PATH="$fixture_root/bin:$PATH" HARDEN_SOURCE_ONLY=1 RESIDUAL_FIXTURE_STATUS="$fixture_status" RESIDUAL_FIXTURE_APT_LOG="$fixture_log" \
+        HARDEN_BOOT_DIR="$fixture_root/boot" HARDEN_BOOT_SYMLINK_DIR="$fixture_root/links" HARDEN_EFI_RUNTIME_DIR="$fixture_root/efi-runtime" \
+        HARDEN_EFI_BOOT_DIR="$fixture_root/efi" HARDEN_GRUB_DIR="$fixture_root/grub" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; REBOOT_REQUIRED=0; CHANGE_LOG="$2/target.tsv"; : > "$CHANGE_LOG"; mkdir -p "$HARDEN_EFI_RUNTIME_DIR"
+            log() { :; }; record_change() { :; }; record_skip() { :; }; run_streamed() { "$@"; }
+            purge_removed_packages final
+            ! grep -E "^(linux-image-unsigned-7.0.0-14-generic|linux-main-modules-zfs-7.0.0-14-generic|linux-modules-7.0.0-14-generic|grub-pc)[[:space:]]" "$RESIDUAL_FIXTURE_STATUS"
+            [[ "$RESIDUAL_PURGE_STATUS" == OK* && "$REBOOT_REQUIRED" -eq 0 ]]
+            grep -Fq "purge -y linux-image-unsigned-7.0.0-14-generic linux-main-modules-zfs-7.0.0-14-generic linux-modules-7.0.0-14-generic grub-pc" "$RESIDUAL_FIXTURE_APT_LOG"
+            before="$(wc -l < "$RESIDUAL_FIXTURE_APT_LOG")"; purge_removed_packages final; [[ "$(wc -l < "$RESIDUAL_FIXTURE_APT_LOG")" == "$before" ]]
+        ' _ "$repo_root" "$fixture_root" || fail "UEFI old-kernel/grub-pc residual purge regression failed"
+
+    cat > "$fixture_status" <<'EOF'
+linux-image-7.0.0-30-generic	deinstall ok config-files
+grub-efi-amd64	install ok installed
+EOF
+    : > "$fixture_log"
+    env PATH="$fixture_root/bin:$PATH" HARDEN_SOURCE_ONLY=1 RESIDUAL_FIXTURE_STATUS="$fixture_status" RESIDUAL_FIXTURE_APT_LOG="$fixture_log" \
+        HARDEN_BOOT_DIR="$fixture_root/boot" HARDEN_BOOT_SYMLINK_DIR="$fixture_root/links" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; log() { :; }; record_change() { :; }; record_skip() { :; }; run_streamed() { "$@"; }; purge_removed_packages; [[ ! -s "$RESIDUAL_FIXTURE_APT_LOG" ]]
+        ' _ "$repo_root" "$fixture_root" || fail "running kernel residual was not protected"
+
+    cat > "$fixture_status" <<'EOF'
+linux-image-unsigned-7.0.0-14-generic	deinstall ok config-files
+EOF
+    printf 'old artifact\n' > "$fixture_root/boot/vmlinuz-7.0.0-14-generic"
+    : > "$fixture_log"
+    env PATH="$fixture_root/bin:$PATH" HARDEN_SOURCE_ONLY=1 RESIDUAL_FIXTURE_STATUS="$fixture_status" RESIDUAL_FIXTURE_APT_LOG="$fixture_log" HARDEN_BOOT_DIR="$fixture_root/boot" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; log() { :; }; record_change() { :; }; record_skip() { :; }; run_streamed() { "$@"; }; purge_removed_packages; [[ ! -s "$RESIDUAL_FIXTURE_APT_LOG" ]]
+        ' _ "$repo_root" "$fixture_root" || fail "old kernel residual with /boot artifact was not protected"
+    rm -f "$fixture_root/boot/vmlinuz-7.0.0-14-generic"
+    printf 'old boot target\n' > "$fixture_root/old-vmlinuz-7.0.0-14-generic"
+    : > "$fixture_root/links/vmlinuz"
+    : > "$fixture_log"
+    env PATH="$fixture_root/bin:$PATH" HARDEN_SOURCE_ONLY=1 RESIDUAL_FIXTURE_STATUS="$fixture_status" RESIDUAL_FIXTURE_APT_LOG="$fixture_log" RESIDUAL_BOOT_TARGET="$fixture_root/old-vmlinuz-7.0.0-14-generic" \
+        HARDEN_BOOT_DIR="$fixture_root/boot" HARDEN_BOOT_SYMLINK_DIR="$fixture_root/links" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; log() { :; }; record_change() { :; }; record_skip() { :; }; run_streamed() { "$@"; }; purge_removed_packages; [[ ! -s "$RESIDUAL_FIXTURE_APT_LOG" ]]
+        ' _ "$repo_root" "$fixture_root" || fail "kernel residual referenced by a boot symlink was not protected"
+    rm -f "$fixture_root/links/vmlinuz" "$fixture_root/old-vmlinuz-7.0.0-14-generic"
+
+    cat > "$fixture_status" <<'EOF'
+linux-image-custom	deinstall ok config-files
+linux-image-generic	deinstall ok config-files
+grub-pc	deinstall ok config-files
+EOF
+    : > "$fixture_log"
+    env PATH="$fixture_root/bin:$PATH" HARDEN_SOURCE_ONLY=1 RESIDUAL_FIXTURE_STATUS="$fixture_status" RESIDUAL_FIXTURE_APT_LOG="$fixture_log" HARDEN_BOOT_DIR="$fixture_root/boot" HARDEN_EFI_RUNTIME_DIR="$fixture_root/no-efi" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; log() { :; }; record_change() { :; }; record_skip() { :; }; run_streamed() { "$@"; }; purge_removed_packages; [[ ! -s "$RESIDUAL_FIXTURE_APT_LOG" ]]
+        ' _ "$repo_root" "$fixture_root" || fail "ambiguous/meta kernel or BIOS grub-pc residual was not protected"
+
+    cat > "$fixture_status" <<'EOF'
+linux-image-unsigned-7.0.0-14-generic	deinstall ok config-files
+linux-image-7.0.0-14-generic	install ok installed
+grub-pc	deinstall ok config-files
+EOF
+    : > "$fixture_log"
+    env PATH="$fixture_root/bin:$PATH" HARDEN_SOURCE_ONLY=1 RESIDUAL_FIXTURE_STATUS="$fixture_status" RESIDUAL_FIXTURE_APT_LOG="$fixture_log" HARDEN_BOOT_DIR="$fixture_root/boot" HARDEN_EFI_RUNTIME_DIR="$fixture_root/efi-runtime" HARDEN_EFI_BOOT_DIR="$fixture_root/missing-efi" HARDEN_GRUB_DIR="$fixture_root/grub" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; log() { :; }; record_change() { :; }; record_skip() { :; }; run_streamed() { "$@"; }; purge_removed_packages; [[ ! -s "$RESIDUAL_FIXTURE_APT_LOG" ]]
+        ' _ "$repo_root" "$fixture_root" || fail "installed old kernel or unverifiable EFI GRUB was not protected"
+
+    cat > "$fixture_status" <<'EOF'
+linux-image-unsigned-7.0.0-14-generic	deinstall ok config-files
+grub-efi-amd64	install ok installed
+unrelated-installed	install ok installed
+EOF
+    : > "$fixture_log"
+    env PATH="$fixture_root/bin:$PATH" HARDEN_SOURCE_ONLY=1 RESIDUAL_FIXTURE_STATUS="$fixture_status" RESIDUAL_FIXTURE_APT_LOG="$fixture_log" RESIDUAL_SIM_EXTRA=1 \
+        HARDEN_BOOT_DIR="$fixture_root/boot" HARDEN_EFI_RUNTIME_DIR="$fixture_root/efi-runtime" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; log() { :; }; record_change() { :; }; record_skip() { :; }; run_streamed() { "$@"; }; purge_removed_packages; [[ ! -s "$RESIDUAL_FIXTURE_APT_LOG" ]]
+        ' _ "$repo_root" "$fixture_root" || fail "residual purge simulation with extra removal was not blocked"
 }
 
 run_firewall_inventory_tests() {
@@ -2579,6 +2730,9 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
         run_package_upgrade_tests
         run_residual_purge_tests
         run_firewall_inventory_tests
+        ;;
+    residual)
+        run_residual_purge_tests
         ;;
     deleted-open)
         run_deleted_open_tests

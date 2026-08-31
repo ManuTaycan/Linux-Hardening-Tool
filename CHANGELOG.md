@@ -13,6 +13,10 @@ für 1.1.3 wird erst nach dem vollständigen Zielsystemtest erstellt.
   dpkg defaults, post-check/reboot state are recorded, and an empty upgrade is
   a true no-op. A final simulated residual-configuration sweep runs after all
   package-changing phases and retains protected or unrequested dependencies.
+  It may purge only rc-only, non-running versioned kernel remnants with no
+  installed owner, boot artifact, or boot-symlink reference, plus rc-only
+  `grub-pc` on a verified UEFI EFI-GRUB stack; all other boot-critical or
+  ambiguous residuals remain protected.
 - `/etc/issue` and `/etc/issue.net` now receive the exact byte-identical
   pre-login legal/consent banner required by the reviewed Lynis 3.1.6 banner
   heuristics; the dynamic post-login MOTD policy remains presentation-only.
