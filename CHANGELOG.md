@@ -16,6 +16,12 @@ für 1.1.3 wird erst nach dem vollständigen Zielsystemtest erstellt.
   private mount namespace only when its client ping and `sshd` jail validate;
   APT, SSH, Tailscale and network-critical services remain deliberately narrow
   or excluded.
+- SSH's managed service drop-in now migrates from `PrivateTmp` plus `UMask` to
+  `UMask=0027` only. A target diagnosis confirmed that a restarted ssh.service
+  can leave an older session in a stale private `/tmp` mount namespace. The
+  migration validates the merged unit and `sshd -t`, reloads (never restarts)
+  SSH, and retains this session-safety correction even when its exposure score
+  is unchanged.
 - Ubuntu target-test follow-up: Phase 03 now performs one controlled
   `apt-get upgrade` only after `apt-get check` and a locale-stable simulation;
   removals and downgrade signals block the operation, conffiles use conservative

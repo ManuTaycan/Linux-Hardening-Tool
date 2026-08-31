@@ -94,10 +94,28 @@ sudo ./harden.sh --apply --aggressive
 ```
 
 Der zweite Lauf darf bei gültigen Drop-ins weder `systemctl daemon-reload` noch
-einen Service-Restart auslösen; die Scores bleiben stabil. SSH wird höchstens
-mit `PrivateTmp`/`UMask` behandelt. Tailscale, dbus, cron, auditd,
+einen Service-Restart auslösen; die Scores bleiben stabil. SSH wird mit
+`UMask=0027` allein behandelt: `PrivateTmp` ist wegen der beschriebenen
+Sitzungs-Sicherheitsausnahme ausdrücklich entfernt. Tailscale, dbus, cron, auditd,
 open-vm-tools, snapd, systemd-Units, polkit, cloud-init sowie weitere
 Netzwerk-/Storage-kritische Dienste bleiben ohne generisches Sandbox-Profil.
+
+Prüfe die SSH-Safety-Migration aus einer bestätigten zweiten SSH- oder
+Recovery-Sitzung. Ein `ssh.service`-Restart kann ältere Sessions mit einem
+verwaisten PrivateTmp-Mount-Namespace zurücklassen, daher ist ausschließlich ein
+Reload zulässig:
+
+```bash
+sudo systemctl cat ssh.service
+sudo sshd -t
+sudo systemctl is-active ssh.service
+findmnt -T /tmp
+mktemp
+sudo grep -A9 '^\[ssh\.service\]' /root/systemd-hardening-report.txt
+```
+
+Bei Validierungs- oder Health-Fehlern muss der vorherige Drop-in wiederhergestellt
+werden; das Script darf dabei niemals `systemctl restart ssh.service` verwenden.
 
 ### Ubuntu-26.04.1-Retest der rp_filter-Routingpolicy (#7)
 

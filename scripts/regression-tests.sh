@@ -1570,16 +1570,70 @@ EOF
         grep -Fq "already hardened/unchanged" "$SYSTEMD_HARDENING_REPORT"
     ' _ "$repo_root" "$case_root" || fail "converged systemd drop-in caused a restart or rewrite"
 
+    env HARDEN_SOURCE_ONLY=1 HARDEN_SYSTEMD_DIR="$case_root/ssh-migration-systemd" HARDEN_SYSTEMD_HARDENING_REPORT="$case_root/ssh-migration-report" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        test_dir="$2"; MODE=apply; SSH_SERVICE=ssh.service; SSHD_BIN=/bin/true; BACKUP_DIR="$test_dir/ssh-migration-backup"; CHANGE_LOG="$test_dir/ssh-migration-changes"; : > "$CHANGE_LOG"; mkdir -p "$BACKUP_DIR" "$HARDEN_SYSTEMD_DIR/ssh.service.d"; : > "$SYSTEMD_HARDENING_REPORT"; : > "$test_dir/ssh-migration-commands"
+        printf "[Service]\\nPrivateTmp=yes\\nUMask=0027\\n" > "$HARDEN_SYSTEMD_DIR/ssh.service.d/99-hardening.conf"
+        unit_file_exists() { return 0; }; systemctl() { printf "%s " "$@" >> "$test_dir/ssh-migration-commands"; printf "\\n" >> "$test_dir/ssh-migration-commands"; case "${1:-} ${2:-}" in "is-active --quiet") return 0 ;; "is-failed --quiet") return 1 ;; cat*) printf "[Service]\\nExecStart=/bin/true\\n" ;; esac; return 0; }; systemd_verify_unit() { return 0; }
+        transaction_copy() { cp -- "$1" "$test_dir/ssh-migration-original"; }; transaction_restore() { cp -- "$test_dir/ssh-migration-original" "$1"; }
+        install_managed_file() { local destination="$1" mode="$2"; mkdir -p -- "$(dirname -- "$destination")"; cat > "$destination"; chmod "$mode" "$destination"; }; run_streamed() { "$@"; }; systemd_service_health_check() { return 0; }
+        measure_service_exposure() { SYSTEMD_EXPOSURE_RESULT=9.2; : > "$3"; }
+        install_service_dropin ssh.service 99-hardening "SSH safety migration" <<EOF
+[Service]
+UMask=0027
+EOF
+        grep -Fxq "UMask=0027" "$HARDEN_SYSTEMD_DIR/ssh.service.d/99-hardening.conf"
+        ! grep -Fq "PrivateTmp" "$HARDEN_SYSTEMD_DIR/ssh.service.d/99-hardening.conf"
+        grep -Fq "reload ssh.service" "$test_dir/ssh-migration-commands"
+        ! grep -Fq "restart ssh.service" "$test_dir/ssh-migration-commands"
+        grep -Fq "SSH safety migration: PrivateTmp removed" "$SYSTEMD_HARDENING_REPORT"
+    ' _ "$repo_root" "$case_root" || fail "SSH PrivateTmp migration did not retain the UMask-only safety exception"
+
+    env HARDEN_SOURCE_ONLY=1 HARDEN_SYSTEMD_DIR="$case_root/ssh-rollback-systemd" HARDEN_SYSTEMD_HARDENING_REPORT="$case_root/ssh-rollback-report" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        test_dir="$2"; MODE=apply; SSH_SERVICE=ssh.service; SSHD_BIN=/bin/true; BACKUP_DIR="$test_dir/ssh-rollback-backup"; CHANGE_LOG="$test_dir/ssh-rollback-changes"; : > "$CHANGE_LOG"; mkdir -p "$BACKUP_DIR" "$HARDEN_SYSTEMD_DIR/ssh.service.d"; : > "$SYSTEMD_HARDENING_REPORT"; : > "$test_dir/ssh-rollback-commands"
+        printf "[Service]\\nPrivateTmp=yes\\nUMask=0027\\n" > "$HARDEN_SYSTEMD_DIR/ssh.service.d/99-hardening.conf"
+        unit_file_exists() { return 0; }; systemctl() { printf "%s " "$@" >> "$test_dir/ssh-rollback-commands"; printf "\\n" >> "$test_dir/ssh-rollback-commands"; case "${1:-} ${2:-}" in "is-active --quiet") return 0 ;; "is-failed --quiet") return 1 ;; cat*) printf "[Service]\\nExecStart=/bin/true\\n" ;; esac; return 0; }; systemd_verify_unit() { return 0; }
+        transaction_copy() { cp -- "$1" "$test_dir/ssh-rollback-original"; }; transaction_restore() { cp -- "$test_dir/ssh-rollback-original" "$1"; }
+        install_managed_file() { local destination="$1" mode="$2"; mkdir -p -- "$(dirname -- "$destination")"; cat > "$destination"; chmod "$mode" "$destination"; }; run_streamed() { "$@"; }; systemd_service_health_check() { return 1; }
+        measure_service_exposure() { SYSTEMD_EXPOSURE_RESULT=9.2; : > "$3"; }
+        install_service_dropin ssh.service 99-hardening "SSH safety migration" <<EOF
+[Service]
+UMask=0027
+EOF
+        grep -Fq "PrivateTmp=yes" "$HARDEN_SYSTEMD_DIR/ssh.service.d/99-hardening.conf"
+        grep -Fq "reload ssh.service" "$test_dir/ssh-rollback-commands"
+        ! grep -Fq "restart ssh.service" "$test_dir/ssh-rollback-commands"
+        grep -Fq "health=failed" "$SYSTEMD_HARDENING_REPORT"
+    ' _ "$repo_root" "$case_root" || fail "SSH migration health rollback restarted SSH or lost the prior drop-in"
+
+    env HARDEN_SOURCE_ONLY=1 HARDEN_SYSTEMD_DIR="$case_root/ssh-converged-systemd" HARDEN_SYSTEMD_HARDENING_REPORT="$case_root/ssh-converged-report" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        test_dir="$2"; MODE=apply; SSH_SERVICE=ssh.service; SSHD_BIN=/bin/true; BACKUP_DIR="$test_dir/ssh-converged-backup"; CHANGE_LOG="$test_dir/ssh-converged-changes"; : > "$CHANGE_LOG"; mkdir -p "$BACKUP_DIR" "$HARDEN_SYSTEMD_DIR/ssh.service.d"; : > "$SYSTEMD_HARDENING_REPORT"; : > "$test_dir/ssh-converged-commands"
+        printf "[Service]\\nUMask=0027\\n" > "$HARDEN_SYSTEMD_DIR/ssh.service.d/99-hardening.conf"
+        unit_file_exists() { return 0; }; systemctl() { printf "%s " "$@" >> "$test_dir/ssh-converged-commands"; printf "\\n" >> "$test_dir/ssh-converged-commands"; case "${1:-} ${2:-}" in "is-active --quiet") return 0 ;; cat*) printf "[Service]\\nExecStart=/bin/true\\n" ;; esac; return 0; }; systemd_verify_unit() { return 0; }; run_streamed() { "$@"; }; systemd_service_health_check() { return 0; }
+        measure_service_exposure() { SYSTEMD_EXPOSURE_RESULT=9.2; : > "$3"; }
+        install_service_dropin ssh.service 99-hardening "SSH safety migration" <<EOF
+[Service]
+UMask=0027
+EOF
+        ! grep -Eq "daemon-reload|reload ssh.service|restart ssh.service" "$test_dir/ssh-converged-commands"
+        grep -Fq "already hardened/unchanged" "$SYSTEMD_HARDENING_REPORT"
+    ' _ "$repo_root" "$case_root" || fail "converged SSH UMask-only drop-in caused a reload or restart"
+
     env HARDEN_SOURCE_ONLY=1 bash -c '
         source "$1/harden.sh"; trap - ERR EXIT
         SSH_SERVICE=ssh.service
-        [[ "$(systemd_service_classification ssh.service)" == retained:* ]]
+        [[ "$(systemd_service_classification ssh.service)" == "safety exception:"* ]]
         [[ "$(systemd_service_classification tailscaled.service)" == excluded:* ]]
         [[ "$(systemd_service_classification networkd-dispatcher.service)" == candidate:* ]]
         section="$(sed -n "/^harden_systemd_services()/,/^}/p" "$1/harden.sh")"
         ! grep -Eq "install_service_dropin (tailscaled|dbus|cron|auditd|open-vm-tools|snapd|systemd-|polkit|cloud-init)" <<<"$section"
         ssh_block="$(sed -n "/install_service_dropin \"\$SSH_SERVICE\"/,/EOF/p" "$1/harden.sh")"
-        grep -Fxq "PrivateTmp=yes" <<<"$ssh_block"; grep -Fxq "UMask=0027" <<<"$ssh_block"
+        ! grep -Fq "PrivateTmp=yes" <<<"$ssh_block"; grep -Fxq "UMask=0027" <<<"$ssh_block"
+        systemctl() { [[ "$1 $2" == "is-active --quiet" ]]; }
+        SSHD_BIN=/bin/true; systemd_service_health_check ssh.service
+        SSHD_BIN=/bin/false; ! systemd_service_health_check ssh.service
     ' _ "$repo_root" || fail "protected service or SSH preservation regression failed"
 }
 

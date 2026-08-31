@@ -4479,7 +4479,7 @@ systemd_service_classification() {
             printf '%s\n' "candidate: network-event helper; no extra mount, device, capability, or address-family restriction is assumed safe for operator hooks"
             ;;
         "$SSH_SERVICE")
-            printf '%s\n' "retained: SSH sandboxing is limited to PrivateTmp/UMask to avoid inheritance into login or sudo sessions"
+            printf '%s\n' "safety exception: SSH uses UMask only; PrivateTmp is removed because a daemon reload can leave older sessions in a stale private /tmp mount namespace"
             ;;
         tailscaled.service|dbus.service|dbus-broker.service|cron.service|crond.service|auditd.service|open-vm-tools.service|snapd.service|systemd-*|polkit.service|cloud-init*)
             printf '%s\n' "excluded: host-critical IPC, audit, overlay, guest, scheduler, or network responsibility"
@@ -4529,6 +4529,9 @@ systemd_service_health_check() {
             fail2ban-client status sshd >/dev/null 2>&1 || return 1
             ;;
     esac
+    if [[ -n "$SSH_SERVICE" && "$service" == "$SSH_SERVICE" ]]; then
+        [[ -n "$SSHD_BIN" ]] && "$SSHD_BIN" -t >/dev/null 2>&1 || return 1
+    fi
     return 0
 }
 
@@ -4549,8 +4552,14 @@ rollback_service_dropin() {
     transaction_restore "$destination" "$transaction_label"
     run_streamed systemctl daemon-reload || true
     if [[ "$was_active" -eq 1 ]]; then
-        run_streamed systemctl "$health_action" "$service" \
-            || run_streamed systemctl restart "$service" || true
+        if [[ "$health_action" == reload ]]; then
+            # SSH must never be restarted as a rollback fallback: preserve
+            # established remote sessions and let the restored unit reload.
+            run_streamed systemctl reload "$service" || true
+        else
+            run_streamed systemctl "$health_action" "$service" \
+                || run_streamed systemctl restart "$service" || true
+        fi
     else
         systemctl stop "$service" >/dev/null 2>&1 || true
     fi
@@ -4577,7 +4586,7 @@ install_service_dropin() {
     local preverify_file="$BACKUP_DIR/systemd-verify-${service//[^A-Za-z0-9_.-]/_}-pre-install.txt"
     local postverify_file="$BACKUP_DIR/systemd-verify-${service//[^A-Za-z0-9_.-]/_}-installed.txt"
     local before="" after="" was_active=0 health_action="restart" exposure_line="" exposure_outcome=""
-    local classification="" activity="" validation="not run" health="not run"
+    local classification="" activity="" validation="not run" health="not run" score_gate=1 safety_reason=""
     local dropin_was_current=0
     local dropin_stage="" verify_dir="" verify_unit=""
     if ! dropin_stage="$(mktemp)"; then
@@ -4598,7 +4607,11 @@ install_service_dropin() {
     before="$SYSTEMD_EXPOSURE_RESULT"
     [[ -z "$before" ]] || SERVICE_EXPOSURE_BEFORE["$service"]="$before"
     [[ "$activity" == active ]] && was_active=1
-    [[ -n "$SSH_SERVICE" && "$service" == "$SSH_SERVICE" ]] && health_action="reload"
+    if [[ -n "$SSH_SERVICE" && "$service" == "$SSH_SERVICE" ]]; then
+        health_action="reload"
+        score_gate=0
+        safety_reason="SSH safety migration: PrivateTmp removed after stale private /tmp namespace diagnosis; UMask=0027 is retained independently of systemd-analyze exposure score"
+    fi
     if ! verify_dir="$(mktemp -d)"; then
         rm -f -- "$dropin_stage"
         log WARN "Could not create a verification directory; skipped systemd hardening for ${service}"
@@ -4665,6 +4678,12 @@ install_service_dropin() {
         write_systemd_hardening_report "$service" "$activity" "$before" "" "$controls" "$classification" "$validation; daemon-reload failed" "not run" "rolled back"
         return 0
     fi
+    if [[ -n "$SSH_SERVICE" && "$service" == "$SSH_SERVICE" ]] && ! "$SSHD_BIN" -t >/dev/null 2>&1; then
+        rollback_service_dropin "$service" "$destination" "$transaction_label" "$was_active" "$health_action" "sshd -t rejected the SSH safety migration"
+        write_systemd_hardening_report "$service" "$activity" "$before" "" "$controls" "$classification" "$validation; sshd -t failed" "not run" "rolled back"
+        return 0
+    fi
+    [[ -n "$SSH_SERVICE" && "$service" == "$SSH_SERVICE" ]] && validation="${validation}; sshd -t passed"
     if [[ "$was_active" -eq 1 ]]; then
         if ! run_streamed systemctl "$health_action" "$service" || ! systemd_service_health_check "$service"; then
             rollback_service_dropin "$service" "$destination" "$transaction_label" "$was_active" "$health_action" "active-service health check failed"
@@ -4694,7 +4713,7 @@ install_service_dropin() {
     if [[ -n "$before" && -n "$after" ]]; then
         printf -v exposure_line '%-32s %s -> %s' "$service" "$before" "$after"
     fi
-    if [[ "$exposure_outcome" != decreased ]]; then
+    if [[ "$score_gate" -eq 1 && "$exposure_outcome" != decreased ]]; then
         rollback_service_dropin "$service" "$destination" "$transaction_label" "$was_active" "$health_action" "exposure did not measurably decrease"
         write_systemd_hardening_report "$service" "$activity" "$before" "$after" "$controls" "$classification" "$validation" "$health" "rolled back: score did not decrease"
         log WARN "${service} passed health checks but the candidate was rolled back because exposure did not decrease (${before:-N/A} -> ${after:-N/A})"
@@ -4702,8 +4721,13 @@ install_service_dropin() {
     fi
     SERVICES_HARDENED+=("$service")
     [[ -n "$exposure_line" ]] && SERVICE_EXPOSURE_SUMMARY+=("$exposure_line")
-    write_systemd_hardening_report "$service" "$activity" "$before" "$after" "$controls" "$classification" "$validation" "$health" "kept: measured exposure decrease"
-    record_change "Installed and health-tested systemd hardening for ${service}; exposure ${before} -> ${after}"
+    if [[ "$score_gate" -eq 0 ]]; then
+        write_systemd_hardening_report "$service" "$activity" "$before" "$after" "$controls" "$classification" "$validation" "$health" "kept: ${safety_reason}"
+        record_change "Migrated SSH systemd hardening to UMask=0027 only after merged-unit validation, sshd -t, reload, and active health check; PrivateTmp was removed for session safety"
+    else
+        write_systemd_hardening_report "$service" "$activity" "$before" "$after" "$controls" "$classification" "$validation" "$health" "kept: measured exposure decrease"
+        record_change "Installed and health-tested systemd hardening for ${service}; exposure ${before} -> ${after}"
+    fi
     return 0
 }
 
@@ -4792,9 +4816,8 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 UMask=0027
 EOF
     if [[ -n "$SSH_SERVICE" ]]; then
-        install_service_dropin "$SSH_SERVICE" 99-hardening "PrivateTmp and restrictive creation mask only" <<'EOF'
+        install_service_dropin "$SSH_SERVICE" 99-hardening "SSH safety migration: UMask=0027 only; PrivateTmp deliberately removed" <<'EOF'
 [Service]
-PrivateTmp=yes
 UMask=0027
 EOF
     fi
@@ -4910,7 +4933,7 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 UMask=0027
 EOF
     record_skip "BOOT-5264:cron.service" "cron executes arbitrary administrator jobs, so a global sandbox would break its purpose"
-    record_skip "BOOT-5264:ssh.service" "only PrivateTmp/UMask are applied; stronger unit restrictions would propagate into sudo administrator sessions"
+    record_skip "BOOT-5264:ssh.service" "SSH is managed with UMask=0027 only; PrivateTmp is deliberately removed because reloads can leave existing sessions with a stale private /tmp namespace"
     record_skip "BOOT-5264:excluded-services" "dbus, cron, auditd, tailscaled, open-vm-tools, systemd-*, polkit, snapd, and cloud-init are not blindly sandboxed because their IPC, namespace, audit, overlay, or guest duties are host-critical"
     if [[ "$MODE" == "apply" ]]; then
         record_change "Wrote measured systemd hardening results to ${SYSTEMD_HARDENING_REPORT}"
