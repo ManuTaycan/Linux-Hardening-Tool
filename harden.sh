@@ -3373,31 +3373,56 @@ EOF
     fi
 }
 
+FAIL2BAN_LAST_PING=""
+FAIL2BAN_LAST_JAIL=""
+FAIL2BAN_READINESS_ATTEMPTS=0
+
+fail2ban_runtime_ready_once() {
+    local ping_status=0 jail_status=0
+    if ! command -v fail2ban-client >/dev/null 2>&1; then
+        return 1
+    fi
+    FAIL2BAN_LAST_PING="$(fail2ban-client ping 2>&1)" || ping_status=$?
+    FAIL2BAN_LAST_JAIL="$(fail2ban-client status sshd 2>&1)" || jail_status=$?
+    systemctl is-active --quiet fail2ban.service \
+        && [[ "$ping_status" -eq 0 && "$jail_status" -eq 0 ]] \
+        && grep -Eiq 'pong|server replied' <<<"$FAIL2BAN_LAST_PING" \
+        && grep -Eiq 'status for the jail:[[:space:]]*sshd|jail.*sshd' <<<"$FAIL2BAN_LAST_JAIL"
+}
+
+wait_for_fail2ban_runtime() {
+    local attempts="${1:-10}" delay="${HARDEN_FAIL2BAN_READINESS_DELAY:-1}" attempt
+    [[ "$attempts" =~ ^[1-9][0-9]*$ ]] || attempts=10
+    [[ "$delay" =~ ^[0-9]+([.][0-9]+)?$ ]] || delay=1
+    FAIL2BAN_READINESS_ATTEMPTS=0
+    for ((attempt=1; attempt<=attempts; attempt++)); do
+        FAIL2BAN_READINESS_ATTEMPTS="$attempt"
+        if fail2ban_runtime_ready_once; then
+            return 0
+        fi
+        ((attempt == attempts)) || sleep "$delay"
+    done
+    return 1
+}
+
 verify_fail2ban_runtime() {
-    local attempts="${1:-1}" attempt ping_output="" jail_output="" report=""
+    local attempts="${1:-10}" report=""
     if ! command -v fail2ban-client >/dev/null 2>&1; then
         FAIL2BAN_STATUS="NOT AVAILABLE"
         return 1
     fi
     [[ -z "$BACKUP_DIR" ]] || report="$BACKUP_DIR/fail2ban-runtime.txt"
-    for ((attempt=1; attempt<=attempts; attempt++)); do
-        ping_output="$(fail2ban-client ping 2>&1 || true)"
-        jail_output="$(fail2ban-client status sshd 2>&1 || true)"
-        if systemctl is-active --quiet fail2ban.service \
-            && grep -Eiq 'pong|server replied' <<<"$ping_output" \
-            && grep -Eiq 'status for the jail:[[:space:]]*sshd|jail.*sshd' <<<"$jail_output"; then
+    if wait_for_fail2ban_runtime "$attempts"; then
             FAIL2BAN_STATUS="OK"
             [[ -z "$report" ]] || {
-                printf 'verified=%s\nping=%s\n%s\n' "$(timestamp)" "$ping_output" "$jail_output" > "$report"
+                printf 'verified=%s\nattempts=%s\nping=%s\n%s\n' "$(timestamp)" "$FAIL2BAN_READINESS_ATTEMPTS" "$FAIL2BAN_LAST_PING" "$FAIL2BAN_LAST_JAIL" > "$report"
                 chmod 0600 "$report"
             }
             return 0
-        fi
-        ((attempt == attempts)) || sleep 1
-    done
+    fi
     FAIL2BAN_STATUS="FAILED"
     [[ -z "$report" ]] || {
-        printf 'failed=%s\nping=%s\n%s\n' "$(timestamp)" "$ping_output" "$jail_output" > "$report"
+        printf 'failed=%s\nattempts=%s\nping=%s\n%s\n' "$(timestamp)" "$FAIL2BAN_READINESS_ATTEMPTS" "$FAIL2BAN_LAST_PING" "$FAIL2BAN_LAST_JAIL" > "$report"
         chmod 0600 "$report"
     }
     return 1
@@ -4716,9 +4741,7 @@ systemd_service_health_check() {
     fi
     case "$service" in
         fail2ban.service)
-            command -v fail2ban-client >/dev/null 2>&1 || return 1
-            fail2ban-client ping >/dev/null 2>&1 || return 1
-            fail2ban-client status sshd >/dev/null 2>&1 || return 1
+            wait_for_fail2ban_runtime "${HARDEN_FAIL2BAN_SERVICE_READINESS_ATTEMPTS:-10}" || return 1
             ;;
     esac
     if [[ -n "$SSH_SERVICE" && "$service" == "$SSH_SERVICE" ]]; then
@@ -4838,7 +4861,11 @@ install_service_dropin() {
             rm -f -- "$dropin_stage"
             return 0
         fi
-        health="healthy/no restart required"
+        if [[ "$service" == fail2ban.service ]]; then
+            health="healthy/no restart required (Fail2ban ready after ${FAIL2BAN_READINESS_ATTEMPTS} check(s))"
+        else
+            health="healthy/no restart required"
+        fi
         measure_service_exposure "$service" after "$after_file"
         after="$SYSTEMD_EXPOSURE_RESULT"
         [[ -z "$after" ]] || SERVICE_EXPOSURE_AFTER["$service"]="$after"
@@ -4882,7 +4909,11 @@ install_service_dropin() {
             write_systemd_hardening_report "$service" "$activity" "$before" "" "$controls" "$classification" "$validation" "failed" "rolled back"
             return 0
         fi
-        health="healthy"
+        if [[ "$service" == fail2ban.service ]]; then
+            health="healthy (Fail2ban ready after ${FAIL2BAN_READINESS_ATTEMPTS} check(s))"
+        else
+            health="healthy"
+        fi
     elif [[ "$service" == "uuidd.service" ]]; then
         if ! run_streamed systemctl start "$service" || systemctl is-failed --quiet "$service" || ! systemd_service_health_check "$service"; then
             rollback_service_dropin "$service" "$destination" "$transaction_label" "$was_active" "$health_action" "safe inactive-service health check failed"

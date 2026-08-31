@@ -1516,7 +1516,7 @@ run_systemd_idempotency_tests() {
 
     local case_root="$test_root/systemd-exposure"
     install -d "$case_root"
-    env HARDEN_SOURCE_ONLY=1 HARDEN_SYSTEMD_DIR="$case_root/systemd" HARDEN_SYSTEMD_HARDENING_REPORT="$case_root/report" bash -c '
+    env HARDEN_SOURCE_ONLY=1 HARDEN_SYSTEMD_DIR="$case_root/systemd" HARDEN_SYSTEMD_HARDENING_REPORT="$case_root/report" HARDEN_FAIL2BAN_SERVICE_READINESS_ATTEMPTS=3 HARDEN_FAIL2BAN_READINESS_DELAY=0 bash -c '
         source "$1/harden.sh"; trap - ERR EXIT
         test_dir="$2"; MODE=apply; BACKUP_DIR="$test_dir/backup"; CHANGE_LOG="$test_dir/changes"; : > "$CHANGE_LOG"; mkdir -p "$BACKUP_DIR"; : > "$SYSTEMD_HARDENING_REPORT"; : > "$test_dir/commands"
         unit_file_exists() { return 0; }
@@ -1525,7 +1525,15 @@ run_systemd_idempotency_tests() {
         transaction_copy() { :; }; transaction_restore() { rm -f -- "$1"; }
         install_managed_file() { local destination="$1" mode="$2"; mkdir -p -- "$(dirname -- "$destination")"; cat > "$destination"; chmod "$mode" "$destination"; }
         run_streamed() { "$@"; }
-        systemd_service_health_check() { return 0; }
+        : > "$test_dir/fail2ban-attempt"
+        fail2ban-client() {
+            fail2ban_attempt="$(cat "$test_dir/fail2ban-attempt")"
+            case "$1" in
+                ping) fail2ban_attempt=$((fail2ban_attempt + 1)); printf "%s" "$fail2ban_attempt" > "$test_dir/fail2ban-attempt"; [[ "$fail2ban_attempt" -ge 2 ]] && { printf "Server replied: pong\\n"; return 0; } ;;
+                status) [[ "$fail2ban_attempt" -ge 2 ]] && { printf "Status for the jail: sshd\\n"; return 0; } ;;
+            esac
+            return 1
+        }
         measure_service_exposure() { [[ "$2" == before ]] && SYSTEMD_EXPOSURE_RESULT=5.0 || SYSTEMD_EXPOSURE_RESULT=4.4; : > "$3"; }
         install_service_dropin fail2ban.service 99-hardening "test control" <<EOF
 [Service]
@@ -1535,6 +1543,7 @@ EOF
             && grep -Fq "restart fail2ban.service" "$test_dir/commands" \
             && grep -Fq "before-score=5.0" "$SYSTEMD_HARDENING_REPORT" \
             && grep -Fq "after-score=4.4" "$SYSTEMD_HARDENING_REPORT" \
+            && grep -Fq "Fail2ban ready after 2 check(s)" "$SYSTEMD_HARDENING_REPORT" \
             && grep -Fq "result=kept: measured exposure decrease" "$SYSTEMD_HARDENING_REPORT" \
             || exit 1
     ' _ "$repo_root" "$case_root" || fail "measurable systemd exposure improvement regression failed"
@@ -1567,25 +1576,27 @@ EOF
         grep -Fq "candidate rejected before installation" "$SYSTEMD_HARDENING_REPORT"
     ' _ "$repo_root" "$case_root" || fail "invalid candidate systemd unit was installed"
 
-    env HARDEN_SOURCE_ONLY=1 HARDEN_SYSTEMD_DIR="$case_root/health-systemd" HARDEN_SYSTEMD_HARDENING_REPORT="$case_root/health-report" bash -c '
+    env HARDEN_SOURCE_ONLY=1 HARDEN_SYSTEMD_DIR="$case_root/health-systemd" HARDEN_SYSTEMD_HARDENING_REPORT="$case_root/health-report" HARDEN_FAIL2BAN_SERVICE_READINESS_ATTEMPTS=3 HARDEN_FAIL2BAN_READINESS_DELAY=0 bash -c '
         source "$1/harden.sh"; trap - ERR EXIT
-        MODE=apply; BACKUP_DIR="$2/health-backup"; CHANGE_LOG="$2/health-changes"; : > "$CHANGE_LOG"; mkdir -p "$BACKUP_DIR"; : > "$SYSTEMD_HARDENING_REPORT"
+        test_dir="$2"; MODE=apply; BACKUP_DIR="$test_dir/health-backup"; CHANGE_LOG="$test_dir/health-changes"; : > "$CHANGE_LOG"; mkdir -p "$BACKUP_DIR"; : > "$SYSTEMD_HARDENING_REPORT"
         unit_file_exists() { return 0; }; systemctl() { case "${1:-} ${2:-}" in "is-active --quiet") return 0 ;; "is-failed --quiet") return 1 ;; cat*) printf "[Service]\nExecStart=/bin/true\n" ;; esac; return 0; }; systemd_verify_unit() { return 0; }; transaction_copy() { :; }; transaction_restore() { rm -f -- "$1"; }
-        install_managed_file() { local destination="$1" mode="$2"; mkdir -p -- "$(dirname -- "$destination")"; cat > "$destination"; chmod "$mode" "$destination"; }; run_streamed() { "$@"; }; systemd_service_health_check() { return 1; }
+        : > "$test_dir/health-check-pings"
+        install_managed_file() { local destination="$1" mode="$2"; mkdir -p -- "$(dirname -- "$destination")"; cat > "$destination"; chmod "$mode" "$destination"; }; run_streamed() { "$@"; }; fail2ban-client() { if [[ "$1" == ping ]]; then count="$(cat "$test_dir/health-check-pings")"; printf "%s" "$((count + 1))" > "$test_dir/health-check-pings"; fi; return 1; }
         measure_service_exposure() { [[ "$2" == before ]] && SYSTEMD_EXPOSURE_RESULT=5.0 || SYSTEMD_EXPOSURE_RESULT=4.4; : > "$3"; }
         install_service_dropin fail2ban.service 99-hardening "test control" <<EOF
 [Service]
 PrivateMounts=yes
 EOF
         [[ ! -e "$HARDEN_SYSTEMD_DIR/fail2ban.service.d/99-hardening.conf" ]]
+        [[ "$(cat "$test_dir/health-check-pings")" == 3 ]]
         grep -Fq "health=failed" "$SYSTEMD_HARDENING_REPORT"
     ' _ "$repo_root" "$case_root" || fail "unhealthy systemd service did not roll back its drop-in"
 
-    env HARDEN_SOURCE_ONLY=1 HARDEN_SYSTEMD_DIR="$case_root/converged-systemd" HARDEN_SYSTEMD_HARDENING_REPORT="$case_root/converged-report" bash -c '
+    env HARDEN_SOURCE_ONLY=1 HARDEN_SYSTEMD_DIR="$case_root/converged-systemd" HARDEN_SYSTEMD_HARDENING_REPORT="$case_root/converged-report" HARDEN_FAIL2BAN_SERVICE_READINESS_ATTEMPTS=3 HARDEN_FAIL2BAN_READINESS_DELAY=0 bash -c '
         source "$1/harden.sh"; trap - ERR EXIT
         test_dir="$2"; MODE=apply; BACKUP_DIR="$test_dir/converged-backup"; CHANGE_LOG="$test_dir/converged-changes"; : > "$CHANGE_LOG"; mkdir -p "$BACKUP_DIR" "$HARDEN_SYSTEMD_DIR/fail2ban.service.d"; : > "$SYSTEMD_HARDENING_REPORT"; : > "$test_dir/converged-commands"
         printf "[Service]\nPrivateMounts=yes\n" > "$HARDEN_SYSTEMD_DIR/fail2ban.service.d/99-hardening.conf"
-        unit_file_exists() { return 0; }; systemctl() { printf "%s " "$@" >> "$test_dir/converged-commands"; printf "\n" >> "$test_dir/converged-commands"; case "${1:-} ${2:-}" in "is-active --quiet") return 0 ;; cat*) printf "[Service]\nExecStart=/bin/true\n" ;; esac; return 0; }; systemd_verify_unit() { return 0; }; run_streamed() { "$@"; }; systemd_service_health_check() { return 0; }
+        unit_file_exists() { return 0; }; systemctl() { printf "%s " "$@" >> "$test_dir/converged-commands"; printf "\n" >> "$test_dir/converged-commands"; case "${1:-} ${2:-}" in "is-active --quiet") return 0 ;; cat*) printf "[Service]\nExecStart=/bin/true\n" ;; esac; return 0; }; systemd_verify_unit() { return 0; }; run_streamed() { "$@"; }; fail2ban-client() { [[ "$1" == ping ]] && printf "Server replied: pong\n" || printf "Status for the jail: sshd\n"; }
         measure_service_exposure() { SYSTEMD_EXPOSURE_RESULT=4.4; : > "$3"; }
         install_service_dropin fail2ban.service 99-hardening "test control" <<EOF
 [Service]
