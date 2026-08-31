@@ -1537,7 +1537,7 @@ run_systemd_idempotency_tests() {
         measure_service_exposure() { [[ "$2" == before ]] && SYSTEMD_EXPOSURE_RESULT=5.0 || SYSTEMD_EXPOSURE_RESULT=4.4; : > "$3"; }
         install_service_dropin fail2ban.service 99-hardening "test control" <<EOF
 [Service]
-PrivateMounts=yes
+PrivateDevices=yes
 EOF
         [[ -f "$HARDEN_SYSTEMD_DIR/fail2ban.service.d/99-hardening.conf" ]] \
             && grep -Fq "restart fail2ban.service" "$test_dir/commands" \
@@ -1557,7 +1557,7 @@ EOF
         measure_service_exposure() { SYSTEMD_EXPOSURE_RESULT=5.0; : > "$3"; }
         install_service_dropin fail2ban.service 99-hardening "test control" <<EOF
 [Service]
-PrivateMounts=yes
+PrivateDevices=yes
 EOF
         [[ ! -e "$HARDEN_SYSTEMD_DIR/fail2ban.service.d/99-hardening.conf" ]]
         grep -Fq "rolled back: score did not decrease" "$SYSTEMD_HARDENING_REPORT"
@@ -1570,7 +1570,7 @@ EOF
         measure_service_exposure() { SYSTEMD_EXPOSURE_RESULT=5.0; : > "$3"; }
         install_service_dropin fail2ban.service 99-hardening "test control" <<EOF
 [Service]
-PrivateMounts=yes
+PrivateDevices=yes
 EOF
         [[ ! -e "$HARDEN_SYSTEMD_DIR/fail2ban.service.d/99-hardening.conf" ]]
         grep -Fq "candidate rejected before installation" "$SYSTEMD_HARDENING_REPORT"
@@ -1585,7 +1585,7 @@ EOF
         measure_service_exposure() { [[ "$2" == before ]] && SYSTEMD_EXPOSURE_RESULT=5.0 || SYSTEMD_EXPOSURE_RESULT=4.4; : > "$3"; }
         install_service_dropin fail2ban.service 99-hardening "test control" <<EOF
 [Service]
-PrivateMounts=yes
+PrivateDevices=yes
 EOF
         [[ ! -e "$HARDEN_SYSTEMD_DIR/fail2ban.service.d/99-hardening.conf" ]]
         [[ "$(cat "$test_dir/health-check-pings")" == 3 ]]
@@ -1595,14 +1595,15 @@ EOF
     env HARDEN_SOURCE_ONLY=1 HARDEN_SYSTEMD_DIR="$case_root/converged-systemd" HARDEN_SYSTEMD_HARDENING_REPORT="$case_root/converged-report" HARDEN_FAIL2BAN_SERVICE_READINESS_ATTEMPTS=3 HARDEN_FAIL2BAN_READINESS_DELAY=0 bash -c '
         source "$1/harden.sh"; trap - ERR EXIT
         test_dir="$2"; MODE=apply; BACKUP_DIR="$test_dir/converged-backup"; CHANGE_LOG="$test_dir/converged-changes"; : > "$CHANGE_LOG"; mkdir -p "$BACKUP_DIR" "$HARDEN_SYSTEMD_DIR/fail2ban.service.d"; : > "$SYSTEMD_HARDENING_REPORT"; : > "$test_dir/converged-commands"
-        printf "[Service]\nPrivateMounts=yes\n" > "$HARDEN_SYSTEMD_DIR/fail2ban.service.d/99-hardening.conf"
+        printf "[Service]\nPrivateDevices=yes\n" > "$HARDEN_SYSTEMD_DIR/fail2ban.service.d/99-hardening.conf"
         unit_file_exists() { return 0; }; systemctl() { printf "%s " "$@" >> "$test_dir/converged-commands"; printf "\n" >> "$test_dir/converged-commands"; case "${1:-} ${2:-}" in "is-active --quiet") return 0 ;; cat*) printf "[Service]\nExecStart=/bin/true\n" ;; esac; return 0; }; systemd_verify_unit() { return 0; }; run_streamed() { "$@"; }; fail2ban-client() { [[ "$1" == ping ]] && printf "Server replied: pong\n" || printf "Status for the jail: sshd\n"; }
         measure_service_exposure() { SYSTEMD_EXPOSURE_RESULT=4.4; : > "$3"; }
         install_service_dropin fail2ban.service 99-hardening "test control" <<EOF
 [Service]
-PrivateMounts=yes
+PrivateDevices=yes
 EOF
         ! grep -Eq "daemon-reload|restart fail2ban.service" "$test_dir/converged-commands"
+        ! grep -Fq "PrivateMounts=yes" "$HARDEN_SYSTEMD_DIR/fail2ban.service.d/99-hardening.conf"
         grep -Fq "already hardened/unchanged" "$SYSTEMD_HARDENING_REPORT"
     ' _ "$repo_root" "$case_root" || fail "converged systemd drop-in caused a restart or rewrite"
 

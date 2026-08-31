@@ -4684,7 +4684,7 @@ systemd_service_classification() {
     local service="$1"
     case "$service" in
         fail2ban.service)
-            printf '%s\n' "candidate: jail and firewall daemon; retained only with fail2ban ping and sshd-jail health"
+            printf '%s\n' "candidate: jail and firewall daemon; retained only with fail2ban ping and sshd-jail health. Residual exposure around 5.0 is accepted for root, firewall/netlink and configurable enforcement actions; no cosmetic score-only sandboxing is added"
             ;;
         unattended-upgrades.service)
             printf '%s\n' "candidate: APT/dpkg maintainer scripts need host package write access; strict filesystem or syscall filters are intentionally excluded"
@@ -5014,12 +5014,11 @@ SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 UMask=0027
 EOF
-    install_service_dropin fail2ban.service 99-hardening "log/jail paths, private devices/mounts, kernel-view isolation, native syscall ABI" <<'EOF'
+    install_service_dropin fail2ban.service 99-hardening "log/jail paths, private devices, kernel-view isolation, native syscall ABI" <<'EOF'
 [Service]
 NoNewPrivileges=yes
 PrivateTmp=yes
 PrivateDevices=yes
-PrivateMounts=yes
 ProtectSystem=strict
 ReadWritePaths=-/var/log -/var/lib/fail2ban -/run/fail2ban
 ProtectHome=yes
