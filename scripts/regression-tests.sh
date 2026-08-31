@@ -1488,6 +1488,99 @@ run_systemd_idempotency_tests() {
         [[ "$(classify_systemd_exposure 3.4 3.4 0)" == not-decreased ]]
         [[ "$(classify_systemd_exposure 3.4 3.5 1)" == not-decreased ]]
     ' _ "$repo_root" || fail "systemd exposure idempotency classification failed"
+
+    local case_root="$test_root/systemd-exposure"
+    install -d "$case_root"
+    env HARDEN_SOURCE_ONLY=1 HARDEN_SYSTEMD_DIR="$case_root/systemd" HARDEN_SYSTEMD_HARDENING_REPORT="$case_root/report" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        test_dir="$2"; MODE=apply; BACKUP_DIR="$test_dir/backup"; CHANGE_LOG="$test_dir/changes"; : > "$CHANGE_LOG"; mkdir -p "$BACKUP_DIR"; : > "$SYSTEMD_HARDENING_REPORT"; : > "$test_dir/commands"
+        unit_file_exists() { return 0; }
+        systemctl() { printf "%s " "$@" >> "$test_dir/commands"; printf "\n" >> "$test_dir/commands"; case "${1:-} ${2:-}" in "is-active --quiet") return 0 ;; "is-failed --quiet") return 1 ;; cat*) printf "[Service]\nExecStart=/bin/true\n" ;; esac; return 0; }
+        systemd_verify_unit() { return 0; }
+        transaction_copy() { :; }; transaction_restore() { rm -f -- "$1"; }
+        install_managed_file() { local destination="$1" mode="$2"; mkdir -p -- "$(dirname -- "$destination")"; cat > "$destination"; chmod "$mode" "$destination"; }
+        run_streamed() { "$@"; }
+        systemd_service_health_check() { return 0; }
+        measure_service_exposure() { [[ "$2" == before ]] && SYSTEMD_EXPOSURE_RESULT=5.0 || SYSTEMD_EXPOSURE_RESULT=4.4; : > "$3"; }
+        install_service_dropin fail2ban.service 99-hardening "test control" <<EOF
+[Service]
+PrivateMounts=yes
+EOF
+        [[ -f "$HARDEN_SYSTEMD_DIR/fail2ban.service.d/99-hardening.conf" ]] \
+            && grep -Fq "restart fail2ban.service" "$test_dir/commands" \
+            && grep -Fq "before-score=5.0" "$SYSTEMD_HARDENING_REPORT" \
+            && grep -Fq "after-score=4.4" "$SYSTEMD_HARDENING_REPORT" \
+            && grep -Fq "result=kept: measured exposure decrease" "$SYSTEMD_HARDENING_REPORT" \
+            || exit 1
+    ' _ "$repo_root" "$case_root" || fail "measurable systemd exposure improvement regression failed"
+
+    env HARDEN_SOURCE_ONLY=1 HARDEN_SYSTEMD_DIR="$case_root/no-gain-systemd" HARDEN_SYSTEMD_HARDENING_REPORT="$case_root/no-gain-report" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        MODE=apply; BACKUP_DIR="$2/no-gain-backup"; CHANGE_LOG="$2/no-gain-changes"; : > "$CHANGE_LOG"; mkdir -p "$BACKUP_DIR"; : > "$SYSTEMD_HARDENING_REPORT"
+        unit_file_exists() { return 0; }; systemctl() { case "${1:-} ${2:-}" in "is-active --quiet") return 0 ;; "is-failed --quiet") return 1 ;; cat*) printf "[Service]\nExecStart=/bin/true\n" ;; esac; return 0; }
+        systemd_verify_unit() { return 0; }; transaction_copy() { :; }; transaction_restore() { rm -f -- "$1"; }
+        install_managed_file() { local destination="$1" mode="$2"; mkdir -p -- "$(dirname -- "$destination")"; cat > "$destination"; chmod "$mode" "$destination"; }; run_streamed() { "$@"; }; systemd_service_health_check() { return 0; }
+        measure_service_exposure() { SYSTEMD_EXPOSURE_RESULT=5.0; : > "$3"; }
+        install_service_dropin fail2ban.service 99-hardening "test control" <<EOF
+[Service]
+PrivateMounts=yes
+EOF
+        [[ ! -e "$HARDEN_SYSTEMD_DIR/fail2ban.service.d/99-hardening.conf" ]]
+        grep -Fq "rolled back: score did not decrease" "$SYSTEMD_HARDENING_REPORT"
+    ' _ "$repo_root" "$case_root" || fail "non-improving systemd sandbox was not rolled back"
+
+    env HARDEN_SOURCE_ONLY=1 HARDEN_SYSTEMD_DIR="$case_root/verify-systemd" HARDEN_SYSTEMD_HARDENING_REPORT="$case_root/verify-report" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        MODE=apply; BACKUP_DIR="$2/verify-backup"; CHANGE_LOG="$2/verify-changes"; : > "$CHANGE_LOG"; mkdir -p "$BACKUP_DIR"; : > "$SYSTEMD_HARDENING_REPORT"
+        unit_file_exists() { return 0; }; systemctl() { case "$1" in cat) printf "[Service]\nExecStart=/bin/true\n" ;; esac; return 0; }; systemd_verify_unit() { return 1; }
+        measure_service_exposure() { SYSTEMD_EXPOSURE_RESULT=5.0; : > "$3"; }
+        install_service_dropin fail2ban.service 99-hardening "test control" <<EOF
+[Service]
+PrivateMounts=yes
+EOF
+        [[ ! -e "$HARDEN_SYSTEMD_DIR/fail2ban.service.d/99-hardening.conf" ]]
+        grep -Fq "candidate rejected before installation" "$SYSTEMD_HARDENING_REPORT"
+    ' _ "$repo_root" "$case_root" || fail "invalid candidate systemd unit was installed"
+
+    env HARDEN_SOURCE_ONLY=1 HARDEN_SYSTEMD_DIR="$case_root/health-systemd" HARDEN_SYSTEMD_HARDENING_REPORT="$case_root/health-report" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        MODE=apply; BACKUP_DIR="$2/health-backup"; CHANGE_LOG="$2/health-changes"; : > "$CHANGE_LOG"; mkdir -p "$BACKUP_DIR"; : > "$SYSTEMD_HARDENING_REPORT"
+        unit_file_exists() { return 0; }; systemctl() { case "${1:-} ${2:-}" in "is-active --quiet") return 0 ;; "is-failed --quiet") return 1 ;; cat*) printf "[Service]\nExecStart=/bin/true\n" ;; esac; return 0; }; systemd_verify_unit() { return 0; }; transaction_copy() { :; }; transaction_restore() { rm -f -- "$1"; }
+        install_managed_file() { local destination="$1" mode="$2"; mkdir -p -- "$(dirname -- "$destination")"; cat > "$destination"; chmod "$mode" "$destination"; }; run_streamed() { "$@"; }; systemd_service_health_check() { return 1; }
+        measure_service_exposure() { [[ "$2" == before ]] && SYSTEMD_EXPOSURE_RESULT=5.0 || SYSTEMD_EXPOSURE_RESULT=4.4; : > "$3"; }
+        install_service_dropin fail2ban.service 99-hardening "test control" <<EOF
+[Service]
+PrivateMounts=yes
+EOF
+        [[ ! -e "$HARDEN_SYSTEMD_DIR/fail2ban.service.d/99-hardening.conf" ]]
+        grep -Fq "health=failed" "$SYSTEMD_HARDENING_REPORT"
+    ' _ "$repo_root" "$case_root" || fail "unhealthy systemd service did not roll back its drop-in"
+
+    env HARDEN_SOURCE_ONLY=1 HARDEN_SYSTEMD_DIR="$case_root/converged-systemd" HARDEN_SYSTEMD_HARDENING_REPORT="$case_root/converged-report" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        test_dir="$2"; MODE=apply; BACKUP_DIR="$test_dir/converged-backup"; CHANGE_LOG="$test_dir/converged-changes"; : > "$CHANGE_LOG"; mkdir -p "$BACKUP_DIR" "$HARDEN_SYSTEMD_DIR/fail2ban.service.d"; : > "$SYSTEMD_HARDENING_REPORT"; : > "$test_dir/converged-commands"
+        printf "[Service]\nPrivateMounts=yes\n" > "$HARDEN_SYSTEMD_DIR/fail2ban.service.d/99-hardening.conf"
+        unit_file_exists() { return 0; }; systemctl() { printf "%s " "$@" >> "$test_dir/converged-commands"; printf "\n" >> "$test_dir/converged-commands"; case "${1:-} ${2:-}" in "is-active --quiet") return 0 ;; cat*) printf "[Service]\nExecStart=/bin/true\n" ;; esac; return 0; }; systemd_verify_unit() { return 0; }; run_streamed() { "$@"; }; systemd_service_health_check() { return 0; }
+        measure_service_exposure() { SYSTEMD_EXPOSURE_RESULT=4.4; : > "$3"; }
+        install_service_dropin fail2ban.service 99-hardening "test control" <<EOF
+[Service]
+PrivateMounts=yes
+EOF
+        ! grep -Eq "daemon-reload|restart fail2ban.service" "$test_dir/converged-commands"
+        grep -Fq "already hardened/unchanged" "$SYSTEMD_HARDENING_REPORT"
+    ' _ "$repo_root" "$case_root" || fail "converged systemd drop-in caused a restart or rewrite"
+
+    env HARDEN_SOURCE_ONLY=1 bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        SSH_SERVICE=ssh.service
+        [[ "$(systemd_service_classification ssh.service)" == retained:* ]]
+        [[ "$(systemd_service_classification tailscaled.service)" == excluded:* ]]
+        [[ "$(systemd_service_classification networkd-dispatcher.service)" == candidate:* ]]
+        section="$(sed -n "/^harden_systemd_services()/,/^}/p" "$1/harden.sh")"
+        ! grep -Eq "install_service_dropin (tailscaled|dbus|cron|auditd|open-vm-tools|snapd|systemd-|polkit|cloud-init)" <<<"$section"
+        ssh_block="$(sed -n "/install_service_dropin \"\$SSH_SERVICE\"/,/EOF/p" "$1/harden.sh")"
+        grep -Fxq "PrivateTmp=yes" <<<"$ssh_block"; grep -Fxq "UMask=0027" <<<"$ssh_block"
+    ' _ "$repo_root" || fail "protected service or SSH preservation regression failed"
 }
 
 run_runtime_noop_tests() {
@@ -2724,6 +2817,9 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
         ;;
     compiler)
         run_compiler_tests
+        ;;
+    systemd)
+        run_systemd_idempotency_tests
         ;;
     packages)
         run_packagekit_tests

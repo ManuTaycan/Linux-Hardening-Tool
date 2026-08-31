@@ -17,7 +17,7 @@ umask 027
 
 readonly SCRIPT_VERSION="1.1.3"
 readonly LOG_FILE="${HARDEN_LOG_FILE:-/var/log/server-hardening.log}"
-readonly SYSTEMD_HARDENING_REPORT="/root/systemd-hardening-report.txt"
+readonly SYSTEMD_HARDENING_REPORT="${HARDEN_SYSTEMD_HARDENING_REPORT:-/root/systemd-hardening-report.txt}"
 readonly MAIN_PID="$BASHPID"
 
 MODE=""
@@ -4463,6 +4463,75 @@ classify_systemd_exposure() {
     fi
 }
 
+systemd_service_classification() {
+    local service="$1"
+    case "$service" in
+        fail2ban.service)
+            printf '%s\n' "candidate: jail and firewall daemon; retained only with fail2ban ping and sshd-jail health"
+            ;;
+        unattended-upgrades.service)
+            printf '%s\n' "candidate: APT/dpkg maintainer scripts need host package write access; strict filesystem or syscall filters are intentionally excluded"
+            ;;
+        rsyslog.service|acct.service|acct-monthly-report.service|uuidd.service)
+            printf '%s\n' "candidate: service-specific sandbox with merged-unit validation and health check"
+            ;;
+        networkd-dispatcher.service)
+            printf '%s\n' "candidate: network-event helper; no extra mount, device, capability, or address-family restriction is assumed safe for operator hooks"
+            ;;
+        "$SSH_SERVICE")
+            printf '%s\n' "retained: SSH sandboxing is limited to PrivateTmp/UMask to avoid inheritance into login or sudo sessions"
+            ;;
+        tailscaled.service|dbus.service|dbus-broker.service|cron.service|crond.service|auditd.service|open-vm-tools.service|snapd.service|systemd-*|polkit.service|cloud-init*)
+            printf '%s\n' "excluded: host-critical IPC, audit, overlay, guest, scheduler, or network responsibility"
+            ;;
+        *) printf '%s\n' "observed: no generic sandbox is applied without a service-specific compatibility case" ;;
+    esac
+}
+
+systemd_service_activity() {
+    local service="$1"
+    if systemctl is-active --quiet "$service"; then
+        printf '%s\n' active
+    else
+        printf '%s\n' inactive
+    fi
+}
+
+write_systemd_hardening_report() {
+    local service="$1" activity="$2" before="$3" after="$4" controls="$5" classification="$6" validation="$7" health="$8" result="$9"
+    local delta="N/A"
+    if [[ "$before" =~ ^[0-9]+([.][0-9]+)?$ && "$after" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        delta="$(awk -v before="$before" -v after="$after" 'BEGIN { printf "%.1f", after - before }')"
+    fi
+    {
+        printf '[%s]\n' "$service"
+        printf 'active=%s\n' "$activity"
+        printf 'before-score=%s\n' "${before:-N/A}"
+        printf 'after-score=%s\n' "${after:-N/A}"
+        printf 'delta=%s\n' "$delta"
+        printf 'controls=%s\n' "${controls:-none}"
+        printf 'classification=%s\n' "$classification"
+        printf 'validation=%s\n' "$validation"
+        printf 'health=%s\n' "$health"
+        printf 'result=%s\n\n' "$result"
+    } >> "$SYSTEMD_HARDENING_REPORT"
+}
+
+systemd_service_health_check() {
+    local service="$1"
+    if ! systemctl is-active --quiet "$service"; then
+        return 1
+    fi
+    case "$service" in
+        fail2ban.service)
+            command -v fail2ban-client >/dev/null 2>&1 || return 1
+            fail2ban-client ping >/dev/null 2>&1 || return 1
+            fail2ban-client status sshd >/dev/null 2>&1 || return 1
+            ;;
+    esac
+    return 0
+}
+
 systemd_verify_unit() {
     local unit_or_file="$1" analyze_help=""
     analyze_help="$(systemd-analyze --help 2>&1 || true)"
@@ -4491,8 +4560,8 @@ rollback_service_dropin() {
 }
 
 install_service_dropin() {
-    local service="$1" name="$2"
-    local destination="/etc/systemd/system/${service}.d/${name}.conf"
+    local service="$1" name="$2" controls="${3:-service-specific controls}"
+    local destination="${HARDEN_SYSTEMD_DIR:-/etc/systemd/system}/${service}.d/${name}.conf"
     if ! unit_file_exists "$service"; then
         cat >/dev/null
         return 0
@@ -4508,6 +4577,7 @@ install_service_dropin() {
     local preverify_file="$BACKUP_DIR/systemd-verify-${service//[^A-Za-z0-9_.-]/_}-pre-install.txt"
     local postverify_file="$BACKUP_DIR/systemd-verify-${service//[^A-Za-z0-9_.-]/_}-installed.txt"
     local before="" after="" was_active=0 health_action="restart" exposure_line="" exposure_outcome=""
+    local classification="" activity="" validation="not run" health="not run"
     local dropin_was_current=0
     local dropin_stage="" verify_dir="" verify_unit=""
     if ! dropin_stage="$(mktemp)"; then
@@ -4522,6 +4592,13 @@ install_service_dropin() {
     if [[ -f "$destination" ]] && cmp -s "$dropin_stage" "$destination"; then
         dropin_was_current=1
     fi
+    classification="$(systemd_service_classification "$service")"
+    activity="$(systemd_service_activity "$service")"
+    measure_service_exposure "$service" before "$before_file"
+    before="$SYSTEMD_EXPOSURE_RESULT"
+    [[ -z "$before" ]] || SERVICE_EXPOSURE_BEFORE["$service"]="$before"
+    [[ "$activity" == active ]] && was_active=1
+    [[ -n "$SSH_SERVICE" && "$service" == "$SSH_SERVICE" ]] && health_action="reload"
     if ! verify_dir="$(mktemp -d)"; then
         rm -f -- "$dropin_stage"
         log WARN "Could not create a verification directory; skipped systemd hardening for ${service}"
@@ -4542,16 +4619,33 @@ install_service_dropin() {
         rm -f -- "$dropin_stage" "$verify_unit"
         rmdir -- "$verify_dir" 2>/dev/null || true
         log WARN "Pre-install systemd verification rejected the candidate drop-in for ${service}; see ${preverify_file}"
+        write_systemd_hardening_report "$service" "$activity" "$before" "" "$controls" "$classification" "candidate rejected before installation" "not run" "retained/no change"
         return 0
     fi
+    validation="candidate merged unit verified"
     chmod 0600 "$preverify_file"
     rm -f -- "$verify_unit"
     rmdir -- "$verify_dir" 2>/dev/null || true
-    measure_service_exposure "$service" before "$before_file"
-    before="$SYSTEMD_EXPOSURE_RESULT"
-    [[ -z "$before" ]] || SERVICE_EXPOSURE_BEFORE["$service"]="$before"
-    systemctl is-active --quiet "$service" && was_active=1
-    [[ -n "$SSH_SERVICE" && "$service" == "$SSH_SERVICE" ]] && health_action="reload"
+    if [[ "$dropin_was_current" -eq 1 ]]; then
+        if [[ "$was_active" -eq 1 ]] && ! systemd_service_health_check "$service"; then
+            write_systemd_hardening_report "$service" "$activity" "$before" "$before" "$controls" "$classification" "$validation" "failed (existing unit was not restarted)" "retained for operator review"
+            log WARN "Existing ${service} drop-in was left untouched because its health check failed; no restart was attempted"
+            rm -f -- "$dropin_stage"
+            return 0
+        fi
+        health="healthy/no restart required"
+        measure_service_exposure "$service" after "$after_file"
+        after="$SYSTEMD_EXPOSURE_RESULT"
+        [[ -z "$after" ]] || SERVICE_EXPOSURE_AFTER["$service"]="$after"
+        if [[ -n "$before" && -n "$after" ]]; then
+            printf -v exposure_line '%-32s %s -> %s' "$service" "$before" "$after"
+            SERVICE_EXPOSURE_SUMMARY+=("$exposure_line")
+        fi
+        write_systemd_hardening_report "$service" "$activity" "$before" "$after" "$controls" "$classification" "$validation" "$health" "already hardened/unchanged"
+        log OK "${service} drop-in is already valid and healthy; no write, daemon-reload, or restart was needed (${before:-N/A} -> ${after:-N/A})"
+        rm -f -- "$dropin_stage"
+        return 0
+    fi
     transaction_copy "$destination" "$transaction_label"
     if ! install_managed_file "$destination" 0644 < "$dropin_stage"; then
         rm -f -- "$dropin_stage"
@@ -4561,48 +4655,55 @@ install_service_dropin() {
     rm -f -- "$dropin_stage"
     if ! systemd_verify_unit "$service" > "$postverify_file" 2>&1; then
         rollback_service_dropin "$service" "$destination" "$transaction_label" "$was_active" "$health_action" "systemd-analyze verify rejected the drop-in"
+        write_systemd_hardening_report "$service" "$activity" "$before" "" "$controls" "$classification" "installed unit rejected" "not run" "rolled back"
         return 0
     fi
+    validation="installed merged unit verified"
     chmod 0600 "$postverify_file"
     if ! run_streamed systemctl daemon-reload; then
         rollback_service_dropin "$service" "$destination" "$transaction_label" "$was_active" "$health_action" "systemd daemon-reload failed"
+        write_systemd_hardening_report "$service" "$activity" "$before" "" "$controls" "$classification" "$validation; daemon-reload failed" "not run" "rolled back"
         return 0
     fi
     if [[ "$was_active" -eq 1 ]]; then
-        if ! run_streamed systemctl "$health_action" "$service" || ! systemctl is-active --quiet "$service"; then
+        if ! run_streamed systemctl "$health_action" "$service" || ! systemd_service_health_check "$service"; then
             rollback_service_dropin "$service" "$destination" "$transaction_label" "$was_active" "$health_action" "active-service health check failed"
+            write_systemd_hardening_report "$service" "$activity" "$before" "" "$controls" "$classification" "$validation" "failed" "rolled back"
             return 0
         fi
+        health="healthy"
     elif [[ "$service" == "uuidd.service" ]]; then
-        if ! run_streamed systemctl start "$service" || systemctl is-failed --quiet "$service"; then
+        if ! run_streamed systemctl start "$service" || systemctl is-failed --quiet "$service" || ! systemd_service_health_check "$service"; then
             rollback_service_dropin "$service" "$destination" "$transaction_label" "$was_active" "$health_action" "safe inactive-service health check failed"
+            write_systemd_hardening_report "$service" "$activity" "$before" "" "$controls" "$classification" "$validation" "failed" "rolled back"
             return 0
         fi
         run_streamed systemctl stop "$service" || true
+        health="healthy (safe transient start/stop)"
     elif systemctl is-failed --quiet "$service"; then
         rollback_service_dropin "$service" "$destination" "$transaction_label" "$was_active" "$health_action" "inactive service is in failed state"
+        write_systemd_hardening_report "$service" "$activity" "$before" "" "$controls" "$classification" "$validation" "failed" "rolled back"
         return 0
+    else
+        health="not active/not failed"
     fi
     measure_service_exposure "$service" after "$after_file"
     after="$SYSTEMD_EXPOSURE_RESULT"
     [[ -z "$after" ]] || SERVICE_EXPOSURE_AFTER["$service"]="$after"
-    SERVICES_HARDENED+=("$service")
+    exposure_outcome="$(classify_systemd_exposure "$before" "$after" 0)"
     if [[ -n "$before" && -n "$after" ]]; then
         printf -v exposure_line '%-32s %s -> %s' "$service" "$before" "$after"
-        SERVICE_EXPOSURE_SUMMARY+=("$exposure_line")
-        printf '%-36s %s -> %s\n' "$service" "$before" "$after" >> "$SYSTEMD_HARDENING_REPORT"
-        exposure_outcome="$(classify_systemd_exposure "$before" "$after" "$dropin_was_current")"
-        if [[ "$exposure_outcome" == decreased ]]; then
-            record_change "Installed and health-tested systemd hardening for ${service}; exposure ${before} -> ${after}"
-        elif [[ "$exposure_outcome" == unchanged ]]; then
-            log OK "${service} drop-in is already active and passed health checks; exposure unchanged/already hardened (${before} -> ${after})"
-        else
-            log WARN "${service} passed health checks but exposure did not decrease (${before} -> ${after})"
-        fi
-    else
-        printf '%-36s exposure unavailable (before=%s, after=%s)\n' "$service" "${before:-N/A}" "${after:-N/A}" >> "$SYSTEMD_HARDENING_REPORT"
-        record_change "Installed and health-tested systemd hardening for ${service}; exposure score unavailable"
     fi
+    if [[ "$exposure_outcome" != decreased ]]; then
+        rollback_service_dropin "$service" "$destination" "$transaction_label" "$was_active" "$health_action" "exposure did not measurably decrease"
+        write_systemd_hardening_report "$service" "$activity" "$before" "$after" "$controls" "$classification" "$validation" "$health" "rolled back: score did not decrease"
+        log WARN "${service} passed health checks but the candidate was rolled back because exposure did not decrease (${before:-N/A} -> ${after:-N/A})"
+        return 0
+    fi
+    SERVICES_HARDENED+=("$service")
+    [[ -n "$exposure_line" ]] && SERVICE_EXPOSURE_SUMMARY+=("$exposure_line")
+    write_systemd_hardening_report "$service" "$activity" "$before" "$after" "$controls" "$classification" "$validation" "$health" "kept: measured exposure decrease"
+    record_change "Installed and health-tested systemd hardening for ${service}; exposure ${before} -> ${after}"
     return 0
 }
 
@@ -4611,7 +4712,7 @@ analyze_active_services() {
         log INFO "Would run systemd-analyze security SERVICE for every active service and retain the complete report"
         return 0
     fi
-    local report="$BACKUP_DIR/systemd-security-active-services.txt" active_units service rest
+    local report="$BACKUP_DIR/systemd-security-active-services.txt" active_units service rest score_file classification activity
     active_units="$(systemctl list-units --type=service --state=active --no-legend --plain 2>/dev/null || true)"
     : > "$report"
     chmod 0600 "$report"
@@ -4619,6 +4720,11 @@ analyze_active_services() {
         [[ "$service" == *.service ]] || continue
         printf '\n===== %s =====\n' "$service" >> "$report"
         systemd-analyze security --no-pager "$service" >> "$report" 2>&1 || true
+        score_file="$BACKUP_DIR/systemd-security-${service//[^A-Za-z0-9_.-]/_}-inventory.txt"
+        measure_service_exposure "$service" inventory "$score_file"
+        classification="$(systemd_service_classification "$service")"
+        activity="$(systemd_service_activity "$service")"
+        write_systemd_hardening_report "$service" "$activity" "$SYSTEMD_EXPOSURE_RESULT" "" "none" "$classification" "systemd-analyze inventory captured" "$activity" "observed before service-specific review"
     done <<<"$active_units"
     record_change "Ran systemd-analyze security individually for every active service; report: ${report}"
     return 0
@@ -4634,7 +4740,8 @@ harden_systemd_services() {
     else
         log INFO "Would write measured systemd exposure changes to ${SYSTEMD_HARDENING_REPORT}"
     fi
-    install_service_dropin rsyslog.service 99-hardening <<'EOF'
+    analyze_active_services
+    install_service_dropin rsyslog.service 99-hardening "log-spool paths, namespace and kernel-view isolation" <<'EOF'
 [Service]
 NoNewPrivileges=yes
 PrivateTmp=yes
@@ -4658,11 +4765,12 @@ SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 UMask=0027
 EOF
-    install_service_dropin fail2ban.service 99-hardening <<'EOF'
+    install_service_dropin fail2ban.service 99-hardening "log/jail paths, private devices/mounts, kernel-view isolation, native syscall ABI" <<'EOF'
 [Service]
 NoNewPrivileges=yes
 PrivateTmp=yes
 PrivateDevices=yes
+PrivateMounts=yes
 ProtectSystem=strict
 ReadWritePaths=-/var/log -/var/lib/fail2ban -/run/fail2ban
 ProtectHome=yes
@@ -4684,13 +4792,13 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 UMask=0027
 EOF
     if [[ -n "$SSH_SERVICE" ]]; then
-        install_service_dropin "$SSH_SERVICE" 99-hardening <<'EOF'
+        install_service_dropin "$SSH_SERVICE" 99-hardening "PrivateTmp and restrictive creation mask only" <<'EOF'
 [Service]
 PrivateTmp=yes
 UMask=0027
 EOF
     fi
-    install_service_dropin unattended-upgrades.service 99-hardening <<'EOF'
+    install_service_dropin unattended-upgrades.service 99-hardening "non-disruptive privilege, temporary-file, home and kernel-log isolation" <<'EOF'
 [Service]
 NoNewPrivileges=yes
 PrivateTmp=yes
@@ -4703,7 +4811,7 @@ RestrictRealtime=yes
 LockPersonality=yes
 UMask=0027
 EOF
-    install_service_dropin acct.service 99-hardening <<'EOF'
+    install_service_dropin acct.service 99-hardening "accounting-log write path, CAP_SYS_PACCT, namespace and kernel-view isolation" <<'EOF'
 [Service]
 NoNewPrivileges=yes
 PrivateTmp=yes
@@ -4727,7 +4835,7 @@ AmbientCapabilities=
 RestrictAddressFamilies=AF_UNIX
 UMask=0027
 EOF
-    install_service_dropin acct-monthly-report.service 99-hardening <<'EOF'
+    install_service_dropin acct-monthly-report.service 99-hardening "accounting report paths, private devices, namespaces and kernel-view isolation" <<'EOF'
 [Service]
 NoNewPrivileges=yes
 PrivateTmp=yes
@@ -4754,7 +4862,7 @@ AmbientCapabilities=
 RestrictAddressFamilies=AF_UNIX
 UMask=0027
 EOF
-    install_service_dropin uuidd.service 99-hardening <<'EOF'
+    install_service_dropin uuidd.service 99-hardening "uuidd runtime socket, private devices, namespaces and kernel-view isolation" <<'EOF'
 [Service]
 NoNewPrivileges=yes
 PrivateTmp=yes
@@ -4781,7 +4889,7 @@ AmbientCapabilities=
 RestrictAddressFamilies=AF_UNIX
 UMask=0027
 EOF
-    install_service_dropin networkd-dispatcher.service 99-hardening <<'EOF'
+    install_service_dropin networkd-dispatcher.service 99-hardening "existing narrow temporary-file, filesystem and kernel-view isolation only" <<'EOF'
 [Service]
 NoNewPrivileges=yes
 PrivateTmp=yes
@@ -4801,7 +4909,6 @@ SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 UMask=0027
 EOF
-    analyze_active_services
     record_skip "BOOT-5264:cron.service" "cron executes arbitrary administrator jobs, so a global sandbox would break its purpose"
     record_skip "BOOT-5264:ssh.service" "only PrivateTmp/UMask are applied; stronger unit restrictions would propagate into sudo administrator sessions"
     record_skip "BOOT-5264:excluded-services" "dbus, cron, auditd, tailscaled, open-vm-tools, systemd-*, polkit, snapd, and cloud-init are not blindly sandboxed because their IPC, namespace, audit, overlay, or guest duties are host-critical"

@@ -73,6 +73,32 @@ nächsten Boot mit noch schreibbarem Control bei 0 bleiben und die Unit darf
 nicht erfolgreich erscheinen. Sichere dann Diagnosebericht und Journal, ohne
 Tailscale-Prefs automatisch zu verändern.
 
+### Ubuntu-26.04.1-Retest systemd-Service-Exposure (#11)
+
+Führe den Apply aus einer bestätigten zweiten SSH-/Recovery-Sitzung direkt ohne
+externe `tee`-Pipe aus. Der Report muss für jeden aktiven Dienst Activity,
+Before-/After-Score, Delta, Controls, Klassifikation, Unit-Validierung und
+Health-Resultat enthalten. Ein neuer Drop-in bleibt nur bei messbar kleinerem
+Exposure bestehen; ein Verify- oder Health-Fehler muss den vorherigen Drop-in
+vollständig wiederherstellen.
+
+```bash
+sudo ./harden.sh --apply --aggressive
+sudo cat /root/systemd-hardening-report.txt
+systemctl is-active fail2ban.service ssh.service tailscaled.service
+sudo fail2ban-client ping
+sudo fail2ban-client status sshd
+sudo systemd-analyze security fail2ban.service unattended-upgrades.service networkd-dispatcher.service
+systemctl --failed --no-pager
+sudo ./harden.sh --apply --aggressive
+```
+
+Der zweite Lauf darf bei gültigen Drop-ins weder `systemctl daemon-reload` noch
+einen Service-Restart auslösen; die Scores bleiben stabil. SSH wird höchstens
+mit `PrivateTmp`/`UMask` behandelt. Tailscale, dbus, cron, auditd,
+open-vm-tools, snapd, systemd-Units, polkit, cloud-init sowie weitere
+Netzwerk-/Storage-kritische Dienste bleiben ohne generisches Sandbox-Profil.
+
 ### Ubuntu-26.04.1-Retest der rp_filter-Routingpolicy (#7)
 
 Führe den Apply direkt aus (ohne externes `tee`) und prüfe den vom Script

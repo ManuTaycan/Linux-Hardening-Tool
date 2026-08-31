@@ -7,6 +7,15 @@ für 1.1.3 wird erst nach dem vollständigen Zielsystemtest erstellt.
 
 ### Changed
 
+- Systemd exposure review now inventories every active service, records its
+  activity state, score, controls, classification, validation and health in
+  `/root/systemd-hardening-report.txt`, and retains a new service-specific
+  drop-in only after a merged-unit verification, health check and measurable
+  `systemd-analyze security` reduction. Existing valid drop-ins converge
+  without rewriting, daemon-reload or restart. Fail2ban additionally uses a
+  private mount namespace only when its client ping and `sshd` jail validate;
+  APT, SSH, Tailscale and network-critical services remain deliberately narrow
+  or excluded.
 - Ubuntu target-test follow-up: Phase 03 now performs one controlled
   `apt-get upgrade` only after `apt-get check` and a locale-stable simulation;
   removals and downgrade signals block the operation, conffiles use conservative
