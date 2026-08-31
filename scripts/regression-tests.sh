@@ -2648,7 +2648,6 @@ EOF
             [[ -x "$HARDEN_UPDATE_MOTD_DIR/50-motd-news" && -x "$HARDEN_UPDATE_MOTD_DIR/98-reboot-required" && ! -e "$HARDEN_MOTD_CACHE" ]]
         fi
         grep -Fxq "ENABLED=0" "$HARDEN_MOTD_NEWS_DEFAULT"
-        [[ "$MOTD_TEST_MOCK_EXEC" == 1 || -e "$BACKUP_DIR/motd-news-reset" ]]
         transaction_restore "$HARDEN_UPDATE_MOTD_DIR/00-header" motd-hook-00-header
         [[ "$MOTD_TEST_MOCK_EXEC" == 1 || -x "$HARDEN_UPDATE_MOTD_DIR/00-header" ]]
     ' _ "$repo_root" "$motd_root" || fail "MOTD presentation classification, preservation, or rollback failed"
