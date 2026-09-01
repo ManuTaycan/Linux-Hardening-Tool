@@ -155,9 +155,15 @@ sudo ./harden.sh --apply --aggressive
 ```
 
 Für jeden tatsächlich profilierten Dienst prüfe den gemergten Profilpfad mit
-`apparmor_parser -Q`, den Healthcheck und `/proc/<PID>/attr/current`. Der
-zweite Lauf darf bei unverändertem Inventar weder ein Profil laden noch einen
-Dienst neu starten.
+`apparmor_parser -Q`, den Healthcheck und `/proc/<PID>/attr/current`. Für
+`rsyslog.service` gehören außerdem `rsyslogd -N1`, ein echter `logger`-Probe
+und – soweit der Kernel-Journalzugriff verfügbar ist – eine Prüfung neuer
+AppArmor-`DENIED`-Ereignisse dazu. Schlägt eine Transition fehl, darf der
+Bericht `rolled-back` nur nach nachgewiesenem Profil-Unload, genau einem
+Service-Restart, positivem Healthcheck und wieder unconfined laufendem Prozess
+ausweisen; andernfalls muss er `rollback-failed` und manuellen Recovery-Bedarf
+melden. Der zweite Lauf darf bei unverändertem Inventar weder ein Profil laden
+noch einen Dienst neu starten.
 
 Der zweite Lauf darf bei gültigen Drop-ins weder `systemctl daemon-reload` noch
 einen Service-Restart auslösen; die Scores bleiben stabil. SSH wird mit

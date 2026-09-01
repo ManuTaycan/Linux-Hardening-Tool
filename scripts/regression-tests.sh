@@ -1936,7 +1936,7 @@ run_apparmor_profile_tests() {
     env HARDEN_SOURCE_ONLY=1 HARDEN_APPARMOR_DIR="$case_root/profiles" HARDEN_APPARMOR_REPORT="$case_root/report" HARDEN_APPARMOR_KERNEL_PROFILES="$case_root/kernel-profiles" bash -c '
         source "$1/harden.sh"; trap - ERR EXIT
         test_dir="$2"; MODE=apply; BACKUP_DIR="$test_dir/backup"; CHANGE_LOG="$test_dir/changes"; mkdir -p "$BACKUP_DIR"; : > "$CHANGE_LOG"; : > "$test_dir/commands"
-        apparmor_service_executable() { printf "/usr/bin/fail2ban-server\n"; }; dpkg-query() { return 0; }; apparmor_process_is_unconfined_for_service() { [[ ! -e "$test_dir/confined" ]]; }; apparmor_service_health_check() { return 0; }
+        apparmor_service_executable() { printf "/usr/bin/fail2ban-server\n"; }; dpkg-query() { return 0; }; apparmor_process_is_unconfined_for_service() { [[ ! -e "$test_dir/confined" ]]; }; apparmor_service_health_check() { return 0; }; apparmor_new_denials_for_executable() { return 1; }
         apparmor_parser() { printf "parser %s\n" "$*" >> "$test_dir/commands"; [[ "$1" != -R ]] && : > "$test_dir/confined"; return 0; }; systemctl() { printf "systemctl %s\n" "$*" >> "$test_dir/commands"; return 0; }; run_streamed() { "$@"; }
         configure_apparmor_vendor_service fail2ban.service
         grep -Fq "parser -Q" "$test_dir/commands" && grep -Fq "parser -r" "$test_dir/commands" && grep -Fq "systemctl restart" "$test_dir/commands" && grep -Fxq "fail2ban.service" "$test_dir/commands" && grep -Fq "result=kept" "$APPARMOR_REPORT" || exit 1
@@ -1946,12 +1946,49 @@ run_apparmor_profile_tests() {
 
     env HARDEN_SOURCE_ONLY=1 HARDEN_APPARMOR_DIR="$case_root/profiles" HARDEN_APPARMOR_REPORT="$case_root/rollback-report" HARDEN_APPARMOR_KERNEL_PROFILES="$case_root/kernel-profiles" bash -c '
         source "$1/harden.sh"; trap - ERR EXIT
-        test_dir="$2"; MODE=apply; BACKUP_DIR="$test_dir/rollback-backup"; CHANGE_LOG="$test_dir/rollback-changes"; mkdir -p "$BACKUP_DIR"; : > "$CHANGE_LOG"; : > "$test_dir/rollback-commands"
-        apparmor_service_executable() { printf "/usr/bin/fail2ban-server\n"; }; dpkg-query() { return 0; }; apparmor_process_is_unconfined_for_service() { return 0; }; apparmor_service_health_check() { return 1; }
-        apparmor_parser() { printf "parser %s\n" "$*" >> "$test_dir/rollback-commands"; return 0; }; systemctl() { printf "systemctl %s\n" "$*" >> "$test_dir/rollback-commands"; return 0; }; run_streamed() { "$@"; }
+        test_dir="$2"; MODE=apply; BACKUP_DIR="$test_dir/rollback-backup"; CHANGE_LOG="$test_dir/rollback-changes"; mkdir -p "$BACKUP_DIR"; : > "$CHANGE_LOG"; : > "$test_dir/rollback-commands"; rm -f -- "$test_dir/confined"
+        health_checks=0
+        apparmor_service_executable() { printf "/usr/bin/fail2ban-server\n"; }; dpkg-query() { return 0; }; apparmor_process_is_unconfined_for_service() { [[ ! -e "$test_dir/confined" ]]; }; apparmor_service_health_check() { health_checks=$((health_checks + 1)); [[ "$health_checks" -gt 1 ]]; }; apparmor_new_denials_for_executable() { return 1; }
+        apparmor_parser() { printf "parser %s\n" "$*" >> "$test_dir/rollback-commands"; if [[ "$1" == -r ]]; then : > "$test_dir/confined"; elif [[ "$1" == -R ]]; then rm -f -- "$test_dir/confined"; fi; return 0; }; systemctl() { printf "systemctl %s\n" "$*" >> "$test_dir/rollback-commands"; return 0; }; run_streamed() { "$@"; }
         configure_apparmor_vendor_service fail2ban.service
-        grep -Fq "parser -R" "$test_dir/rollback-commands" && grep -Fq "systemctl restart" "$test_dir/rollback-commands" && grep -Fxq "fail2ban.service" "$test_dir/rollback-commands" && grep -Fq "result=rolled-back" "$APPARMOR_REPORT" || exit 1
-    ' _ "$repo_root" "$case_root" || fail "AppArmor health-failure rollback regression failed"
+        grep -Fq "parser -R" "$test_dir/rollback-commands" && [[ "$(grep -Fc "systemctl restart" "$test_dir/rollback-commands")" == 2 ]] && grep -Fq "result=rolled-back validation=profile-unloaded,service-restarted,service-healthy,process-unconfined" "$APPARMOR_REPORT" && [[ "$APPARMOR_TRANSITION_FAILED" == 0 ]] || exit 1
+    ' _ "$repo_root" "$case_root" || fail "AppArmor proven rollback regression failed"
+
+    env HARDEN_SOURCE_ONLY=1 HARDEN_APPARMOR_DIR="$case_root/profiles" HARDEN_APPARMOR_REPORT="$case_root/unload-failure-report" HARDEN_APPARMOR_KERNEL_PROFILES="$case_root/kernel-profiles" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        test_dir="$2"; MODE=apply; BACKUP_DIR="$test_dir/unload-failure-backup"; CHANGE_LOG="$test_dir/unload-failure-changes"; mkdir -p "$BACKUP_DIR"; : > "$CHANGE_LOG"; : > "$test_dir/unload-failure-commands"; rm -f -- "$test_dir/confined"
+        apparmor_service_executable() { printf "/usr/bin/fail2ban-server\n"; }; dpkg-query() { return 0; }; apparmor_process_is_unconfined_for_service() { return 0; }; apparmor_service_health_check() { return 0; }; apparmor_new_denials_for_executable() { return 1; }
+        apparmor_parser() { printf "parser %s\n" "$*" >> "$test_dir/unload-failure-commands"; [[ "$1" != -R ]]; }; systemctl() { printf "systemctl %s\n" "$*" >> "$test_dir/unload-failure-commands"; return 0; }; run_streamed() { "$@"; }
+        configure_apparmor_vendor_service fail2ban.service
+        grep -Fq "parser -R" "$test_dir/unload-failure-commands" && [[ "$(grep -Fc "systemctl restart" "$test_dir/unload-failure-commands")" == 2 ]] && grep -Fq "result=rollback-failed unload=failed" "$APPARMOR_REPORT" && [[ "$APPARMOR_TRANSITION_FAILED" == 1 ]] && ! grep -Fq "result=rolled-back " "$APPARMOR_REPORT"
+    ' _ "$repo_root" "$case_root" || fail "AppArmor unload-failure rollback regression failed"
+
+    env HARDEN_SOURCE_ONLY=1 HARDEN_APPARMOR_DIR="$case_root/profiles" HARDEN_APPARMOR_REPORT="$case_root/restart-failure-report" HARDEN_APPARMOR_KERNEL_PROFILES="$case_root/kernel-profiles" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        test_dir="$2"; MODE=apply; BACKUP_DIR="$test_dir/restart-failure-backup"; CHANGE_LOG="$test_dir/restart-failure-changes"; mkdir -p "$BACKUP_DIR"; : > "$CHANGE_LOG"; : > "$test_dir/restart-failure-commands"; rm -f -- "$test_dir/confined"
+        restarts=0
+        apparmor_service_executable() { printf "/usr/bin/fail2ban-server\n"; }; dpkg-query() { return 0; }; apparmor_process_is_unconfined_for_service() { return 0; }; apparmor_service_health_check() { return 1; }; apparmor_new_denials_for_executable() { return 1; }
+        apparmor_parser() { printf "parser %s\n" "$*" >> "$test_dir/restart-failure-commands"; return 0; }; systemctl() { printf "systemctl %s\n" "$*" >> "$test_dir/restart-failure-commands"; if [[ "$1" == restart ]]; then restarts=$((restarts + 1)); [[ "$restarts" -lt 2 ]]; else return 0; fi; }; run_streamed() { "$@"; }
+        configure_apparmor_vendor_service fail2ban.service
+        [[ "$restarts" == 2 ]] && grep -Fq "result=rollback-failed" "$APPARMOR_REPORT" && grep -Fq "restart=failed" "$APPARMOR_REPORT" && [[ "$APPARMOR_TRANSITION_FAILED" == 1 ]]
+    ' _ "$repo_root" "$case_root" || fail "AppArmor rollback restart-failure regression failed"
+
+    printf '/usr/sbin/rsyslogd {\n}\n' > "$case_root/profiles/usr.sbin.rsyslogd"
+    env HARDEN_SOURCE_ONLY=1 HARDEN_APPARMOR_DIR="$case_root/profiles" HARDEN_APPARMOR_REPORT="$case_root/rsyslog-denied-report" HARDEN_APPARMOR_KERNEL_PROFILES="$case_root/kernel-profiles" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        test_dir="$2"; MODE=apply; BACKUP_DIR="$test_dir/rsyslog-backup"; CHANGE_LOG="$test_dir/rsyslog-changes"; mkdir -p "$BACKUP_DIR"; : > "$CHANGE_LOG"; : > "$test_dir/rsyslog-commands"
+        apparmor_service_executable() { printf "/usr/sbin/rsyslogd\n"; }; dpkg-query() { return 0; }; apparmor_process_is_unconfined_for_service() { return 0; }; apparmor_service_health_check() { return 0; }; apparmor_new_denials_for_executable() { return 0; }
+        apparmor_parser() { printf "parser %s\n" "$*" >> "$test_dir/rsyslog-commands"; return 0; }; systemctl() { printf "systemctl %s\n" "$*" >> "$test_dir/rsyslog-commands"; return 0; }; run_streamed() { "$@"; }
+        configure_apparmor_vendor_service rsyslog.service
+        [[ "$(grep -Fc "systemctl restart" "$test_dir/rsyslog-commands")" == 2 ]] && grep -Fq "result=rolled-back" "$APPARMOR_REPORT" && ! grep -Fq "result=kept" "$APPARMOR_REPORT"
+    ' _ "$repo_root" "$case_root" || fail "AppArmor rsyslog DENIED-event rollback regression failed"
+
+    env HARDEN_SOURCE_ONLY=1 bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        systemctl() { [[ "$1" == is-active && "$2" == --quiet && "$3" == rsyslog.service ]]; }
+        rsyslogd() { return 1; }; run_streamed() { "$@"; }
+        ! apparmor_service_health_check rsyslog.service
+    ' _ "$repo_root" || fail "AppArmor rsyslog runtime validation regression failed"
 
     env HARDEN_SOURCE_ONLY=1 HARDEN_APPARMOR_REPORT="$case_root/dry-run-report" bash -c '
         source "$1/harden.sh"; trap - ERR EXIT
