@@ -59,6 +59,19 @@ für 1.1.3 wird erst nach dem vollständigen Zielsystemtest erstellt.
   `tee`.
 - Phase 03 now warns about legitimate multi-minute package work and streams APT
   progress without imposing artificial package timeouts.
+- acct-monthly-report.service now receives only its vendor report write path,
+  `/var/log/wtmp.report`, under ProtectSystem=strict. If absent, the file is
+  created before activation as `root:adm` mode `0640`, matching the vendor
+  script; existing report contents are never overwritten by the tool. The
+  one-shot is run once after a changed policy (and to recover a pre-existing
+  failed state), with merged-unit validation and report metadata validation;
+  successful runs may clear failed state, while failures roll back the empty
+  placeholder only. Existing valid policy converges without daemon-reload,
+  restart, file creation, or another report run.
+  This service-specific compatibility correction is retained even when
+  `systemd-analyze security` remains unchanged, but only after exact
+  ReadWritePaths, merged-unit, one-shot and metadata validation; generic
+  service score gates remain unchanged.
 - AIDE now validates the distribution's active configuration directly, without
   requiring `update-aide.conf`; it resolves `database_in`/`database_out`,
   atomically activates a verified baseline, skips unnecessary second-run
