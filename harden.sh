@@ -5425,36 +5425,62 @@ apparmor_unconfined_classification() {
         ssh.service|sshd.service|tailscaled.service|NetworkManager.service|systemd-networkd.service|networking.service|networkd-dispatcher.service|nftables.service|firewalld.service)
             printf 'protected-service|remote-access, overlay, networking or firewall safety boundary'
             ;;
-        systemd-*.service|dbus.service|polkit.service|cron.service|auditd.service|apt-daily*.service|unattended-upgrades.service|snapd.service|cloud-*.service)
-            printf 'consciously-unconfined|system, package-management or recovery path'
+        systemd-*.service|dbus.service|polkit.service|cron.service|auditd.service|apt-daily*.service|unattended-upgrades.service|snapd.service|cloud-*.service|packagekit.service|user@*.service|getty*.service|serial-getty*.service|rescue.service|emergency.service|systemd-recovery.service)
+            printf 'consciously-unconfined|system, package-management, login or recovery path'
             ;;
         '')
-            if [[ "$pid" == 1 || "$process" == kthreadd* ]]; then
-                printf 'system-process|kernel or PID-1 execution context'
-            else
-                printf 'unattributed-process|no stable systemd service unit found'
-            fi
+            case "$process" in
+                kthreadd*|kworker*|ksoftirqd*|migration*|idle_inject*|cpuhp*|watchdog*|cpuhp*|rcu*|oom_reaper*|mm_percpu_wq|kcompactd*|kswapd*|jbd2/*|ext4-rsv-conver*)
+                    printf 'system-process|kernel thread without a systemd unit'
+                    ;;
+                systemd|init|systemd-udevd|systemd-journald|systemd-logind)
+                    printf 'system-process|userspace system process without a unit mapping'
+                    ;;
+                '')
+                    printf 'unattributed-process|process name and systemd unit unavailable'
+                    ;;
+                *)
+                    printf 'unattributed-userspace|userspace process without a stable systemd service unit'
+                    ;;
+            esac
             ;;
         *) printf 'service-candidate|persistent service; vendor profile may be assessed' ;;
     esac
 }
 
+apparmor_process_name() {
+    local pid="$1" process=""
+    if IFS= read -r process < "/proc/${pid}/comm" 2>/dev/null; then
+        printf '%s\n' "$process"
+    else
+        printf 'unknown\n'
+    fi
+}
+
 write_apparmor_unconfined_inventory() {
-    local stage="$1" pid current process unit classification count=0
+    local stage="$1" pid current process unit classification class_key count=0 meaningful_count=0
+    declare -A classification_counts=()
     printf '[%s]\n' "$stage" >> "$APPARMOR_REPORT"
     for pid in /proc/[0-9]*; do
         pid="${pid##*/}"
         [[ -r "/proc/${pid}/attr/current" ]] || continue
         current="$(< "/proc/${pid}/attr/current")"
         [[ "$current" == unconfined* ]] || continue
-        process="$(< "/proc/${pid}/comm" 2>/dev/null || printf unknown)"
+        process="$(apparmor_process_name "$pid")"
         unit="$(apparmor_unit_for_pid "$pid")"
         classification="$(apparmor_unconfined_classification "$pid" "$process" "$unit")"
         printf 'pid=%s process=%s unit=%s apparmor=%s classification=%s\n' \
             "$pid" "$process" "${unit:-N/A}" "$current" "$classification" >> "$APPARMOR_REPORT"
         count=$((count + 1))
+        class_key="${classification%%|*}"
+        classification_counts["$class_key"]=$(( ${classification_counts["$class_key"]:-0} + 1 ))
+        case "$class_key" in system-process|unattributed-process|unattributed-userspace) ;; *) meaningful_count=$((meaningful_count + 1)) ;; esac
     done
     printf 'unconfined-count=%s\n\n' "$count" >> "$APPARMOR_REPORT"
+    for class_key in "${!classification_counts[@]}"; do
+        printf 'classification-count[%s]=%s\n' "$class_key" "${classification_counts[$class_key]}" >> "$APPARMOR_REPORT"
+    done
+    printf 'meaningful-userspace-service-count=%s (inventory metric; not Lynis-compatible)\n\n' "$meaningful_count" >> "$APPARMOR_REPORT"
     printf '%s\n' "$count"
 }
 
@@ -5540,6 +5566,11 @@ apparmor_service_health_check() {
     esac
 }
 
+apparmor_report_service_assessment() {
+    local service="$1" result="$2" reason="$3"
+    printf 'service=%s result=%s reason=%s\n' "$service" "$result" "$reason" >> "$APPARMOR_REPORT"
+}
+
 rollback_apparmor_vendor_transition() {
     local service="$1" profile="$2" executable="$3"
     local unload_result="failed" restart_result="failed" health_result="failed" confinement_result="failed"
@@ -5588,34 +5619,41 @@ configure_apparmor_vendor_service() {
     local denial_since="" denial_result=1
     profile_info="$(apparmor_vendor_profile_for_service "$service" || true)"
     if [[ -z "$profile_info" ]]; then
+        apparmor_report_service_assessment "$service" skipped "no matching enabled distribution-owned executable profile"
         record_skip "AppArmor:${service}" "no matching enabled distribution-owned executable profile"
         return 0
     fi
     profile="${profile_info%%$'\t'*}"
     executable="${profile_info#*$'\t'}"
     if grep -Eq 'flags=\([^)]*complain' "$profile"; then
+        apparmor_report_service_assessment "$service" skipped "vendor profile explicitly requests complain mode"
         record_skip "AppArmor:${service}" "vendor profile ${profile} explicitly requests complain mode"
         return 0
     fi
     if ! apparmor_process_is_unconfined_for_service "$service"; then
+        apparmor_report_service_assessment "$service" skipped "no unconfined service process requires a transition"
         record_skip "AppArmor:${service}" "no unconfined service process requires a transition"
         return 0
     fi
     if apparmor_profile_is_loaded "$executable"; then
+        apparmor_report_service_assessment "$service" skipped "distribution profile is already loaded while process is unconfined; transition not rollback-safe"
         record_skip "AppArmor:${service}" "distribution profile is already loaded, but the running process is unconfined; no safe rollback-preserving transition is available"
         return 0
     else
         profile_loaded_result=$?
     fi
     if [[ "$profile_loaded_result" -eq 2 ]]; then
+        apparmor_report_service_assessment "$service" skipped "kernel profile inventory unavailable; unload rollback cannot be proven safe"
         record_skip "AppArmor:${service}" "kernel profile inventory is unavailable, so an unload rollback cannot be proven safe"
         return 0
     fi
     if ! apparmor_parser -Q "$profile" >/dev/null 2>&1; then
+        apparmor_report_service_assessment "$service" skipped "parser rejected distribution profile ${profile}"
         record_skip "AppArmor:${service}" "parser rejected distribution profile ${profile}"
         return 0
     fi
     if ! run_streamed apparmor_parser -r "$profile"; then
+        apparmor_report_service_assessment "$service" skipped "could not load validated distribution profile ${profile}"
         record_skip "AppArmor:${service}" "could not load validated distribution profile ${profile}"
         return 0
     fi

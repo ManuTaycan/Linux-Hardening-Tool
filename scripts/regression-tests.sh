@@ -1990,6 +1990,22 @@ run_apparmor_profile_tests() {
         ! apparmor_service_health_check rsyslog.service
     ' _ "$repo_root" || fail "AppArmor rsyslog runtime validation regression failed"
 
+    env HARDEN_SOURCE_ONLY=1 HARDEN_APPARMOR_REPORT="$case_root/skip-report" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        MODE=apply; BACKUP_DIR="$2/skip-backup"; CHANGE_LOG="$2/skip-changes"; mkdir -p "$BACKUP_DIR"; : > "$CHANGE_LOG"; : > "$APPARMOR_REPORT"
+        apparmor_service_executable() { printf "/usr/bin/not-profiled\n"; }
+        configure_apparmor_vendor_service packagekit.service
+        grep -Fq "service=packagekit.service result=skipped reason=no matching enabled distribution-owned executable profile" "$APPARMOR_REPORT"
+    ' _ "$repo_root" "$case_root" || fail "AppArmor no-vendor-profile assessment was not reported"
+
+    env HARDEN_SOURCE_ONLY=1 bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        [[ -n "$(apparmor_process_name $$)" ]]
+        [[ "$(apparmor_unconfined_classification 42 kthreadd "")" == system-process\|* ]]
+        [[ "$(apparmor_unconfined_classification 42 systemd packagekit.service)" == consciously-unconfined\|* ]]
+        [[ "$(apparmor_unconfined_classification 42 packagekit "packagekit.service")" == consciously-unconfined\|* ]]
+    ' _ "$repo_root" || fail "AppArmor process/classification regression failed"
+
     env HARDEN_SOURCE_ONLY=1 HARDEN_APPARMOR_REPORT="$case_root/dry-run-report" bash -c '
         source "$1/harden.sh"; trap - ERR EXIT
         MODE=dry-run; aa-status() { return 0; }; apparmor_parser() { return 0; }; systemctl() { exit 1; }
