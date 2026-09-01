@@ -7,6 +7,12 @@ für 1.1.3 wird erst nach dem vollständigen Zielsystemtest erstellt.
 
 ### Changed
 
+- Ubuntu MOTD news is now disabled through its documented
+  `/etc/default/motd-news` `ENABLED=0` switch. The `50-motd-news` hook remains
+  executable because `motd-news.service` invokes it directly with `--force`;
+  a legacy non-executable hook is repaired transactionally instead of causing
+  a `203/EXEC` systemd failure. Other presentation hooks remain separately
+  managed and the reboot-required hook is preserved.
 - Systemd exposure review now inventories every active service, records its
   activity state, score, controls, classification, validation and health in
   `/root/systemd-hardening-report.txt`, and retains a new service-specific
