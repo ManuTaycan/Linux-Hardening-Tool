@@ -4862,6 +4862,22 @@ systemd_service_health_check() {
     return 0
 }
 
+# acct's vendor monthly report is a Type=oneshot service.  It is healthy when
+# the real command completes and produces its report, not while it remains
+# active.  Keep this check bounded and side-effect limited (one explicit run).
+verify_acct_monthly_report_runtime() {
+    local report_path="${HARDEN_ACCT_MONTHLY_REPORT:-/var/log/wtmp.report}"
+    if ! run_streamed systemctl start --wait acct-monthly-report.service; then
+        log WARN "acct-monthly-report.service one-shot failed; ${report_path} was not validated"
+        return 1
+    fi
+    if [[ ! -f "$report_path" ]]; then
+        log WARN "acct-monthly-report.service completed but ${report_path} is missing"
+        return 1
+    fi
+    return 0
+}
+
 systemd_verify_unit() {
     local unit_or_file="$1" analyze_help=""
     analyze_help="$(systemd-analyze --help 2>&1 || true)"
@@ -4912,7 +4928,7 @@ install_service_dropin() {
     local after_file="$BACKUP_DIR/systemd-security-${service//[^A-Za-z0-9_.-]/_}-after.txt"
     local preverify_file="$BACKUP_DIR/systemd-verify-${service//[^A-Za-z0-9_.-]/_}-pre-install.txt"
     local postverify_file="$BACKUP_DIR/systemd-verify-${service//[^A-Za-z0-9_.-]/_}-installed.txt"
-    local before="" after="" was_active=0 health_action="restart" exposure_line="" exposure_outcome=""
+    local before="" after="" was_active=0 was_failed=0 health_action="restart" exposure_line="" exposure_outcome=""
     local classification="" activity="" validation="not run" health="not run" score_gate=1 safety_reason=""
     local dropin_was_current=0
     local dropin_stage="" verify_dir="" verify_unit=""
@@ -4934,6 +4950,7 @@ install_service_dropin() {
     before="$SYSTEMD_EXPOSURE_RESULT"
     [[ -z "$before" ]] || SERVICE_EXPOSURE_BEFORE["$service"]="$before"
     [[ "$activity" == active ]] && was_active=1
+    systemctl is-failed --quiet "$service" && was_failed=1 || true
     if [[ -n "$SSH_SERVICE" && "$service" == "$SSH_SERVICE" ]]; then
         health_action="reload"
         score_gate=0
@@ -4967,6 +4984,14 @@ install_service_dropin() {
     rm -f -- "$verify_unit"
     rmdir -- "$verify_dir" 2>/dev/null || true
     if [[ "$dropin_was_current" -eq 1 ]]; then
+        if [[ "$service" == acct-monthly-report.service && "$was_failed" -eq 1 ]]; then
+            if ! verify_acct_monthly_report_runtime; then
+                write_systemd_hardening_report "$service" "$activity" "$before" "$before" "$controls" "$classification" "$validation" "failed (one-shot readiness)" "retained for operator review"
+                rm -f -- "$dropin_stage"
+                return 0
+            fi
+            run_streamed systemctl reset-failed "$service" || true
+        fi
         if [[ "$was_active" -eq 1 ]] && ! systemd_service_health_check "$service"; then
             write_systemd_hardening_report "$service" "$activity" "$before" "$before" "$controls" "$classification" "$validation" "failed (existing unit was not restarted)" "retained for operator review"
             log WARN "Existing ${service} drop-in was left untouched because its health check failed; no restart was attempted"
@@ -5015,7 +5040,17 @@ install_service_dropin() {
         return 0
     fi
     [[ -n "$SSH_SERVICE" && "$service" == "$SSH_SERVICE" ]] && validation="${validation}; sshd -t passed"
-    if [[ "$was_active" -eq 1 ]]; then
+    if [[ "$service" == acct-monthly-report.service ]]; then
+        if ! verify_acct_monthly_report_runtime; then
+            rollback_service_dropin "$service" "$destination" "$transaction_label" "$was_active" "$health_action" "acct monthly report one-shot failed"
+            write_systemd_hardening_report "$service" "$activity" "$before" "" "$controls" "$classification" "$validation" "failed" "rolled back"
+            return 0
+        fi
+        if [[ "$was_failed" -eq 1 ]]; then
+            run_streamed systemctl reset-failed "$service" || true
+        fi
+        health="healthy (acct monthly report wrote ${HARDEN_ACCT_MONTHLY_REPORT:-/var/log/wtmp.report})"
+    elif [[ "$was_active" -eq 1 ]]; then
         if ! run_streamed systemctl "$health_action" "$service" || ! systemd_service_health_check "$service"; then
             rollback_service_dropin "$service" "$destination" "$transaction_label" "$was_active" "$health_action" "active-service health check failed"
             write_systemd_hardening_report "$service" "$activity" "$before" "" "$controls" "$classification" "$validation" "failed" "rolled back"
@@ -5194,13 +5229,15 @@ AmbientCapabilities=
 RestrictAddressFamilies=AF_UNIX
 UMask=0027
 EOF
-    install_service_dropin acct-monthly-report.service 99-hardening "accounting report paths, private devices, namespaces and kernel-view isolation" <<'EOF'
+    install_service_dropin acct-monthly-report.service 99-hardening "accounting report path, private devices, namespaces and kernel-view isolation" <<'EOF'
 [Service]
 NoNewPrivileges=yes
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectSystem=strict
-ReadWritePaths=-/var/log/account -/var/lib/acct
+# Ubuntu/Debian acct reporting/monthly writes this single report file; reads
+# remain covered by ProtectSystem=strict without granting broad /var/log access.
+ReadWritePaths=-/var/log/wtmp.report
 ProtectHome=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
