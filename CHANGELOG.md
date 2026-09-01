@@ -7,6 +7,17 @@ für 1.1.3 wird erst nach dem vollständigen Zielsystemtest erstellt.
 
 ### Changed
 
+- AppArmor now writes a before/after inventory of unconfined processes and
+  their systemd context to `/root/apparmor-service-coverage-report.txt`.
+  It no longer bulk-enforces every top-level profile. Only a matching,
+  enabled distribution-owned profile for the explicitly assessed stable
+  `fail2ban.service` or `rsyslog.service` is parser-validated and loaded; the
+  service must restart healthy, pass its service-specific runtime check and
+  become confined or the profile transition is rolled back only after unload,
+  restart, health and unconfined-process restoration are each proven. Rsyslog
+  also validates its configuration, emits a real logger probe and checks new
+  kernel AppArmor denials when the journal query is available. SSH, Tailscale, systemd, networking, firewall, package and
+  recovery services remain deliberate, reported exclusions.
 - Ubuntu MOTD news is now disabled through its documented
   `/etc/default/motd-news` `ENABLED=0` switch. The `50-motd-news` hook remains
   executable because `motd-news.service` invokes it directly with `--force`;

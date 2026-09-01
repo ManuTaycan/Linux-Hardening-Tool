@@ -18,6 +18,7 @@ umask 027
 readonly SCRIPT_VERSION="1.1.3"
 readonly LOG_FILE="${HARDEN_LOG_FILE:-/var/log/server-hardening.log}"
 readonly SYSTEMD_HARDENING_REPORT="${HARDEN_SYSTEMD_HARDENING_REPORT:-/root/systemd-hardening-report.txt}"
+readonly APPARMOR_REPORT="${HARDEN_APPARMOR_REPORT:-/root/apparmor-service-coverage-report.txt}"
 readonly MAIN_PID="$BASHPID"
 
 MODE=""
@@ -63,6 +64,9 @@ FAILED_LOGIN_REPORT="${HARDEN_FAILED_LOGIN_REPORT:-/root/failed-login-logging-re
 SHELL_TIMEOUT_STATUS="NOT RUN"
 AUDIT_STATUS="NOT RUN"
 APPARMOR_STATUS="NOT RUN"
+APPARMOR_UNCONFINED_BEFORE="N/A"
+APPARMOR_UNCONFINED_AFTER="N/A"
+APPARMOR_TRANSITION_FAILED=0
 AIDE_STATUS="NOT RUN"
 FAIL2BAN_STATUS="NOT RUN"
 UPDATES_STATUS="NOT RUN"
@@ -5407,34 +5411,321 @@ EOF
     return 0
 }
 
+apparmor_unit_for_pid() {
+    local pid="$1" cgroup="" unit=""
+    [[ -r "/proc/${pid}/cgroup" ]] || return 0
+    cgroup="$(cat "/proc/${pid}/cgroup" 2>/dev/null || true)"
+    unit="$(awk -F/ '{ for (i = 1; i <= NF; i++) if ($i ~ /\.service$/) unit = $i } END { print unit }' <<<"$cgroup")"
+    printf '%s\n' "$unit"
+}
+
+apparmor_unconfined_classification() {
+    local pid="$1" process="$2" unit="$3"
+    case "$unit" in
+        ssh.service|sshd.service|tailscaled.service|NetworkManager.service|systemd-networkd.service|networking.service|networkd-dispatcher.service|nftables.service|firewalld.service)
+            printf 'protected-service|remote-access, overlay, networking or firewall safety boundary'
+            ;;
+        systemd-*.service|dbus.service|polkit.service|cron.service|auditd.service|apt-daily*.service|unattended-upgrades.service|snapd.service|cloud-*.service|packagekit.service|user@*.service|getty*.service|serial-getty*.service|rescue.service|emergency.service|systemd-recovery.service)
+            printf 'consciously-unconfined|system, package-management, login or recovery path'
+            ;;
+        '')
+            case "$process" in
+                kthreadd*|kworker*|ksoftirqd*|migration*|idle_inject*|cpuhp*|watchdog*|cpuhp*|rcu*|oom_reaper*|mm_percpu_wq|kcompactd*|kswapd*|jbd2/*|ext4-rsv-conver*)
+                    printf 'system-process|kernel thread without a systemd unit'
+                    ;;
+                systemd|init|systemd-udevd|systemd-journald|systemd-logind)
+                    printf 'system-process|userspace system process without a unit mapping'
+                    ;;
+                '')
+                    printf 'unattributed-process|process name and systemd unit unavailable'
+                    ;;
+                *)
+                    printf 'unattributed-userspace|userspace process without a stable systemd service unit'
+                    ;;
+            esac
+            ;;
+        *) printf 'service-candidate|persistent service; vendor profile may be assessed' ;;
+    esac
+}
+
+apparmor_process_name() {
+    local pid="$1" process=""
+    if IFS= read -r process < "/proc/${pid}/comm" 2>/dev/null; then
+        printf '%s\n' "$process"
+    else
+        printf 'unknown\n'
+    fi
+}
+
+write_apparmor_unconfined_inventory() {
+    local stage="$1" pid current process unit classification class_key count=0 meaningful_count=0
+    declare -A classification_counts=()
+    printf '[%s]\n' "$stage" >> "$APPARMOR_REPORT"
+    for pid in /proc/[0-9]*; do
+        pid="${pid##*/}"
+        [[ -r "/proc/${pid}/attr/current" ]] || continue
+        current="$(< "/proc/${pid}/attr/current")"
+        [[ "$current" == unconfined* ]] || continue
+        process="$(apparmor_process_name "$pid")"
+        unit="$(apparmor_unit_for_pid "$pid")"
+        classification="$(apparmor_unconfined_classification "$pid" "$process" "$unit")"
+        printf 'pid=%s process=%s unit=%s apparmor=%s classification=%s\n' \
+            "$pid" "$process" "${unit:-N/A}" "$current" "$classification" >> "$APPARMOR_REPORT"
+        count=$((count + 1))
+        class_key="${classification%%|*}"
+        classification_counts["$class_key"]=$(( ${classification_counts["$class_key"]:-0} + 1 ))
+        case "$class_key" in system-process|unattributed-process|unattributed-userspace) ;; *) meaningful_count=$((meaningful_count + 1)) ;; esac
+    done
+    printf 'unconfined-count=%s\n\n' "$count" >> "$APPARMOR_REPORT"
+    for class_key in "${!classification_counts[@]}"; do
+        printf 'classification-count[%s]=%s\n' "$class_key" "${classification_counts[$class_key]}" >> "$APPARMOR_REPORT"
+    done
+    printf 'meaningful-userspace-service-count=%s (inventory metric; not Lynis-compatible)\n\n' "$meaningful_count" >> "$APPARMOR_REPORT"
+    printf '%s\n' "$count"
+}
+
+apparmor_service_executable() {
+    local service="$1" exec_start=""
+    exec_start="$(systemctl show --property=ExecStart --value "$service" 2>/dev/null || true)"
+    sed -n 's/.*path=\([^ ;}]*\).*/\1/p; q' <<<"$exec_start"
+}
+
+apparmor_vendor_profile_for_service() {
+    local service="$1" apparmor_dir="${HARDEN_APPARMOR_DIR:-/etc/apparmor.d}"
+    local executable="" profile_name="" profile=""
+    executable="$(apparmor_service_executable "$service")"
+    [[ "$executable" == /* ]] || return 1
+    profile_name="${executable#/}"
+    profile_name="${profile_name//\//.}"
+    profile="${apparmor_dir}/${profile_name}"
+    [[ -f "$profile" && ! -L "$profile" ]] || return 1
+    [[ ! -e "${apparmor_dir}/disable/${profile_name}" && ! -L "${apparmor_dir}/disable/${profile_name}" ]] || return 1
+    dpkg-query -S "$profile" >/dev/null 2>&1 || return 1
+    grep -Fq -- "$executable" "$profile" || return 1
+    printf '%s\t%s\n' "$profile" "$executable"
+}
+
+apparmor_process_is_unconfined_for_service() {
+    local service="$1" pid current
+    for pid in /proc/[0-9]*; do
+        pid="${pid##*/}"
+        [[ "$(apparmor_unit_for_pid "$pid")" == "$service" ]] || continue
+        current="$(< "/proc/${pid}/attr/current" 2>/dev/null || true)"
+        [[ "$current" == unconfined* ]] && return 0
+    done
+    return 1
+}
+
+apparmor_profile_is_loaded() {
+    local executable="$1" profiles_path="${HARDEN_APPARMOR_KERNEL_PROFILES:-/sys/kernel/security/apparmor/profiles}"
+    [[ -r "$profiles_path" ]] || return 2
+    grep -Fq -- "${executable} (" "$profiles_path"
+}
+
+apparmor_profile_is_unloaded() {
+    local executable="$1" profile_state=0
+    if apparmor_profile_is_loaded "$executable"; then
+        return 1
+    else
+        profile_state=$?
+    fi
+    [[ "$profile_state" -eq 1 ]]
+}
+
+rsyslog_apparmor_health_check() {
+    local probe_tag=""
+    probe_tag="harden-apparmor-${BASHPID}-$(date +%s)"
+    systemctl is-active --quiet rsyslog.service || return 1
+    command -v rsyslogd >/dev/null 2>&1 || return 1
+    command -v logger >/dev/null 2>&1 || return 1
+    run_streamed rsyslogd -N1 || return 1
+    run_streamed logger -p authpriv.notice -t "$probe_tag" \
+        "rsyslog AppArmor transition validation probe $(timestamp)"
+}
+
+apparmor_new_denials_for_executable() {
+    local executable="$1" since="$2" journal_output matches
+    command -v journalctl >/dev/null 2>&1 || return 2
+    journal_output="$(journalctl -k --since "$since" --no-pager 2>/dev/null)" || return 2
+    matches="$(awk -v executable="$executable" \
+        '$0 ~ /apparmor="DENIED"/ && index($0, "profile=\"" executable "\"") { print }' \
+        <<<"$journal_output")"
+    [[ -n "$matches" ]]
+}
+
+apparmor_service_health_check() {
+    local service="$1"
+    systemctl is-active --quiet "$service" || return 1
+    case "$service" in
+        fail2ban.service)
+            wait_for_fail2ban_runtime "${HARDEN_FAIL2BAN_SERVICE_READINESS_ATTEMPTS:-10}"
+            ;;
+        rsyslog.service)
+            rsyslog_apparmor_health_check
+            ;;
+    esac
+}
+
+apparmor_report_service_assessment() {
+    local service="$1" result="$2" reason="$3"
+    printf 'service=%s result=%s reason=%s\n' "$service" "$result" "$reason" >> "$APPARMOR_REPORT"
+}
+
+rollback_apparmor_vendor_transition() {
+    local service="$1" profile="$2" executable="$3"
+    local unload_result="failed" restart_result="failed" health_result="failed" confinement_result="failed"
+
+    if run_streamed apparmor_parser -R "$profile"; then
+        if apparmor_profile_is_unloaded "$executable"; then
+            unload_result="verified"
+        else
+            unload_result="not-verified"
+        fi
+    fi
+
+    # One controlled restart is required to restore the service's process
+    # confinement state. Do not retry: repeated restarts increase outage risk.
+    if run_streamed systemctl restart "$service"; then
+        restart_result="completed"
+        if apparmor_service_health_check "$service"; then
+            health_result="healthy"
+            if apparmor_process_is_unconfined_for_service "$service"; then
+                confinement_result="unconfined"
+            else
+                confinement_result="still-confined-or-unverified"
+            fi
+        else
+            health_result="failed"
+        fi
+    fi
+
+    if [[ "$unload_result" == verified && "$restart_result" == completed \
+        && "$health_result" == healthy && "$confinement_result" == unconfined ]]; then
+        printf 'service=%s profile=%s result=rolled-back validation=profile-unloaded,service-restarted,service-healthy,process-unconfined\n' \
+            "$service" "$profile" >> "$APPARMOR_REPORT"
+        log ROLLBACK "AppArmor transition for ${service} failed; rollback was verified (profile unloaded, service healthy and unconfined)"
+        return 0
+    fi
+
+    APPARMOR_TRANSITION_FAILED=1
+    printf 'service=%s profile=%s result=rollback-failed unload=%s restart=%s service-health=%s process-state=%s\n' \
+        "$service" "$profile" "$unload_result" "$restart_result" "$health_result" "$confinement_result" >> "$APPARMOR_REPORT"
+    log ERROR "AppArmor transition for ${service} failed and rollback could not be proven (unload=${unload_result}, restart=${restart_result}, health=${health_result}, process=${confinement_result}); manual recovery is required"
+    return 1
+}
+
+configure_apparmor_vendor_service() {
+    local service="$1" profile_info="" profile="" executable="" profile_loaded_result=0
+    local denial_since="" denial_result=1
+    profile_info="$(apparmor_vendor_profile_for_service "$service" || true)"
+    if [[ -z "$profile_info" ]]; then
+        apparmor_report_service_assessment "$service" skipped "no matching enabled distribution-owned executable profile"
+        record_skip "AppArmor:${service}" "no matching enabled distribution-owned executable profile"
+        return 0
+    fi
+    profile="${profile_info%%$'\t'*}"
+    executable="${profile_info#*$'\t'}"
+    if grep -Eq 'flags=\([^)]*complain' "$profile"; then
+        apparmor_report_service_assessment "$service" skipped "vendor profile explicitly requests complain mode"
+        record_skip "AppArmor:${service}" "vendor profile ${profile} explicitly requests complain mode"
+        return 0
+    fi
+    if ! apparmor_process_is_unconfined_for_service "$service"; then
+        apparmor_report_service_assessment "$service" skipped "no unconfined service process requires a transition"
+        record_skip "AppArmor:${service}" "no unconfined service process requires a transition"
+        return 0
+    fi
+    if apparmor_profile_is_loaded "$executable"; then
+        apparmor_report_service_assessment "$service" skipped "distribution profile is already loaded while process is unconfined; transition not rollback-safe"
+        record_skip "AppArmor:${service}" "distribution profile is already loaded, but the running process is unconfined; no safe rollback-preserving transition is available"
+        return 0
+    else
+        profile_loaded_result=$?
+    fi
+    if [[ "$profile_loaded_result" -eq 2 ]]; then
+        apparmor_report_service_assessment "$service" skipped "kernel profile inventory unavailable; unload rollback cannot be proven safe"
+        record_skip "AppArmor:${service}" "kernel profile inventory is unavailable, so an unload rollback cannot be proven safe"
+        return 0
+    fi
+    if ! apparmor_parser -Q "$profile" >/dev/null 2>&1; then
+        apparmor_report_service_assessment "$service" skipped "parser rejected distribution profile ${profile}"
+        record_skip "AppArmor:${service}" "parser rejected distribution profile ${profile}"
+        return 0
+    fi
+    if ! run_streamed apparmor_parser -r "$profile"; then
+        apparmor_report_service_assessment "$service" skipped "could not load validated distribution profile ${profile}"
+        record_skip "AppArmor:${service}" "could not load validated distribution profile ${profile}"
+        return 0
+    fi
+    denial_since="$(date --iso-8601=seconds 2>/dev/null || date -Iseconds)"
+    if run_streamed systemctl restart "$service" \
+        && apparmor_service_health_check "$service" \
+        && ! apparmor_process_is_unconfined_for_service "$service"; then
+        if apparmor_new_denials_for_executable "$executable" "$denial_since"; then
+            denial_result=0
+        else
+            denial_result=$?
+        fi
+        if [[ "$denial_result" -eq 0 ]]; then
+            log ERROR "AppArmor transition for ${service} produced a new kernel DENIED event"
+        elif [[ "$denial_result" -eq 2 ]]; then
+            log INFO "AppArmor DENIED-event query is unavailable; parser, runtime and process confinement checks passed"
+            record_change "Enabled validated distribution AppArmor profile ${profile} for ${service} (${executable}); DENIED-event journal query unavailable"
+            printf 'service=%s profile=%s result=kept validation=parser,health,process-confined,denied-events-unavailable\n' "$service" "$profile" >> "$APPARMOR_REPORT"
+            return 0
+        else
+            record_change "Enabled validated distribution AppArmor profile ${profile} for ${service} (${executable})"
+            printf 'service=%s profile=%s result=kept validation=parser,health,process-confined,denied-events-clear\n' "$service" "$profile" >> "$APPARMOR_REPORT"
+            return 0
+        fi
+    fi
+    # The profile was loaded only for this controlled transition. Remove it and
+    # restart once to restore the prior unconfined runtime; the helper proves
+    # every rollback condition before it claims restoration.
+    if ! rollback_apparmor_vendor_transition "$service" "$profile" "$executable"; then
+        : # Failure is recorded precisely by the rollback helper and propagated through status.
+    fi
+    return 0
+}
+
 configure_apparmor() {
-    if ! command -v aa-status >/dev/null 2>&1; then
+    local service
+    if ! command -v aa-status >/dev/null 2>&1 || ! command -v apparmor_parser >/dev/null 2>&1; then
         APPARMOR_STATUS="NOT AVAILABLE"
         return 0
     fi
-    run systemctl enable --now apparmor.service || true
-    if [[ "$MODE" == "apply" ]]; then
-        if command -v apparmor_parser >/dev/null 2>&1; then
-            local profile
-            while IFS= read -r -d '' profile; do
-                apparmor_parser -Q "$profile" >/dev/null 2>&1 || {
-                    log WARN "AppArmor parser rejected ${profile}; left unchanged"
-                    continue
-                }
-                if [[ "$AGGRESSIVE" -eq 1 ]] && command -v aa-enforce >/dev/null 2>&1; then
-                    aa-enforce "$profile" >/dev/null 2>&1 || true
-                fi
-            done < <(find /etc/apparmor.d -maxdepth 1 -type f -print0 2>/dev/null)
-        fi
-        if aa-status --enabled >/dev/null 2>&1; then
-            APPARMOR_STATUS="OK"
-            record_change "Enabled AppArmor and parser-validated installed top-level profiles"
-        else
-            APPARMOR_STATUS="FAILED"
-        fi
-    else
+    if [[ "$MODE" == "dry-run" ]]; then
         APPARMOR_STATUS="PLANNED"
+        log INFO "Would inventory unconfined processes and assess only distribution profiles for fail2ban.service and rsyslog.service"
+        return 0
     fi
+    if ! systemctl is-active --quiet apparmor.service; then
+        run_streamed systemctl enable --now apparmor.service || {
+            APPARMOR_STATUS="FAILED"
+            return 0
+        }
+    fi
+    if ! aa-status --enabled >/dev/null 2>&1; then
+        APPARMOR_STATUS="FAILED"
+        return 0
+    fi
+    : > "$APPARMOR_REPORT"
+    chmod 0600 "$APPARMOR_REPORT"
+    printf 'AppArmor service coverage report\nGenerated: %s\n\n' "$(timestamp)" >> "$APPARMOR_REPORT"
+    APPARMOR_UNCONFINED_BEFORE="$(write_apparmor_unconfined_inventory before)"
+    APPARMOR_TRANSITION_FAILED=0
+    for service in fail2ban.service rsyslog.service; do
+        configure_apparmor_vendor_service "$service"
+    done
+    APPARMOR_UNCONFINED_AFTER="$(write_apparmor_unconfined_inventory after)"
+    printf 'summary before=%s after=%s\n' "$APPARMOR_UNCONFINED_BEFORE" "$APPARMOR_UNCONFINED_AFTER" >> "$APPARMOR_REPORT"
+    record_skip "AppArmor:excluded-processes" "SSH, Tailscale, systemd, networking, firewall, package-management and recovery paths remain deliberately unconfined"
+    if [[ "$APPARMOR_TRANSITION_FAILED" -eq 1 ]]; then
+        APPARMOR_STATUS="FAILED (one or more AppArmor transitions could not be rolled back; report ${APPARMOR_REPORT})"
+        return 0
+    fi
+    APPARMOR_STATUS="OK (unconfined ${APPARMOR_UNCONFINED_BEFORE}->${APPARMOR_UNCONFINED_AFTER}; report ${APPARMOR_REPORT})"
+    record_change "Inventoried AppArmor unconfined processes and assessed only validated distribution profiles for stable services"
 }
 
 configure_time_sync() {
@@ -6812,6 +7103,7 @@ Login banners      : ${BANNER_STATUS}
 MOTD policy        : ${MOTD_STATUS}
 Audit              : ${AUDIT_STATUS}
 AppArmor           : ${APPARMOR_STATUS}
+AppArmor report    : $([[ "$MODE" == "apply" && "$APPARMOR_STATUS" != "NOT AVAILABLE" ]] && printf '%s' "$APPARMOR_REPORT" || printf 'not written / not available')
 AIDE               : ${AIDE_STATUS}
 Fail2ban           : ${FAIL2BAN_STATUS}
 Remote Logging     : ${REMOTE_LOG_STATUS}
