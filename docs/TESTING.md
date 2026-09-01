@@ -130,6 +130,10 @@ ausführen; `ReadWritePaths` muss exakt `/var/log/wtmp.report` ohne optionales
 `-` enthalten. Ein bereits fehlgeschlagener Dienst wird nur nach erfolgreichem
 Lauf per `reset-failed` bereinigt. Der zweite Apply ist bei unveränderter Policy
 ein vollständiger No-op ohne erneute Dateierstellung, Start oder Reload.
+Ein unveränderter `systemd-analyze security`-Wert ist für diesen einen Dienst
+akzeptabel, wenn der präzise Pfad, Unit-Validierung, One-shot und
+`root:adm`/`0640` nachweislich erfolgreich sind; andere Service-Drop-ins
+behalten weiterhin ihr messbares Score-Gate.
 
 Der zweite Lauf darf bei gültigen Drop-ins weder `systemctl daemon-reload` noch
 einen Service-Restart auslösen; die Scores bleiben stabil. SSH wird mit

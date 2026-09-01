@@ -68,6 +68,10 @@ für 1.1.3 wird erst nach dem vollständigen Zielsystemtest erstellt.
   successful runs may clear failed state, while failures roll back the empty
   placeholder only. Existing valid policy converges without daemon-reload,
   restart, file creation, or another report run.
+  This service-specific compatibility correction is retained even when
+  `systemd-analyze security` remains unchanged, but only after exact
+  ReadWritePaths, merged-unit, one-shot and metadata validation; generic
+  service score gates remain unchanged.
 - AIDE now validates the distribution's active configuration directly, without
   requiring `update-aide.conf`; it resolves `database_in`/`database_out`,
   atomically activates a verified baseline, skips unnecessary second-run

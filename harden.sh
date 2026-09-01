@@ -4935,6 +4935,15 @@ verify_acct_monthly_report_runtime() {
     return 0
 }
 
+acct_monthly_report_write_path_is_exact() {
+    local dropin_path="$1" report_path="${HARDEN_ACCT_MONTHLY_REPORT:-/var/log/wtmp.report}"
+    local path_count=0
+    [[ -f "$dropin_path" ]] || return 1
+    grep -Fxq "ReadWritePaths=${report_path}" "$dropin_path" || return 1
+    path_count="$(grep -c '^ReadWritePaths=' "$dropin_path" || true)"
+    [[ "$path_count" == 1 ]]
+}
+
 systemd_verify_unit() {
     local unit_or_file="$1" analyze_help=""
     analyze_help="$(systemd-analyze --help 2>&1 || true)"
@@ -4987,7 +4996,7 @@ install_service_dropin() {
     local preverify_file="$BACKUP_DIR/systemd-verify-${service//[^A-Za-z0-9_.-]/_}-pre-install.txt"
     local postverify_file="$BACKUP_DIR/systemd-verify-${service//[^A-Za-z0-9_.-]/_}-installed.txt"
     local before="" after="" was_active=0 was_failed=0 health_action="restart" exposure_line="" exposure_outcome=""
-    local classification="" activity="" validation="not run" health="not run" score_gate=1 safety_reason=""
+    local classification="" activity="" validation="not run" health="not run" score_gate=1 safety_reason="" compatibility_retention=0 compatibility_reason=""
     local dropin_was_current=0
     local dropin_stage="" verify_dir="" verify_unit=""
     if ! dropin_stage="$(mktemp)"; then
@@ -5058,7 +5067,9 @@ install_service_dropin() {
                 rm -f -- "$dropin_stage"
                 return 0
             fi
-            run_streamed systemctl reset-failed "$service" || true
+            if ! run_streamed systemctl reset-failed "$service"; then
+                log WARN "acct-monthly-report.service one-shot succeeded, but its failed state could not be reset"
+            fi
         fi
         if [[ "$was_active" -eq 1 ]] && ! systemd_service_health_check "$service"; then
             write_systemd_hardening_report "$service" "$activity" "$before" "$before" "$controls" "$classification" "$validation" "failed (existing unit was not restarted)" "retained for operator review"
@@ -5110,15 +5121,24 @@ install_service_dropin() {
     fi
     [[ -n "$SSH_SERVICE" && "$service" == "$SSH_SERVICE" ]] && validation="${validation}; sshd -t passed"
     if [[ "$service" == acct-monthly-report.service ]]; then
+        if ! acct_monthly_report_write_path_is_exact "$destination"; then
+            rollback_service_dropin "$service" "$destination" "$transaction_label" "$was_active" "$health_action" "acct monthly report write-path policy was not exact"
+            write_systemd_hardening_report "$service" "$activity" "$before" "" "$controls" "$classification" "$validation" "failed" "rolled back"
+            return 0
+        fi
         if ! verify_acct_monthly_report_runtime; then
             rollback_service_dropin "$service" "$destination" "$transaction_label" "$was_active" "$health_action" "acct monthly report one-shot failed"
             write_systemd_hardening_report "$service" "$activity" "$before" "" "$controls" "$classification" "$validation" "failed" "rolled back"
             return 0
         fi
         if [[ "$was_failed" -eq 1 ]]; then
-            run_streamed systemctl reset-failed "$service" || true
+            if ! run_streamed systemctl reset-failed "$service"; then
+                log WARN "acct-monthly-report.service one-shot succeeded, but its failed state could not be reset"
+            fi
         fi
         health="healthy (acct monthly report wrote ${HARDEN_ACCT_MONTHLY_REPORT:-/var/log/wtmp.report})"
+        compatibility_retention=1
+        compatibility_reason="acct monthly report compatibility: exact ReadWritePaths and vendor metadata validated after a successful one-shot; systemd-analyze score is not sensitive to this narrower correction"
     elif [[ "$was_active" -eq 1 ]]; then
         if ! run_streamed systemctl "$health_action" "$service" || ! systemd_service_health_check "$service"; then
             rollback_service_dropin "$service" "$destination" "$transaction_label" "$was_active" "$health_action" "active-service health check failed"
@@ -5152,7 +5172,7 @@ install_service_dropin() {
     if [[ -n "$before" && -n "$after" ]]; then
         printf -v exposure_line '%-32s %s -> %s' "$service" "$before" "$after"
     fi
-    if [[ "$score_gate" -eq 1 && "$exposure_outcome" != decreased ]]; then
+    if [[ "$score_gate" -eq 1 && "$compatibility_retention" -eq 0 && "$exposure_outcome" != decreased ]]; then
         rollback_service_dropin "$service" "$destination" "$transaction_label" "$was_active" "$health_action" "exposure did not measurably decrease"
         write_systemd_hardening_report "$service" "$activity" "$before" "$after" "$controls" "$classification" "$validation" "$health" "rolled back: score did not decrease"
         log WARN "${service} passed health checks but the candidate was rolled back because exposure did not decrease (${before:-N/A} -> ${after:-N/A})"
@@ -5160,7 +5180,10 @@ install_service_dropin() {
     fi
     SERVICES_HARDENED+=("$service")
     [[ -n "$exposure_line" ]] && SERVICE_EXPOSURE_SUMMARY+=("$exposure_line")
-    if [[ "$score_gate" -eq 0 ]]; then
+    if [[ "$compatibility_retention" -eq 1 ]]; then
+        write_systemd_hardening_report "$service" "$activity" "$before" "$after" "$controls" "$classification" "$validation" "$health" "kept: ${compatibility_reason}"
+        record_change "Retained the validated acct monthly report compatibility correction; exposure ${before} -> ${after}"
+    elif [[ "$score_gate" -eq 0 ]]; then
         write_systemd_hardening_report "$service" "$activity" "$before" "$after" "$controls" "$classification" "$validation" "$health" "kept: ${safety_reason}"
         record_change "Migrated SSH systemd hardening to UMask=0027 only after merged-unit validation, sshd -t, reload, and active health check; PrivateTmp was removed for session safety"
     else
