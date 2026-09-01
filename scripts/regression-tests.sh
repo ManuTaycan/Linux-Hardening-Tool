@@ -1860,34 +1860,50 @@ EOF
 run_acct_monthly_report_tests() {
     local case_root="$test_root/acct-monthly-report"
     install -d "$case_root"
-    env HARDEN_SOURCE_ONLY=1 HARDEN_SYSTEMD_DIR="$case_root/systemd" HARDEN_SYSTEMD_HARDENING_REPORT="$case_root/report" HARDEN_ACCT_MONTHLY_REPORT="$case_root/wtmp.report" bash -c '
+    env HARDEN_SOURCE_ONLY=1 HARDEN_SYSTEMD_DIR="$case_root/systemd" HARDEN_SYSTEMD_HARDENING_REPORT="$case_root/report" HARDEN_ACCT_MONTHLY_REPORT="$case_root/wtmp.report" HARDEN_ACCT_MONTHLY_REPORT_GROUP=root bash -c '
         source "$1/harden.sh"; trap - ERR EXIT
         test_dir="$2"; MODE=apply; BACKUP_DIR="$test_dir/backup"; CHANGE_LOG="$test_dir/changes"; mkdir -p "$BACKUP_DIR"; : > "$CHANGE_LOG"; : > "$SYSTEMD_HARDENING_REPORT"; : > "$test_dir/commands"
         unit_file_exists() { return 0; }
-        systemctl() { printf "%s " "$@" >> "$test_dir/commands"; printf "\n" >> "$test_dir/commands"; case "${1:-} ${2:-}" in "is-active --quiet") return 1 ;; "is-failed --quiet") return 1 ;; "start --wait") printf "vendor report\n" > "$HARDEN_ACCT_MONTHLY_REPORT"; return 0 ;; cat*) printf "[Service]\nType=oneshot\nExecStart=/usr/share/acct/reporting/monthly\n" ;; esac; return 0; }
+        install() { local -a retained=(); while (($#)); do case "$1" in -o|-g) shift 2 ;; *) retained+=("$1"); shift ;; esac; done; command install "${retained[@]}"; }
+        systemctl() { printf "%s " "$@" >> "$test_dir/commands"; printf "\n" >> "$test_dir/commands"; case "${1:-} ${2:-}" in "is-active --quiet") return 1 ;; "is-failed --quiet") return 1 ;; "start --wait") [[ -f "$HARDEN_ACCT_MONTHLY_REPORT" && ! -L "$HARDEN_ACCT_MONTHLY_REPORT" ]] || return 1; printf "vendor report\n" > "$HARDEN_ACCT_MONTHLY_REPORT"; return 0 ;; cat*) printf "[Service]\nType=oneshot\nExecStart=/usr/share/acct/reporting/monthly\n" ;; esac; return 0; }
+        getent() { [[ "${1:-}" == group ]] && printf "root:x:0:\n"; }
+        stat() { [[ "${1:-}" == -c && "${2:-}" == '%u:%g:%a' ]] && { printf "0:0:640\n"; return 0; }; command stat "$@"; }
         systemd_verify_unit() { return 0; }; transaction_copy() { :; }; transaction_restore() { rm -f -- "$1"; }
         install_managed_file() { local destination="$1" mode="$2"; mkdir -p -- "$(dirname -- "$destination")"; cat > "$destination"; chmod "$mode" "$destination"; }; run_streamed() { "$@"; }
         measure_service_exposure() { [[ "$2" == before ]] && SYSTEMD_EXPOSURE_RESULT=3.4 || SYSTEMD_EXPOSURE_RESULT=2.9; : > "$3"; }
         install_service_dropin acct-monthly-report.service 99-hardening "acct report write path" <<EOF
 [Service]
 ProtectSystem=strict
-ReadWritePaths=-$HARDEN_ACCT_MONTHLY_REPORT
+ReadWritePaths=$HARDEN_ACCT_MONTHLY_REPORT
 EOF
-        [[ -f "$HARDEN_SYSTEMD_DIR/acct-monthly-report.service.d/99-hardening.conf" ]] && grep -Fq "ReadWritePaths=-$HARDEN_ACCT_MONTHLY_REPORT" "$HARDEN_SYSTEMD_DIR/acct-monthly-report.service.d/99-hardening.conf" && ! grep -Fq "/var/log/account" "$HARDEN_SYSTEMD_DIR/acct-monthly-report.service.d/99-hardening.conf" && grep -Fq "start --wait acct-monthly-report.service" "$test_dir/commands" && grep -Fq "result=kept: measured exposure decrease" "$SYSTEMD_HARDENING_REPORT"
+        [[ -f "$HARDEN_SYSTEMD_DIR/acct-monthly-report.service.d/99-hardening.conf" ]] && grep -Fq "ReadWritePaths=$HARDEN_ACCT_MONTHLY_REPORT" "$HARDEN_SYSTEMD_DIR/acct-monthly-report.service.d/99-hardening.conf" && ! grep -Fq "ReadWritePaths=-" "$HARDEN_SYSTEMD_DIR/acct-monthly-report.service.d/99-hardening.conf" && ! grep -Fq "/var/log/account" "$HARDEN_SYSTEMD_DIR/acct-monthly-report.service.d/99-hardening.conf" && grep -Fq "start --wait acct-monthly-report.service" "$test_dir/commands" && [[ "$(stat -c %a "$HARDEN_ACCT_MONTHLY_REPORT")" == 640 ]] && grep -Fq "result=kept: measured exposure decrease" "$SYSTEMD_HARDENING_REPORT"
     ' _ "$repo_root" "$case_root" || fail "acct monthly report write-path regression failed"
 
     env HARDEN_SOURCE_ONLY=1 HARDEN_SYSTEMD_DIR="$case_root/converged" HARDEN_SYSTEMD_HARDENING_REPORT="$case_root/converged-report" HARDEN_ACCT_MONTHLY_REPORT="$case_root/converged.report" bash -c '
         source "$1/harden.sh"; trap - ERR EXIT
         test_dir="$2"; MODE=apply; BACKUP_DIR="$test_dir/backup"; CHANGE_LOG="$test_dir/changes"; mkdir -p "$BACKUP_DIR" "${HARDEN_SYSTEMD_DIR}/acct-monthly-report.service.d"; : > "$CHANGE_LOG"; : > "$SYSTEMD_HARDENING_REPORT"; : > "$test_dir/commands"
-        printf "[Service]\nProtectSystem=strict\nReadWritePaths=-%s\n" "$HARDEN_ACCT_MONTHLY_REPORT" > "$HARDEN_SYSTEMD_DIR/acct-monthly-report.service.d/99-hardening.conf"
+        printf "existing report\n" > "$HARDEN_ACCT_MONTHLY_REPORT"
+        printf "[Service]\nProtectSystem=strict\nReadWritePaths=%s\n" "$HARDEN_ACCT_MONTHLY_REPORT" > "$HARDEN_SYSTEMD_DIR/acct-monthly-report.service.d/99-hardening.conf"
         unit_file_exists() { return 0; }; systemctl() { printf "%s " "$@" >> "$test_dir/commands"; case "${1:-} ${2:-}" in "is-active --quiet") return 1 ;; "is-failed --quiet") return 1 ;; cat*) printf "[Service]\nType=oneshot\n" ;; esac; return 0; }; systemd_verify_unit() { return 0; }; measure_service_exposure() { SYSTEMD_EXPOSURE_RESULT=2.9; : > "$3"; }
         install_service_dropin acct-monthly-report.service 99-hardening "acct report write path" <<EOF
 [Service]
 ProtectSystem=strict
-ReadWritePaths=-$HARDEN_ACCT_MONTHLY_REPORT
+ReadWritePaths=$HARDEN_ACCT_MONTHLY_REPORT
 EOF
         ! grep -Fq "start --wait" "$test_dir/commands" && grep -Fq "already hardened/unchanged" "$SYSTEMD_HARDENING_REPORT"
     ' _ "$repo_root" "$case_root" || fail "acct monthly converged run was not a no-op"
+
+    env HARDEN_SOURCE_ONLY=1 HARDEN_SYSTEMD_DIR="$case_root/rollback" HARDEN_SYSTEMD_HARDENING_REPORT="$case_root/rollback-report" HARDEN_ACCT_MONTHLY_REPORT="$case_root/rollback.report" HARDEN_ACCT_MONTHLY_REPORT_GROUP=root bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        test_dir="$2"; MODE=apply; BACKUP_DIR="$test_dir/rollback-backup"; CHANGE_LOG="$test_dir/rollback-changes"; mkdir -p "$BACKUP_DIR"; : > "$CHANGE_LOG"; : > "$SYSTEMD_HARDENING_REPORT"
+        unit_file_exists() { return 0; }; install() { local -a retained=(); while (($#)); do case "$1" in -o|-g) shift 2 ;; *) retained+=("$1"); shift ;; esac; done; command install "${retained[@]}"; }; getent() { [[ "${1:-}" == group ]] && printf "root:x:0:\n"; }; systemctl() { case "${1:-} ${2:-}" in "is-active --quiet"|"is-failed --quiet") return 1 ;; "start --wait") [[ -f "$HARDEN_ACCT_MONTHLY_REPORT" ]] || return 1; return 1 ;; cat*) printf "[Service]\nType=oneshot\n" ;; esac; return 0; }; systemd_verify_unit() { return 0; }; transaction_copy() { :; }; transaction_restore() { rm -f -- "$1"; }; install_managed_file() { local destination="$1" mode="$2"; mkdir -p -- "$(dirname -- "$destination")"; cat > "$destination"; chmod "$mode" "$destination"; }; run_streamed() { "$@"; }; measure_service_exposure() { [[ "$2" == before ]] && SYSTEMD_EXPOSURE_RESULT=3.4 || SYSTEMD_EXPOSURE_RESULT=2.9; : > "$3"; }
+        install_service_dropin acct-monthly-report.service 99-hardening "acct report write path" <<EOF
+[Service]
+ProtectSystem=strict
+ReadWritePaths=$HARDEN_ACCT_MONTHLY_REPORT
+EOF
+        [[ ! -e "$HARDEN_ACCT_MONTHLY_REPORT" && ! -e "$HARDEN_SYSTEMD_DIR/acct-monthly-report.service.d/99-hardening.conf" ]] && grep -Fq "result=rolled back" "$SYSTEMD_HARDENING_REPORT"
+    ' _ "$repo_root" "$case_root" || fail "acct monthly report placeholder rollback regression failed"
 }
 
 run_runtime_noop_tests() {

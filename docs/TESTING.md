@@ -112,23 +112,24 @@ sudo systemctl cat acct-monthly-report.service
 sudo systemctl cat acct-monthly-report.timer
 sudo sed -n '1,240p' /usr/share/acct/reporting/monthly
 sudo systemctl show -p ProtectSystem -p ReadWritePaths acct-monthly-report.service
-sudo systemctl reset-failed acct-monthly-report.service  # nur zur Vorbereitung, falls bereits geprüft
-sudo systemctl start --wait acct-monthly-report.service
 sudo systemctl status --no-pager acct-monthly-report.service
-sudo stat /var/log/wtmp.report
+sudo stat -c '%U:%G %a %n' /var/log/wtmp.report
 sudo cat /root/systemd-hardening-report.txt
 sudo ./harden.sh --apply --aggressive
+sudo stat -c '%U:%G %a %n' /var/log/wtmp.report
+sudo systemctl start --wait acct-monthly-report.service
 sudo ./harden.sh --apply --aggressive
 sudo systemctl start --wait acct-monthly-report.service
 sudo apt-get check
 systemctl --failed --no-pager
 ```
 
-Der erste Lauf muss die gemergte Unit vor Installation validieren und den
-One-shot erfolgreich ausführen; `/var/log/wtmp.report` muss danach vorhanden
-sein. Ein bereits fehlgeschlagener Dienst wird nur nach erfolgreichem Lauf per
-`reset-failed` bereinigt. Der zweite Apply ist bei unveränderter Policy ein
-vollständiger No-op ohne erneuten Start oder Reload.
+Der erste Lauf muss die gemergte Unit vor Installation validieren, die fehlende
+Reportdatei eng als `root:adm`/`0640` anlegen und erst dann den One-shot
+ausführen; `ReadWritePaths` muss exakt `/var/log/wtmp.report` ohne optionales
+`-` enthalten. Ein bereits fehlgeschlagener Dienst wird nur nach erfolgreichem
+Lauf per `reset-failed` bereinigt. Der zweite Apply ist bei unveränderter Policy
+ein vollständiger No-op ohne erneute Dateierstellung, Start oder Reload.
 
 Der zweite Lauf darf bei gültigen Drop-ins weder `systemctl daemon-reload` noch
 einen Service-Restart auslösen; die Scores bleiben stabil. SSH wird mit
