@@ -1928,6 +1928,47 @@ EOF
     ' _ "$repo_root" "$case_root" || fail "acct monthly report placeholder rollback regression failed"
 }
 
+run_apparmor_profile_tests() {
+    local case_root="$test_root/apparmor-profiles"
+    install -d "$case_root/profiles/disable"
+    printf '/usr/bin/fail2ban-server {\n}\n' > "$case_root/profiles/usr.bin.fail2ban-server"
+    : > "$case_root/kernel-profiles"
+    env HARDEN_SOURCE_ONLY=1 HARDEN_APPARMOR_DIR="$case_root/profiles" HARDEN_APPARMOR_REPORT="$case_root/report" HARDEN_APPARMOR_KERNEL_PROFILES="$case_root/kernel-profiles" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        test_dir="$2"; MODE=apply; BACKUP_DIR="$test_dir/backup"; CHANGE_LOG="$test_dir/changes"; mkdir -p "$BACKUP_DIR"; : > "$CHANGE_LOG"; : > "$test_dir/commands"
+        apparmor_service_executable() { printf "/usr/bin/fail2ban-server\n"; }; dpkg-query() { return 0; }; apparmor_process_is_unconfined_for_service() { [[ ! -e "$test_dir/confined" ]]; }; apparmor_service_health_check() { return 0; }
+        apparmor_parser() { printf "parser %s\n" "$*" >> "$test_dir/commands"; [[ "$1" != -R ]] && : > "$test_dir/confined"; return 0; }; systemctl() { printf "systemctl %s\n" "$*" >> "$test_dir/commands"; return 0; }; run_streamed() { "$@"; }
+        configure_apparmor_vendor_service fail2ban.service
+        grep -Fq "parser -Q" "$test_dir/commands" && grep -Fq "parser -r" "$test_dir/commands" && grep -Fq "systemctl restart" "$test_dir/commands" && grep -Fxq "fail2ban.service" "$test_dir/commands" && grep -Fq "result=kept" "$APPARMOR_REPORT" || exit 1
+        : > "$test_dir/commands"; configure_apparmor_vendor_service fail2ban.service
+        [[ ! -s "$test_dir/commands" ]] || exit 1
+    ' _ "$repo_root" "$case_root" || fail "AppArmor vendor-profile transition or converged no-op regression failed"
+
+    env HARDEN_SOURCE_ONLY=1 HARDEN_APPARMOR_DIR="$case_root/profiles" HARDEN_APPARMOR_REPORT="$case_root/rollback-report" HARDEN_APPARMOR_KERNEL_PROFILES="$case_root/kernel-profiles" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        test_dir="$2"; MODE=apply; BACKUP_DIR="$test_dir/rollback-backup"; CHANGE_LOG="$test_dir/rollback-changes"; mkdir -p "$BACKUP_DIR"; : > "$CHANGE_LOG"; : > "$test_dir/rollback-commands"
+        apparmor_service_executable() { printf "/usr/bin/fail2ban-server\n"; }; dpkg-query() { return 0; }; apparmor_process_is_unconfined_for_service() { return 0; }; apparmor_service_health_check() { return 1; }
+        apparmor_parser() { printf "parser %s\n" "$*" >> "$test_dir/rollback-commands"; return 0; }; systemctl() { printf "systemctl %s\n" "$*" >> "$test_dir/rollback-commands"; return 0; }; run_streamed() { "$@"; }
+        configure_apparmor_vendor_service fail2ban.service
+        grep -Fq "parser -R" "$test_dir/rollback-commands" && grep -Fq "systemctl restart" "$test_dir/rollback-commands" && grep -Fxq "fail2ban.service" "$test_dir/rollback-commands" && grep -Fq "result=rolled-back" "$APPARMOR_REPORT" || exit 1
+    ' _ "$repo_root" "$case_root" || fail "AppArmor health-failure rollback regression failed"
+
+    env HARDEN_SOURCE_ONLY=1 HARDEN_APPARMOR_REPORT="$case_root/dry-run-report" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        MODE=dry-run; aa-status() { return 0; }; apparmor_parser() { return 0; }; systemctl() { exit 1; }
+        configure_apparmor
+        [[ "$APPARMOR_STATUS" == PLANNED && ! -e "$APPARMOR_REPORT" ]]
+    ' _ "$repo_root" "$case_root" || fail "AppArmor dry-run wrote state"
+
+    env HARDEN_SOURCE_ONLY=1 bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        section="$(sed -n "/^configure_apparmor()/,/^}/p" "$1/harden.sh")"
+        ! grep -Fq "aa-enforce" <<<"$section"
+        grep -Fq "for service in fail2ban.service rsyslog.service" <<<"$section"
+        grep -Fq "SSH, Tailscale, systemd, networking, firewall, package-management and recovery paths" <<<"$section"
+    ' _ "$repo_root" || fail "AppArmor protected-service exclusions regressed"
+}
+
 run_runtime_noop_tests() {
     local case_root="$test_root/runtime-noop"
     local mock_bin="$case_root/bin"
@@ -3201,6 +3242,9 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
     acct-monthly)
         run_acct_monthly_report_tests
         ;;
+    apparmor)
+        run_apparmor_profile_tests
+        ;;
     packages)
         run_packagekit_tests
         run_package_upgrade_tests
@@ -3242,6 +3286,7 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
         run_binfmt_tests
         run_systemd_idempotency_tests
         run_acct_monthly_report_tests
+        run_apparmor_profile_tests
         run_runtime_noop_tests
         run_deleted_open_tests
         run_login_timeout_tests
@@ -3265,6 +3310,7 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
         run_binfmt_tests
         run_systemd_idempotency_tests
         run_acct_monthly_report_tests
+        run_apparmor_profile_tests
         run_runtime_noop_tests
         run_deleted_open_tests
         run_login_timeout_tests

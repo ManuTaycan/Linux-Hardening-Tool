@@ -135,6 +135,30 @@ akzeptabel, wenn der präzise Pfad, Unit-Validierung, One-shot und
 `root:adm`/`0640` nachweislich erfolgreich sind; andere Service-Drop-ins
 behalten weiterhin ihr messbares Score-Gate.
 
+### Ubuntu-26.04.1-Retest AppArmor service coverage (#15)
+
+Der Lauf darf keine automatisch erzeugten Profile oder pauschales Enforcing
+aller Profile vornehmen. Er inventarisiert unconfined Prozesse vor und nach dem
+Apply und bewertet ausschließlich aktive `fail2ban.service`- und
+`rsyslog.service`-Prozesse, sofern zu deren tatsächlichem `ExecStart` ein
+paketiertes, nicht deaktiviertes Profil existiert. SSH, Tailscale, systemd,
+Netzwerk, Firewall, Paketmanagement und Recovery bleiben sichtbar ausgeschlossen.
+
+```bash
+sudo aa-status
+sudo ./harden.sh --apply --aggressive
+sudo cat /root/apparmor-service-coverage-report.txt
+sudo systemctl is-active fail2ban.service rsyslog.service ssh.service tailscaled.service
+sudo fail2ban-client ping
+sudo fail2ban-client status sshd
+sudo ./harden.sh --apply --aggressive
+```
+
+Für jeden tatsächlich profilierten Dienst prüfe den gemergten Profilpfad mit
+`apparmor_parser -Q`, den Healthcheck und `/proc/<PID>/attr/current`. Der
+zweite Lauf darf bei unverändertem Inventar weder ein Profil laden noch einen
+Dienst neu starten.
+
 Der zweite Lauf darf bei gültigen Drop-ins weder `systemctl daemon-reload` noch
 einen Service-Restart auslösen; die Scores bleiben stabil. SSH wird mit
 `UMask=0027` allein behandelt: `PrivateTmp` ist wegen der beschriebenen
