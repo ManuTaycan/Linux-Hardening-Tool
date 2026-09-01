@@ -126,6 +126,10 @@ sudo ./harden.sh --apply
 sudo ./harden.sh --apply --aggressive
 # Only on an unequivocally unused IPv6 host, after reviewing the dry-run:
 sudo ./harden.sh --apply --aggressive --disable-ipv6
+# Optional reversible SSH port stage; the old port remains active:
+sudo ./harden.sh --apply --aggressive --ssh-port 52022
+# Only after a separately verified new SSH session:
+sudo ./harden.sh --apply --aggressive --non-interactive --retire-ssh-port
 ```
 
 Nicht-interaktives Remote Logging:
@@ -141,7 +145,13 @@ sudo ./harden.sh \
 
 ## Absichtlich unveränderte Bereiche
 
-- Der SSH-Port wird nicht geändert.
+- Der SSH-Port bleibt standardmäßig unverändert.
+- Eine Portänderung ist ausschließlich eine optionale, zweistufige Migration:
+  `--ssh-port PORT` hält den bisherigen Port zunächst parallel aktiv. Ein anderer
+  Port verringert nur Scan- und Log-Noise; starke Authentifizierung, Firewall
+  und Fail2ban bleiben die tatsächlichen Schutzmaßnahmen. Der alte Port wird
+  erst in einem späteren Lauf nach bestätigter neuer SSH-Sitzung mit
+  `--retire-ssh-port` entfernt.
 - Es wird kein GRUB-Passwort eingerichtet.
 - `/home` und `/var` werden nicht automatisch live repartitioniert.
 - Für den Admin-Account wird kein festes Ablaufdatum erzwungen.
