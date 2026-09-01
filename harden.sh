@@ -5414,7 +5414,7 @@ apparmor_unit_for_pid() {
     local pid="$1" cgroup="" unit=""
     [[ -r "/proc/${pid}/cgroup" ]] || return 0
     cgroup="$(cat "/proc/${pid}/cgroup" 2>/dev/null || true)"
-    unit="$(grep -Eo '[^/[:space:]]+\.service' <<<"$cgroup" | tail -n 1 || true)"
+    unit="$(awk -F/ '{ for (i = 1; i <= NF; i++) if ($i ~ /\.service$/) unit = $i } END { print unit }' <<<"$cgroup")"
     printf '%s\n' "$unit"
 }
 
@@ -5460,7 +5460,7 @@ write_apparmor_unconfined_inventory() {
 apparmor_service_executable() {
     local service="$1" exec_start=""
     exec_start="$(systemctl show --property=ExecStart --value "$service" 2>/dev/null || true)"
-    sed -n 's/.*path=\([^ ;}]*\).*/\1/p' <<<"$exec_start" | head -n 1
+    sed -n 's/.*path=\([^ ;}]*\).*/\1/p; q' <<<"$exec_start"
 }
 
 apparmor_vendor_profile_for_service() {
