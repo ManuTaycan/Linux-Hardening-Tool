@@ -2304,7 +2304,7 @@ EOF
 
     env HARDEN_SOURCE_ONLY=1 bash -c '
         source "$1/harden.sh"; trap - ERR EXIT
-        SSH_SERVICE=ssh.service; SSH_LISTENER_MODE=socket; SSH_LISTENER_UNIT=ssh.socket; SSH_PORT=22; SSHD_BIN=sshd; mutations=0
+        SSH_SERVICE=ssh.service; SSH_LISTENER_MODE=socket; SSH_LISTENER_UNIT=ssh.socket; SSH_PORT=22; SSHD_BIN=sshd; SSH_HARDENING_CONFIG_CHANGED=0; mutations=0
         sshd() { [[ "$1" == -t ]]; }; ssh_port_is_listening() { [[ "$1" == "$SSH_PORT" ]]; }
         systemctl() { [[ "$1" == is-active && "$3" == ssh.socket ]] || { mutations=1; return 1; }; }
         run_streamed() { mutations=1; return 1; }
@@ -2315,6 +2315,37 @@ EOF
 
     env HARDEN_SOURCE_ONLY=1 bash -c '
         source "$1/harden.sh"; trap - ERR EXIT
+        SSH_SERVICE=ssh.service; SSH_LISTENER_MODE=socket; SSH_LISTENER_UNIT=ssh.socket; SSH_PORT=22; SSHD_BIN=sshd; SSH_HARDENING_CONFIG_CHANGED=0; mutations=0
+        sshd() { [[ "$1" == -t ]]; }; ssh_port_is_listening() { [[ "$1" == 22 ]]; }
+        systemctl() { [[ "$1" == is-active && ( "$3" == ssh.socket || "$3" == ssh.service ) ]]; }
+        run_streamed() { mutations=1; return 1; }
+        hardened_ssh_runtime_healthy && [[ "$mutations" == 0 ]]
+    ' _ "$repo_root" || fail "unchanged socket-mode SSH hardening reloaded an already active ssh.service"
+
+    env HARDEN_SOURCE_ONLY=1 bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        SSH_SERVICE=ssh.service; SSH_LISTENER_MODE=socket; SSH_LISTENER_UNIT=ssh.socket; SSH_PORT=22; SSHD_BIN=sshd; SSH_HARDENING_CONFIG_CHANGED=1; reloads=0; socket_mutations=0
+        sshd() { [[ "$1" == -t ]]; }; ssh_port_is_listening() { [[ "$1" == 22 ]]; }
+        systemctl() {
+            if [[ "$1" == is-active && ( "$3" == ssh.socket || "$3" == ssh.service ) ]]; then return 0; fi
+            [[ "$1" != restart || "$2" != ssh.socket ]] || socket_mutations=1
+            return 1
+        }
+        run_streamed() { [[ "$1" == systemctl && "$2" == reload && "$3" == ssh.service ]] && { reloads=$((reloads + 1)); return 0; }; return 1; }
+        hardened_ssh_runtime_healthy && [[ "$reloads" == 1 && "$socket_mutations" == 0 ]]
+    ' _ "$repo_root" || fail "changed socket-mode SSH hardening did not reload exactly one active ssh.service without restarting ssh.socket"
+
+    env HARDEN_SOURCE_ONLY=1 bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        SSH_SERVICE=ssh.service; SSH_LISTENER_MODE=socket; SSH_LISTENER_UNIT=ssh.socket; SSH_PORT=22; SSHD_BIN=sshd; SSH_HARDENING_CONFIG_CHANGED=1; mutations=0
+        sshd() { [[ "$1" == -t ]]; }; ssh_port_is_listening() { [[ "$1" == 22 ]]; }
+        systemctl() { [[ "$1" == is-active && "$3" == ssh.socket ]] || return 1; }
+        run_streamed() { mutations=1; return 1; }
+        hardened_ssh_runtime_healthy && [[ "$mutations" == 0 ]]
+    ' _ "$repo_root" || fail "changed socket-mode SSH hardening touched an inactive ssh.service or ssh.socket"
+
+    env HARDEN_SOURCE_ONLY=1 bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
         SSH_SERVICE=ssh.service; SSH_LISTENER_MODE=service; SSH_PORT=22; SSHD_BIN=sshd; reloaded=0
         sshd() { [[ "$1" == -t ]]; }; systemctl() { [[ "$1" == is-active && "$3" == ssh.service ]]; }; run_streamed() { [[ "$1" == systemctl && "$2" == reload && "$3" == ssh.service ]] && reloaded=1; }
         hardened_ssh_runtime_healthy && [[ "$reloaded" == 1 ]]
@@ -2322,11 +2353,18 @@ EOF
 
     env HARDEN_SOURCE_ONLY=1 bash -c '
         source "$1/harden.sh"; trap - ERR EXIT
-        BACKUP_DIR="$2/socket-normal-rollback"; mkdir -p "$BACKUP_DIR/transactions"; SSH_SERVICE=ssh.service; SSH_LISTENER_MODE=socket; SSH_LISTENER_UNIT=ssh.socket; mutations=0; restores=0
+        BACKUP_DIR="$2/socket-normal-rollback"; mkdir -p "$BACKUP_DIR/transactions"; SSH_SERVICE=ssh.service; SSH_LISTENER_MODE=socket; SSH_LISTENER_UNIT=ssh.socket; SSH_HARDENING_CONFIG_CHANGED=1; mutations=0; restores=0
         transaction_restore() { restores=$((restores + 1)); }; systemctl() { if [[ "$1" == is-active && "$3" == ssh.service ]]; then return 1; fi; mutations=1; return 1; }; run_streamed() { mutations=1; return 1; }
         restore_hardened_ssh_config
         [[ "$restores" == 1 && "$mutations" == 0 ]]
     ' _ "$repo_root" "$case_root" || fail "socket-mode normal SSH rollback attempted an unnecessary socket/service restart"
+
+    env HARDEN_SOURCE_ONLY=1 bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        BACKUP_DIR="$2/socket-active-rollback"; mkdir -p "$BACKUP_DIR/transactions"; SSH_SERVICE=ssh.service; SSH_LISTENER_MODE=socket; SSH_LISTENER_UNIT=ssh.socket; SSH_HARDENING_CONFIG_CHANGED=1; reloads=0; restores=0
+        transaction_restore() { restores=$((restores + 1)); }; systemctl() { [[ "$1" == is-active && "$3" == ssh.service ]]; }; run_streamed() { [[ "$1" == systemctl && "$2" == reload && "$3" == ssh.service ]] && { reloads=$((reloads + 1)); return 0; }; return 1; }
+        restore_hardened_ssh_config && [[ "$restores" == 1 && "$reloads" == 1 ]]
+    ' _ "$repo_root" "$case_root" || fail "changed socket-mode SSH rollback did not prove a single active ssh.service reload without touching ssh.socket"
 
     env HARDEN_SOURCE_ONLY=1 bash -c '
         source "$1/harden.sh"; trap - ERR EXIT
@@ -2336,21 +2374,40 @@ EOF
         [[ "$died" == 0 && "$FIREWALL_STATUS" == FAILED ]]
     ' _ "$repo_root" "$case_root" || fail "recoverable SSH-migration firewall validation still exited the process"
 
+    env HARDEN_SOURCE_ONLY=1 bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        MODE=apply; BACKUP_DIR="$2/recoverable-no-nft"; mkdir -p "$BACKUP_DIR"; SSH_PORT_MIGRATION_STATE_UNSAFE=0
+        command() { [[ "$1" == -v && "${2:-}" == nft ]] && return 1; builtin command "$@"; }
+        record_skip() { :; }; log() { :; }
+        ! configure_firewall --recoverable
+        [[ "$FIREWALL_STATUS" == FAILED ]]
+        configure_firewall
+    ' _ "$repo_root" "$case_root" || fail "recoverable SSH-migration firewall apply did not fail when nft was unavailable while generic Phase 07 behavior changed"
+
+    env HARDEN_SOURCE_ONLY=1 bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        MODE=apply; SSH_PORT_MIGRATION_STATE_UNSAFE=1
+        record_skip() { :; }; log() { :; }
+        ! configure_firewall --recoverable
+        [[ "$FIREWALL_STATUS" == REVIEW\ REQUIRED/FROZEN* ]]
+        configure_firewall
+    ' _ "$repo_root" || fail "recoverable SSH-migration firewall apply did not fail while an unsafe migration state froze Phase 07"
+
     env HARDEN_SOURCE_ONLY=1 HARDEN_SSH_CONFIG_DIR="$case_root/recoverable-retire-config" \
         HARDEN_SSH_PORT_STATE_FILE="$case_root/recoverable-retire-state" HARDEN_SSH_PORT_REPORT="$case_root/recoverable-retire-report" bash -c '
         source "$1/harden.sh"; trap - ERR EXIT
         test_dir="$2"; MODE=apply; BACKUP_DIR="$test_dir/recoverable-retire-backup"; mkdir -p "$BACKUP_DIR" "$(dirname "$(ssh_migration_config_path)")"; CHANGE_LOG="$test_dir/recoverable-retire-changes"; : > "$CHANGE_LOG"
-        SSH_PORT=22; SSH_STAGED_OLD_PORT=22; SSH_STAGED_NEW_PORT=2222; SSH_PORT_RETIRE=1; NON_INTERACTIVE=1; SSH_SERVICE=ssh.service; SSH_LISTENER_MODE=service; SSHD_BIN=sshd; recoverable=0
+        SSH_PORT=22; SSH_STAGED_OLD_PORT=22; SSH_STAGED_NEW_PORT=2222; SSH_PORT_RETIRE=1; NON_INTERACTIVE=1; SSH_SERVICE=ssh.service; SSH_LISTENER_MODE=service; SSHD_BIN=sshd
         printf "Port 22\nPort 2222\n" > "$(ssh_migration_config_path)"; printf dual > "$test_dir/firewall"; printf dual > "$test_dir/fail2ban"; printf "status=staged\nold_port=22\nnew_port=2222\nlistener_mode=service\n" > "$HARDEN_SSH_PORT_STATE_FILE"
         transaction_copy() { :; }
         transaction_restore() { case "$2" in ssh-port-migration.conf) printf "Port 22\nPort 2222\n" > "$1" ;; ssh-port-firewall.nft) printf dual > "$test_dir/firewall" ;; ssh-port-fail2ban-global.local|ssh-port-fail2ban.local) printf dual > "$test_dir/fail2ban" ;; ssh-port-state.conf) printf "status=staged\nold_port=22\nnew_port=2222\nlistener_mode=service\n" > "$1" ;; esac; }
         install_managed_file() { local target="$1"; shift 2; cat > "$target"; MANAGED_FILE_CHANGED=1; }
         sshd() { if [[ "$1" == -t ]]; then return 0; fi; awk "\$1 == \"Port\" {print \"port \" \$2}" "$(ssh_migration_config_path)"; }; ssh_port_is_listening() { grep -Fxq "Port $1" "$(ssh_migration_config_path)"; }
         ssh_port_policy_healthy() { [[ "$1" == dual && "$2" == 22 && "$3" == 2222 ]] && grep -Fxq "Port 22" "$(ssh_migration_config_path)" && grep -Fxq "Port 2222" "$(ssh_migration_config_path)" && [[ "$(< "$test_dir/firewall")" == dual && "$(< "$test_dir/fail2ban")" == dual ]] && grep -Fxq "status=staged" "$HARDEN_SSH_PORT_STATE_FILE"; }
-        run_streamed() { return 0; }; systemctl() { return 0; }; configure_fail2ban() { printf new > "$test_dir/fail2ban"; FAIL2BAN_STATUS=OK; return 0; }; configure_firewall() { [[ "$1" == --recoverable ]] && recoverable=1; return 1; }; write_ssh_port_migration_report() { :; }; log() { :; }
+        run_streamed() { return 0; }; systemctl() { return 0; }; configure_fail2ban() { printf new > "$test_dir/fail2ban"; FAIL2BAN_STATUS=OK; return 0; }; command() { [[ "$1" == -v && "${2:-}" == nft ]] && return 1; builtin command "$@"; }; record_skip() { :; }; write_ssh_port_migration_report() { :; }; log() { :; }
         ! retire_ssh_port_migration
-        [[ "$recoverable" == 1 && "$SSH_PORT_MIGRATION_STATUS" == FAILED/ROLLED\ BACK* ]] && ssh_port_policy_healthy dual 22 2222
-    ' _ "$repo_root" "$case_root" || fail "recoverable final-firewall failure did not prove the required dual-port SSH rollback"
+        [[ "$SSH_PORT_MIGRATION_STATUS" == FAILED/ROLLED\ BACK* ]] && ! grep -Fxq "status=retired" "$HARDEN_SSH_PORT_STATE_FILE" && ssh_port_policy_healthy dual 22 2222
+    ' _ "$repo_root" "$case_root" || fail "unavailable nft during final retire did not prove dual-port rollback or incorrectly wrote retired state"
 }
 
 run_runtime_noop_tests() {

@@ -41,6 +41,7 @@ SSH_PORT_MIGRATION_REPORT="${HARDEN_SSH_PORT_REPORT:-/root/ssh-port-migration-re
 SSH_STAGED_OLD_PORT=""
 SSH_STAGED_NEW_PORT=""
 SSH_PORT_MIGRATION_RELOADED=0
+SSH_HARDENING_CONFIG_CHANGED=0
 SSH_PORT_MIGRATION_STATE_UNSAFE=0
 SSH_PORT_MIGRATION_STATE_STATUS=""
 SSH_SERVICE=""
@@ -3454,11 +3455,19 @@ configure_firewall() {
         FIREWALL_STATUS="REVIEW REQUIRED/FROZEN (SSH migration state is inconsistent; existing owned firewall retained unchanged)"
         record_skip "firewall" "SSH port migration state is unsafe; Phase 07 is frozen so no SSH_CONNECTION/state-derived port can replace the existing owned firewall rule"
         log WARN "Firewall policy is frozen: persisted SSH migration state is inconsistent; retaining the existing owned table without rendering a new SSH port rule"
+        if [[ "$recoverable" -eq 1 ]]; then
+            log ERROR "Recoverable SSH migration firewall apply cannot complete while the owned firewall is frozen by an unsafe migration state"
+            return 1
+        fi
         return 0
     fi
     if ! command -v nft >/dev/null 2>&1; then
         FIREWALL_STATUS="FAILED"
         record_skip "firewall" "nft binary unavailable after package checks"
+        if [[ "$recoverable" -eq 1 ]]; then
+            log ERROR "Recoverable SSH migration firewall apply cannot complete because nft is unavailable"
+            return 1
+        fi
         return 0
     fi
     local tailscale_input="" tailscale_forward="" wireguard_rule="" tailscale_healthy_before=0 ssh_rule="" ssh_port_set=""
@@ -3954,13 +3963,22 @@ manage_ssh_port_migration() {
 }
 
 hardened_ssh_runtime_healthy() {
+    local config_changed="${1:-$SSH_HARDENING_CONFIG_CHANGED}"
     case "$SSH_LISTENER_MODE" in
         socket)
             # ssh.socket owns the listener; an inactive ssh.service is normal.
-            # A port-stable hardening pass must not restart either unit.
+            # Never restart ssh.socket for normal hardening: only an actual
+            # stage/retire operation changes its listener configuration.
             ssh_listener_carrier_healthy \
                 && ssh_port_is_listening "$SSH_PORT" \
-                && "$SSHD_BIN" -t
+                && "$SSHD_BIN" -t || return 1
+            if [[ "$config_changed" -eq 1 ]] && systemctl is-active --quiet "$SSH_SERVICE"; then
+                # A running per-connection service can consume the updated
+                # hardening configuration with a reload, never a restart.
+                run_streamed systemctl reload "$SSH_SERVICE" \
+                    && systemctl is-active --quiet "$SSH_SERVICE" || return 1
+            fi
+            return 0
             ;;
         service)
             run_streamed systemctl reload "$SSH_SERVICE" \
@@ -3972,10 +3990,12 @@ hardened_ssh_runtime_healthy() {
 }
 
 restore_hardened_ssh_config() {
-    local restore_ok=1
-    transaction_restore /etc/ssh/sshd_config.d/99-hardening.conf sshd-hardening.conf || restore_ok=0
-    if [[ -e "$BACKUP_DIR/transactions/sshd_config" || -e "$BACKUP_DIR/transactions/sshd_config.absent" ]]; then
-        transaction_restore /etc/ssh/sshd_config sshd_config || restore_ok=0
+    local config_changed="${1:-$SSH_HARDENING_CONFIG_CHANGED}" restore_ok=1
+    if [[ "$config_changed" -eq 1 ]]; then
+        transaction_restore /etc/ssh/sshd_config.d/99-hardening.conf sshd-hardening.conf || restore_ok=0
+        if [[ -e "$BACKUP_DIR/transactions/sshd_config" || -e "$BACKUP_DIR/transactions/sshd_config.absent" ]]; then
+            transaction_restore /etc/ssh/sshd_config sshd_config || restore_ok=0
+        fi
     fi
     case "$SSH_LISTENER_MODE" in
         service)
@@ -3983,9 +4003,9 @@ restore_hardened_ssh_config() {
             ;;
         socket)
             # Do not restart ssh.socket for a port-stable normal-hardening
-            # rollback. If a per-connection ssh.service happens to be active,
-            # a reload is the most it may receive.
-            if systemctl is-active --quiet "$SSH_SERVICE"; then
+            # rollback. Only a changed normal configuration can require a
+            # reload of an already active per-connection ssh.service.
+            if [[ "$config_changed" -eq 1 ]] && systemctl is-active --quiet "$SSH_SERVICE"; then
                 run_streamed systemctl reload "$SSH_SERVICE" || restore_ok=0
             fi
             ;;
@@ -4000,7 +4020,7 @@ harden_ssh() {
         log INFO "SSH daemon not present; SSH configuration skipped"
         return 0
     fi
-    local ciphers macs kex hostkeys
+    local ciphers macs kex hostkeys main_tmp hardening_tmp normal_config_changed=0
     ciphers="$(supported_ssh_list cipher chacha20-poly1305@openssh.com aes256-gcm@openssh.com aes128-gcm@openssh.com aes256-ctr aes192-ctr aes128-ctr)"
     macs="$(supported_ssh_list mac hmac-sha2-512-etm@openssh.com hmac-sha2-256-etm@openssh.com umac-128-etm@openssh.com hmac-sha2-512 hmac-sha2-256)"
     kex="$(supported_ssh_list kex sntrup761x25519-sha512 sntrup761x25519-sha512@openssh.com mlkem768x25519-sha256 curve25519-sha256 curve25519-sha256@libssh.org diffie-hellman-group16-sha512 diffie-hellman-group18-sha512)"
@@ -4020,7 +4040,6 @@ harden_ssh() {
 
     install -d -o root -g root -m 0755 /etc/ssh/sshd_config.d
     if ! grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' /etc/ssh/sshd_config; then
-        local main_tmp
         main_tmp="$(mktemp)"
         {
             printf 'Include /etc/ssh/sshd_config.d/*.conf\n'
@@ -4029,8 +4048,10 @@ harden_ssh() {
         transaction_copy /etc/ssh/sshd_config sshd_config
         install -o root -g root -m 0600 "$main_tmp" /etc/ssh/sshd_config
         rm -f "$main_tmp"
+        normal_config_changed=1
     fi
     transaction_copy /etc/ssh/sshd_config.d/99-hardening.conf sshd-hardening.conf
+    hardening_tmp="$(mktemp)" || die "Could not create temporary SSH hardening configuration"
     {
         cat <<EOF
 # Managed by harden.sh
@@ -4072,7 +4093,14 @@ EOF
         if [[ -n "$ADMIN_USER" && "$ADMIN_KEY_READY" -eq 1 ]]; then
             printf 'PasswordAuthentication no\n'
         fi
-    } | install_managed_file /etc/ssh/sshd_config.d/99-hardening.conf 0600
+    } > "$hardening_tmp"
+    if ! install_managed_file /etc/ssh/sshd_config.d/99-hardening.conf 0600 < "$hardening_tmp"; then
+        rm -f -- "$hardening_tmp"
+        die "Could not install managed SSH hardening configuration"
+    fi
+    rm -f -- "$hardening_tmp"
+    [[ "$MANAGED_FILE_CHANGED" -eq 0 ]] || normal_config_changed=1
+    SSH_HARDENING_CONFIG_CHANGED="$normal_config_changed"
 
     manage_ssh_port_migration || die "SSH port migration failed; prior SSH/firewall/Fail2ban state was rolled back"
 
@@ -4082,9 +4110,7 @@ EOF
     find /etc/ssh -maxdepth 1 -type f -name 'ssh_host_*_key.pub' -exec chmod 0644 {} +
 
     if ! "$SSHD_BIN" -t; then
-        transaction_restore /etc/ssh/sshd_config.d/99-hardening.conf sshd-hardening.conf
-        [[ -e "$BACKUP_DIR/transactions/sshd_config" || -e "$BACKUP_DIR/transactions/sshd_config.absent" ]] \
-            && transaction_restore /etc/ssh/sshd_config sshd_config
+        restore_hardened_ssh_config "$SSH_HARDENING_CONFIG_CHANGED" || log ERROR "SSH configuration rollback could not fully restore its active listener context"
         SSH_STATUS="FAILED/ROLLED BACK"
         die "sshd rejected the hardening configuration; previous SSH configuration restored"
     fi
@@ -4095,11 +4121,16 @@ EOF
     if [[ "$SSH_PORT_MIGRATION_RELOADED" -eq 1 ]]; then
         SSH_STATUS="OK"
         log INFO "SSH was already reloaded and listener-validated by the requested port migration; no second reload is needed"
-    elif hardened_ssh_runtime_healthy; then
+    elif hardened_ssh_runtime_healthy "$SSH_HARDENING_CONFIG_CHANGED"; then
         SSH_STATUS="OK"
         if [[ "$SSH_LISTENER_MODE" == socket ]]; then
-            log INFO "Validated hardened SSH configuration against active ssh.socket and current listener; no SSH service or socket restart was needed"
-            record_change "Validated hardened SSH configuration in socket listener mode without restarting ssh.service or ssh.socket"
+            if [[ "$SSH_HARDENING_CONFIG_CHANGED" -eq 1 ]] && systemctl is-active --quiet "$SSH_SERVICE"; then
+                log INFO "Validated changed SSH hardening configuration against ssh.socket/current listener and reloaded the already active ssh.service once; ssh.socket was untouched"
+                record_change "Validated changed SSH hardening configuration in socket listener mode without restarting ssh.socket"
+            else
+                log INFO "Validated hardened SSH configuration against active ssh.socket and current listener; no SSH service or socket mutation was needed"
+                record_change "Validated unchanged SSH hardening configuration in socket listener mode without restarting ssh.service or ssh.socket"
+            fi
         else
             record_change "Validated and reloaded hardened SSH configuration without terminating existing sessions"
         fi
@@ -4109,7 +4140,7 @@ EOF
             record_skip "PasswordAuthentication" "administrator ${ADMIN_USER} has no proven authorized_keys entry; password login was retained"
         fi
     else
-        restore_hardened_ssh_config || log ERROR "SSH configuration rollback could not fully reload its active service context"
+        restore_hardened_ssh_config "$SSH_HARDENING_CONFIG_CHANGED" || log ERROR "SSH configuration rollback could not fully reload its active service context"
         SSH_STATUS="FAILED/ROLLED BACK"
         die "SSH listener health check failed; prior configuration restored"
     fi
