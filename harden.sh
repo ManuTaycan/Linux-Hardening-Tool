@@ -391,7 +391,7 @@ prompt_yes_no() {
         case "$answer" in
             y|yes|j|ja) return 0 ;;
             n|no|nein|'') return 1 ;;
-            *) printf '%s\n' 'Bitte mit y/yes/j/ja oder n/no/nein antworten.' > /dev/tty ;;
+            *) printf '%s\n' 'Please answer y/yes or n/no (legacy j/ja/nein aliases are also accepted).' > /dev/tty ;;
         esac
     done
 }
@@ -1173,7 +1173,7 @@ ask_remote_logging() {
         return 0
     fi
     local prompt_status=0
-    if prompt_yes_no "Soll ein Remote-Log-Server verwendet werden? [y/N] "; then
+    if prompt_yes_no "Use a remote log server? [y/N] "; then
         prompt_status=0
     else
         prompt_status=$?
@@ -1187,7 +1187,7 @@ ask_remote_logging() {
         log INFO "Remote logging deliberately disabled by operator choice"
         return 0
     fi
-    prompt_value "IP-Adresse oder Hostname des Log-Servers: " \
+    prompt_value "Remote log server IP address or hostname: " \
         || die "Could not read the remote log server from /dev/tty"
     REMOTE_LOG_SERVER="$PROMPT_REPLY"
     [[ -n "$REMOTE_LOG_SERVER" ]] || die "Remote logging was selected, but no host was entered"

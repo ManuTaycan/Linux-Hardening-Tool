@@ -1,31 +1,31 @@
-## Zusammenfassung
+## Summary
 
-<!-- Was ändert sich? -->
+<!-- What changes? -->
 
-## Motivation und Sicherheitsauswirkung
+## Motivation and security impact
 
-<!-- Risiko, Sicherheitsgewinn und mögliche Nebenwirkungen. -->
+<!-- Risk, security benefit, and possible side effects. -->
 
-## Geänderte Komponenten
+## Changed components
 
-<!-- Skript, Dokumentation, CI, Installer oder Vorlagen. -->
+<!-- Script, documentation, CI, installer, or templates. -->
 
-## Testnachweise
+## Test evidence
 
-<!-- Befehle und Ergebnis; keine Geheimnisse in Logs. -->
+<!-- Commands and results; never include secrets in logs. -->
 
 ## Rollback
 
-<!-- Wie wird der vorherige Zustand wiederhergestellt? -->
+<!-- How is the prior state restored? -->
 
-## Lynis-Auswirkung
+## Lynis impact
 
-<!-- Erwartete oder gemessene Änderung, ohne Score-Gaming. -->
+<!-- Expected or measured effect, without score gaming. -->
 
-## Checkliste
+## Checklist
 
-- [ ] Keine Geheimnisse oder unbereinigten Produktionslogs enthalten
-- [ ] SSH-Port unverändert
-- [ ] Kein GRUB-Passwort ergänzt
-- [ ] Checksum aktualisiert und geprüft
-- [ ] Test- und Rollback-Pfad dokumentiert
+- [ ] No secrets or unredacted production logs included
+- [ ] SSH port policy preserved or explicitly reviewed
+- [ ] No GRUB password added
+- [ ] Checksum updated and verified when harden.sh changed
+- [ ] Test and rollback paths documented

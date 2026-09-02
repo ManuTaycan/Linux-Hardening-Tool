@@ -1,14 +1,13 @@
-# Security Policy
+# Security policy
 
-Dieses Projekt verändert sicherheitskritische Systemdateien, Dienste, Firewall-
-und Authentifizierungseinstellungen. Führe es nur mit einem aktuellen Snapshot
-oder vollständigen Backup und einem getesteten Recovery-Zugang aus.
+This project changes security-sensitive system files, services, firewall rules,
+and authentication settings. Use it only with a current snapshot or full backup
+and tested recovery access.
 
-Melde Sicherheitsprobleme nicht mit echten Zugangsdaten, Tokens, privaten
-Schlüsseln oder vollständigen unbereinigten Logs öffentlich. Bereinige Logs vor
-dem Teilen und beschreibe stattdessen reproduzierbar die betroffene Version,
-Distribution, Phase und Auswirkung.
+Do not report a vulnerability with credentials, tokens, private keys, or full
+unredacted logs. Redact the evidence and include the affected version,
+distribution, phase, impact, and safe reproduction steps.
 
-Ein bestimmter Lynis-Score wird nicht garantiert. Ein hoher Score ersetzt weder
-eine Bedrohungsanalyse noch Tests für die konkrete Serverrolle. Berücksichtige
-bei Änderungen außerdem Paketquellen, Abhängigkeiten und Supply-Chain-Risiken.
+No Lynis score is guaranteed. A high score does not replace threat modeling,
+testing for the actual server role, package-source review, dependency review,
+or supply-chain controls.

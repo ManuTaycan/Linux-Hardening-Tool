@@ -1,97 +1,78 @@
 # Troubleshooting
 
-## Execute-Bit oder `Permission denied`
+## Execute permission or Permission denied
 
-Prüfe `ls -l harden.sh`, kopiere das Repository nicht auf ein Dateisystem mit
-`noexec` und setze gegebenenfalls `chmod +x harden.sh`.
+Check ls -l harden.sh, do not place the repository on a noexec filesystem, and
+restore the executable bit with chmod +x harden.sh when appropriate.
 
-## SSH, nftables und Tailscale
+## SSH, nftables, and Tailscale
 
-Halte die zweite SSH-Sitzung offen. Prüfe vor einem Reload `sshd -t`, kontrolliere
-die nftables-Regeln und teste Tailscale-Routing separat. Bei einem Problem den
-gesicherten Backup-Zustand oder Snapshot wiederherstellen.
+Keep the second SSH session open. Before any reload, validate sshd -t, inspect
+the owned nftables rules, and test Tailscale routing separately. Restore the
+backup state or snapshot if the access path is unhealthy.
 
-## rsyslog oder Remote-Ziel nicht erreichbar
+## rsyslog or remote destination is unavailable
 
-Prüfe Ziel, Port, Transport, DNS, Firewall und bei TLS die CA-Datei. Der lokale
-Logging-Pfad muss unabhängig vom Remote-Ziel weiter funktionieren.
+Check destination, port, transport, DNS, firewall, and the CA path for TLS.
+Local logging must continue independently of a remote destination.
 
-## systemd-Drop-in wurde zurückgerollt
+## A systemd drop-in was rolled back
 
-Sieh in `/root/systemd-hardening-report.txt`, die vor/nach gespeicherten
-`systemd-analyze`-Ausgaben und `journalctl -u NAME.service`. Entferne keine
-Schutzoptionen blind; teste den Dienstzweck und erstelle einen gezielten Fix.
+Read /root/systemd-hardening-report.txt, the saved before/after
+systemd-analyze output, and journalctl -u NAME.service. Do not remove sandbox
+controls blindly; identify the service requirement and prepare a focused fix.
 
-## AIDE dauert lange
+## AIDE takes a long time
 
-Eine Baseline liest viele Dateien und kann I/O-intensiv sein. Nicht abbrechen,
-ohne den Zustand von Datenbank, Timer und Backup zu prüfen.
+A baseline reads many files and can be I/O intensive. Do not interrupt it
+without inspecting the database, timer, and backup state.
 
-`FINT-4402` liest in Lynis 3.1.6 nur die erkannte primäre AIDE-Konfiguration;
-Lynis expandiert deren Include-Dateien für diesen Test nicht. Das Skript hält
-deshalb die tatsächlich wirksame `HardenSHA2`-Gruppendefinition in der primären
-Runtime-Konfiguration und die überwachten Pfade im Include. Prüfe bei einem
-Restbefund `aide-lynis-FINT-4402-evidence.txt` und `aide --config-check`; füge
-keine wirkungslose Kommentarzeile nur für den Score ein.
+For FINT-4402, Lynis 3.1.6 inspects only the recognised primary AIDE
+configuration and does not expand included files for this test. Inspect
+aide-lynis-FINT-4402-evidence.txt and aide --config-check. Do not add a
+non-functional comment merely to affect a score.
 
-## PackageKit, Compiler und binfmt
+## PackageKit, compiler, or binfmt decision
 
-Die Entscheidungsartefakte liegen im Lauf-Backup. Ein unsicherer PackageKit-
-oder Compiler-Purge wird abgebrochen, nicht erzwungen. Wiederherstellung eines
-bewusst entfernten Pakets erfolgt aus den konfigurierten Distributionsquellen
-mit `apt-get install PAKET`; anschließend APT und die zugehörigen Dienste
-validieren. Erhaltene Compiler werden nach Paketupdates erneut root-only
-gesetzt. Kernel-Headers allein sind kein Purge-Veto; aktive DKMS-Nutzung und
-jede simulierte nicht zur Toolchain gehörende Abhängigkeit bleiben es.
+Decision artifacts are stored in the run backup. Unsafe PackageKit or compiler
+purges are skipped rather than forced. Restore an intentionally removed package
+only from configured distribution sources, then validate APT and the related
+service. Kernel headers alone are not a purge veto; active DKMS use and every
+simulated non-toolchain dependency are.
 
-Die distributionsseitige `python3.X`-binfmt-Regel dient nur dem direkten Start
-versionsspezifischer kompilierter `.pyc`-Dateien. Auf einem Host ohne geschützte
-Fremdformat-Verbraucher kann das Skript genau diese Vendor-Datei über den von
-systemd vorgesehenen gleichnamigen `/etc/binfmt.d/... -> /dev/null`-Override
-maskieren und nur die passende Laufzeitregistrierung entfernen. Normales
-Python, APT, systemd und andere Registrierungen werden danach geprüft. Unbekannte
-oder qemu-/Wine-/JVM-Formate werden weiterhin erhalten; sie lösen keinen blinden
-globalen Modul-Blacklist-Pfad aus.
+The vendor python3.X binfmt rule supports direct execution of version-specific
+compiled .pyc files. On a host without protected foreign-format consumers, only
+that matching vendor rule can be disabled reversibly. Python, APT, systemd, and
+other registrations are validated afterwards. Unknown qemu, Wine, and JVM
+formats remain protected.
 
-## Lynis-Summary oder Fail2ban widersprüchlich
+## Lynis summary or Fail2ban mismatch
 
-Prüfe `lynis-after-hardening-report.dat`,
-`lynis-summary-parse-diagnostics.txt` und das Backup-Artefakt
-`fail2ban-runtime.txt`. Der Fail2ban-Status setzt einen aktiven Dienst, eine
-erfolgreiche Server-Ping-Antwort und den live abfragbaren `sshd`-Jail voraus.
+Inspect lynis-after-hardening-report.dat,
+lynis-summary-parse-diagnostics.txt, and the fail2ban-runtime.txt backup
+artifact. An OK Fail2ban status requires an active service, a successful server
+ping, and a live sshd jail query.
 
-## `PROC-3614`
+## PROC-3614
 
-`/root/hardening-iowait-processes.txt` enthält wiederholte D-State-Snapshots
-mit Unit und Wait-Channel. Kurzlebige I/O-Waits sind erwartbar; wiederholt
-gleiche PIDs erfordern Storage-/Filesystem-Diagnose. D-State-Prozesse nicht
-blind killen oder Storage zurücksetzen.
+/root/hardening-iowait-processes.txt contains repeated D-state snapshots with
+unit and wait channel. Short-lived waits are expected; repeated PIDs require
+storage/filesystem diagnosis. Never kill D-state processes automatically.
 
-## `kernel.modules_disabled=1`
+## kernel.modules_disabled=1
 
-Diese aggressive Einstellung ist bis zum Reboot irreversibel. Teste benötigte
-Kernelmodule vorher und stelle bei Problemen per Reboot/Snapshot wieder her.
+This aggressive setting is irreversible until reboot. Test required kernel
+modules first and recover through reboot or snapshot when necessary.
 
-Bei aktivem Tailscale setzt der späte Lock den Wert nur nach erfolgreicher
-Netfilter-/NAT-Vorladung und Dual-Stack-Runtimeprüfung. Prüfe bei einer
-fehlgeschlagenen `kernel-module-lockdown.service` zuerst
-`/root/kernel-module-lockdown-report.txt` und
-`journalctl -u kernel-module-lockdown.service -b`. Ein fehlgeschlagenes Gate
-ist absichtlich kein Erfolg: `kernel.modules_disabled` bleibt 0, damit der
-Systemzugriff erhalten und eine gezielte Reparatur möglich bleibt. Das Gate
-ändert keine Tailscale-Routen, Exit-Node-, Accept-Routes- oder Advertise-Routes-
-Einstellungen. Ist der Wert bereits 1, erfolgen keine `modprobe`-Versuche.
-Auf einem bereits fehlerhaft gesperrten Host installiert ein aktualisierter
-Apply-Lauf zwar den korrigierten Helper, die Preload-/Lock-Units und das
-Tailscale-Drop-in, kann fehlende Module im laufenden Kernel aber absichtlich
-nicht nachladen. Die Runtime-Reparatur wird erst nach einem kontrollierten
-Reboot wirksam: Die neue Preload-Unit läuft vor `tailscaled.service`, danach
-validiert die späte Lock-Unit denselben Gate-Pfad. Ein anschließender zweiter
-Apply-Lauf muss den bereits gesetzten Wert ohne `modprobe` idempotent
-bestätigen.
+With active Tailscale, the late lock runs only after successful netfilter/NAT
+preload and dual-stack runtime validation. If the gate fails, inspect
+/root/kernel-module-lockdown-report.txt and the boot journal. A failed gate is
+deliberately not success: module loading remains enabled so that targeted repair
+is still possible. It does not change Tailscale routes, exit-node state,
+accept-routes, or advertise-routes.
 
-## Lauf endet vor Phase 18
+## The run stops before Phase 18
 
-Der EXIT-Trap meldet die aktuelle Phase. Lies `/var/log/server-hardening.log`,
-das Backup und die konkrete Fehlermeldung; starte keinen neuen Apply-Lauf, bevor
-die Ursache und der Rollback-Stand geklärt sind.
+The EXIT trap reports the current phase. Read /var/log/server-hardening.log, the
+backup, and the concrete error. Do not start another Apply until the cause and
+rollback state are understood.

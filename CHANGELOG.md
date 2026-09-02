@@ -1,222 +1,101 @@
 # Changelog
 
-Alle relevanten Änderungen werden in dieser Datei dokumentiert. Ein Release-Tag
-für 1.1.3 wird erst nach dem vollständigen Zielsystemtest erstellt.
+All notable changes are documented here. Version 1.1.3 remains unreleased; no
+release tag or GitHub Release is created by this file.
 
-## Unreleased — Repository-Aufnahme von 1.1.3
+## Unreleased
 
-### Changed
+### Public release polish
 
-- SSH-Port changes are now an operator-opt-in, two-stage migration. The stage
-  first adds the new port only to the harden.sh-owned firewall table while
-  retaining the old port, validates dual `sshd` listeners and Fail2ban coverage,
-  then persists root-only `awaiting-confirmation` state. A later explicit retire
-  validates the staged new listener before removing old SSH, firewall and
-  Fail2ban coverage; any failure restores the dual-port state. Port changes are
-  documented as scan/log-noise reduction only, not an authentication or
-  hardening substitute.
-- AppArmor now writes a before/after inventory of unconfined processes and
-  their systemd context to `/root/apparmor-service-coverage-report.txt`.
-  It no longer bulk-enforces every top-level profile. Only a matching,
-  enabled distribution-owned profile for the explicitly assessed stable
-  `fail2ban.service` or `rsyslog.service` is parser-validated and loaded; the
-  service must restart healthy, pass its service-specific runtime check and
-  become confined or the profile transition is rolled back only after unload,
-  restart, health and unconfined-process restoration are each proven. Rsyslog
-  also validates its configuration, emits a real logger probe and checks new
-  kernel AppArmor denials when the journal query is available. SSH, Tailscale, systemd, networking, firewall, package and
-  recovery services remain deliberate, reported exclusions.
-- Ubuntu MOTD news is now disabled through its documented
-  `/etc/default/motd-news` `ENABLED=0` switch. The `50-motd-news` hook remains
-  executable because `motd-news.service` invokes it directly with `--force`;
-  a legacy non-executable hook is repaired transactionally instead of causing
-  a `203/EXEC` systemd failure. Other presentation hooks remain separately
-  managed and the reboot-required hook is preserved.
-- Systemd exposure review now inventories every active service, records its
-  activity state, score, controls, classification, validation and health in
-  `/root/systemd-hardening-report.txt`, and retains a new service-specific
-  drop-in only after a merged-unit verification, health check and measurable
-  `systemd-analyze security` reduction. Existing valid drop-ins converge
-  without rewriting, daemon-reload or restart. Fail2ban additionally uses a
-  private mount namespace only when its client ping and `sshd` jail validate;
-  APT, SSH, Tailscale and network-critical services remain deliberately narrow
-  or excluded.
-- SSH's managed service drop-in now migrates from `PrivateTmp` plus `UMask` to
-  `UMask=0027` only. A target diagnosis confirmed that a restarted ssh.service
-  can leave an older session in a stale private `/tmp` mount namespace. The
-  migration now runs immediately after Phase 02 backup and before every Phase
-  03 package change, validates the merged unit and `sshd -t`, reloads (never
-  restarts) SSH, and retains this session-safety correction even when its
-  exposure score is unchanged. The officially supported needrestart list-only
-  mode defers all package-hook restarts for the hardening process, records
-  pending services, and requires controlled reboot convergence when an active
-  legacy SSH PrivateTmp namespace or pending service remains.
-- Ubuntu target-test follow-up: Phase 03 now performs one controlled
-  `apt-get upgrade` only after `apt-get check` and a locale-stable simulation;
-  removals and downgrade signals block the operation, conffiles use conservative
-  dpkg defaults, post-check/reboot state are recorded, and an empty upgrade is
-  a true no-op. A final simulated residual-configuration sweep runs after all
-  package-changing phases and retains protected or unrequested dependencies.
-  It may purge only rc-only, non-running versioned kernel remnants with no
-  installed owner, boot artifact, or boot-symlink reference, plus rc-only
-  `grub-pc` on a verified UEFI EFI-GRUB stack; all other boot-critical or
-  ambiguous residuals remain protected.
-- `/etc/issue` and `/etc/issue.net` now receive the exact byte-identical
-  pre-login legal/consent banner required by the reviewed Lynis 3.1.6 banner
-  heuristics; the dynamic post-login MOTD policy remains presentation-only.
-- FIRE-4513 now writes a root-only nftables/iptables inventory instead of
-  deleting rules without ownership proof. Tailscale, SSH, Fail2ban, NAT,
-  forwarding, and all non-owned rules remain untouched.
-- Remaining-findings documentation distinguishes the accepted anonymous memfd
-  LOGG-2190 case, intentionally retained SSH port 22 and absent automation
-  platform, and explains why IPv6 `accept_source_route=-1` is stricter than
-  Lynis 3.1.6's legacy `prefval=0` rather than a score-gaming mismatch.
-- Unreleased real-test fix: synchronous dual logging replaces the asynchronous
-  process-substitution logger, keeps interactive colors, writes ANSI-free logs,
-  prevents logging FD inheritance or package-process job-control stalls, and
-  captures user-visible Apply commands such as `update-grub` without external
-  `tee`.
-- Phase 03 now warns about legitimate multi-minute package work and streams APT
-  progress without imposing artificial package timeouts.
-- acct-monthly-report.service now receives only its vendor report write path,
-  `/var/log/wtmp.report`, under ProtectSystem=strict. If absent, the file is
-  created before activation as `root:adm` mode `0640`, matching the vendor
-  script; existing report contents are never overwritten by the tool. The
-  one-shot is run once after a changed policy (and to recover a pre-existing
-  failed state), with merged-unit validation and report metadata validation;
-  successful runs may clear failed state, while failures roll back the empty
-  placeholder only. Existing valid policy converges without daemon-reload,
-  restart, file creation, or another report run.
-  This service-specific compatibility correction is retained even when
-  `systemd-analyze security` remains unchanged, but only after exact
-  ReadWritePaths, merged-unit, one-shot and metadata validation; generic
-  service score gates remain unchanged.
-- AIDE now validates the distribution's active configuration directly, without
-  requiring `update-aide.conf`; it resolves `database_in`/`database_out`,
-  atomically activates a verified baseline, skips unnecessary second-run
-  rebuilds, checks the database, validates one real vendor/custom systemd
-  service run (including Ubuntu `_aide` capabilities), and enables the timer
-  only after success.
-- The irreversible `kernel.modules_disabled=1` write is guarded by the final
-  phase-17 network, firewall, AppArmor, validation, and AIDE prerequisites and
-  is verified after the write.
-- The late kernel-module lock now closes the confirmed Tailscale boot race:
-  it classifies the running kernel's Netfilter/NAT features, preloads only
-  present modular IPv4/IPv6 components, waits on observable iptables-nft,
-  Tailscale-chain, backend, and router/netfilter-health readiness, and only
-  then performs the irreversible write. The same verified helper runs during
-  Apply and boot; a failed prerequisite leaves module loading enabled, fails
-  the unit visibly, and writes a secret-free diagnostic report.
-- Kernel-lock helper, preload unit, late-lock unit and Tailscale drop-in are
-  transaction-backed and rolled back together if candidate/installed unit
-  verification or daemon reload fails. The owned firewall unit is rendered
-  once and verified before installation as well as after installation.
-- Hosts already locked by an earlier run receive the corrected boot units
-  without an impossible live `modprobe`; recovery of missing modules is
-  explicitly deferred to the next controlled reboot.
-- Converged runs avoid unnecessary `update-initramfs`, `update-grub`, fstab
-  daemon reloads, compiler ownership/mode writes, account-aging changes,
-  rkhunter property rebuilds, and service disable/mask calls. Reboot-required
-  is set by managed initramfs/GRUB work only when its input actually changed.
-- CI prüft den committed Base-to-Head-Diff auf Whitespace und testet den
-  Installer in einem temporären Zielpfad.
-- `--install-path` bezeichnet jetzt die ausführbare Zieldatei statt eines
-  Verzeichnisses.
-- AIDE writes its validated `HardenSHA2` group into the effective primary
-  runtime configuration. This matches what AIDE executes and what Lynis 3.1.6
-  actually inspects for `FINT-4402`; included path rules, database activation,
-  service-context validation, and the timer remain unchanged.
-- Headless PackageKit is unmasked and removed only when an APT purge simulation
-  contains no other package. Simulations run with `LC_ALL=C` and parse both
-  `Purg` and `Remv`; unsafe dependency graphs (including the confirmed
-  `ubuntu-server`/`software-properties-common` cascade) retain PackageKit
-  unmasked with the exact dependency reason.
-- Aggressive compiler handling inventories the exact Lynis 3.1.6 detector set
-  (`as`, `cc`, `clang`, `g++`, `gcc`) and owning packages. A simulated purge is
-  allowed only for a narrow toolchain set and is blocked by active DKMS or any
-  simulated non-toolchain dependency (including the confirmed `rkhunter` and
-  `crash` cascade); installed kernel headers alone no longer preempt the APT
-  simulation. The fallback remains root-only and never runs autoremove.
-- `binfmt_misc` registrations, persistent definitions, and qemu/Wine/JVM
-  consumers are inventoried. The Python-version registration is identified as
-  direct `.pyc` execution support and is disabled reversibly and individually
-  with a same-name `/etc/binfmt.d` `/dev/null` override only after Python, APT,
-  systemd, and unrelated registrations validate; no global blacklist is used
-  for that case. Only an otherwise empty, consumer-free aggressive host gets
-  the whole runtime facility and `systemd-binfmt` persistently disabled.
-- Final Lynis score/warning/suggestion parsing now accepts real 3.1.6 console
-  output and falls back to the saved structured report. Fail2ban status is
-  refreshed from service, server ping, and the live `sshd` jail after a bounded
-  readiness check.
-- Apply now captures a separate pre-hardening Lynis console report and
-  `report.dat`, and the summary uses that measured baseline instead of a static
-  source score. Dry-run explicitly reports `N/A / NOT RUN` and launches no
-  writing Lynis scan.
-- Reverse-path filtering is now an explicit routing policy: an active
-  Tailscale overlay receives loose mode `2` for `all`, `default`, and relevant
-  active interfaces (including `tailscale0`), while an inactive host receives
-  strict mode `1` only after a simple-routing check. Policy routing or multiple
-  default paths are retained and reported rather than overwritten. This is a
-  documented compatibility exception, not a Lynis score change.
-- Repeated systemd hardening treats an already-current, health-tested drop-in
-  with identical exposure as unchanged/already hardened rather than warning
-  that exposure did not decrease.
-- `PROC-3614` now records repeated PID, unit, stat, wait-channel, command, IO,
-  and file-descriptor snapshots, classifies transient versus persistent waits,
-  and never kills a D-state process.
-- Deleted-open-file handling now writes a normalized PID/process/user/FD/type/link-count/path inventory with systemd-unit attribution. Only a small explicit service allowlist is restarted once; SSH, Tailscale, networking, firewall, system, dbus, and unknown owners are default-denied and remain visible in the report.
-- UEFI Memory Overwrite Request (MOR) is now inspected conservatively against
-  the standard control and lock variables, including the required `0x00000007`
-  UEFI attributes. The implementation is detection-only: it never creates,
-  changes, or deletes an EFI variable, because support and safe lifecycle
-  semantics are firmware-owned.
-- Failed-login auditing now reports the separate Shadow/Lynis `FAILLOG_ENAB` /
-  optional `faillog` and utmp `btmp`/`lastb` mechanisms without conflating
-  them. It preserves `btmp` records, stores metadata only (never its content),
-  never restores or deletes audit history, and leaves the existing `pam_faillock`
-  lockout policy as the only lockout mechanism. On modern Ubuntu without
-  `lastb`, the active journald plus effective SSH `LogLevel`/`SyslogFacility`
-  configuration is validated instead; legacy `btmp`/`lastb` is reported as N/A
-  and no synthetic failed login is created. Interactive shells receive an
-  override-safe 900-second `TMOUT` through a managed profile; non-interactive
-  commands are unaffected.
-- IPv6 is now treated as an observed network policy rather than a blanket
-  hardening switch. Global addresses, routes, listeners, forwarding, policy
-  routing, and Tailscale block a requested disable; otherwise an aggressive
-  operator may explicitly choose `--disable-ipv6`. The default remains enabled
-  with safe redirect/source-route controls and a policy report.
-- Apply manages the local and network login banners with a concise,
-  non-assertive authorized-access notice. Ubuntu aggressive runs disable only
-  selected dynamic-MOTD presentation hooks, preserving the reboot-required
-  hook and leaving packages and services installed.
+- Reworked repository-facing documentation, templates, examples, and
+  troubleshooting guidance into consistent English.
+- Reorganized the README around scope, safety boundaries, common commands,
+  historical validation evidence, and documentation links.
+- Added repository-native Mermaid visuals for the hardening flow and recorded
+  validation evidence.
+- Kept the explicit pre-release and not-production-ready warning. Licensing and
+  final release governance remain open and are not decided here.
 
-### Added
+### Runtime hardening and validation
 
-- Klassifizierte Rückgabecode-Behandlung für `pwck` und `grpck`; bekannte
-  fehlende Home-Verzeichnisse von Systemaccounts werden protokolliert, ohne
-  den Lauf abzubrechen.
-- Strikte Phasenfolge 01–18, Completion-Gates und synchron sichtbarer
-  EXIT-Trap bei unvollständigen Läufen.
-- Verifikation deaktivierter oder maskierter Dienste sowie gezielte
-  systemd-Drop-ins mit Vorher-/Nachher-Exposure-Bericht.
-- AIDE-Runtime-Validierung mit SHA256/SHA512, Baseline, Datenbankprüfung und
-  Timer erst nach einem lesbaren Check.
-- Tailscale-kompatible `rp_filter`-Ausnahme, erweiterte Compiler-Erkennung,
-  BOOT-5180-Startdienst-Inventar, LOGG-2190-Remediation und
-  PROC-3614-IO-Wait-Diagnose.
+- Preserved the fixed Phase 01–18 order, visible incomplete-run EXIT trap, and
+  separate Apply-mode Lynis baseline. Dry-run reports N/A / NOT RUN and does not
+  launch a write-producing baseline scan.
+- Made logging synchronous and fully owned by the script: interactive output
+  can retain color, the file log is ANSI-free, descriptors do not leak to
+  external commands, and package tools do not stall through logger job control.
+- Ordered Phase 03 as APT metadata refresh, controlled no-removal upgrade, then
+  hardening/security package preparation. Upgrade simulation is locale-stable,
+  blocks removals and downgrades, and records reboot state.
+- Validated AIDE against the actual distribution runtime configuration without
+  requiring update-aide.conf. The baseline is atomically activated, the real
+  check-service context is proven, and the timer is enabled only after success.
+- Kept kernel.modules_disabled=1 as the final irreversible gate. Tailscale
+  Netfilter/NAT prerequisites are loaded and validated before locking; an
+  already locked but unhealthy runtime is reported for controlled reboot repair
+  without impossible live modprobe attempts.
+- Retained Tailscale-compatible rp_filter=2 as an explicit routing-policy
+  exception. Ambiguous inactive-Tailscale routing preserves observed runtime
+  values persistently rather than forcing strict filtering.
+- Treated IPv6 as an observed network policy. The default remains enabled;
+  explicit aggressive disable is blocked by addresses, routes, listeners,
+  forwarding, Tailscale, or ambiguity and has deterministic rollback.
+- Added conservative UEFI MOR inspection with required efivarfs attribute
+  validation. The implementation never creates, changes, or deletes an EFI
+  variable.
+- Added deleted-open-file inventory and default-deny remediation. Anonymous
+  memfd entries remain visible, are classified separately, and never force
+  restart or reboot.
+- Separated failed-login evidence for Shadow/FAILLOG_ENAB, optional faillog,
+  legacy btmp/lastb, and the modern journald/SSH path. Audit history remains
+  content-preserving; interactive TMOUT defaults to 900 seconds while
+  non-interactive shells remain unaffected.
+- Added a conservative, optional two-stage SSH port migration. It validates
+  state against actual listeners, stages firewall before dual listeners, and
+  proves single- or dual-port rollback. Socket activation is supported without
+  automatic mode conversion or duplicate listener restarts.
+- Hardened the recoverable firewall contract so SSH retirement cannot write
+  final state when the firewall is unavailable or migration state is unsafe.
+- Added service-specific systemd exposure handling with merged-unit validation,
+  health checks, rollback, and idempotent convergence. Compatibility retention
+  is narrowly documented for acct-monthly-report.service and its vendor report
+  file /var/log/wtmp.report.
+- Restricted AppArmor transitions to explicit stable services with matching
+  enabled distribution profiles, parser validation, service-specific health,
+  and proven rollback.
+- Improved PackageKit, compiler, binfmt, residual-kernel, and rc-only grub-pc
+  handling through APT simulation and explicit dependency/boot safety gates.
+- Kept firewall rule inventory non-destructive: foreign, Tailscale, SSH,
+  Fail2ban, NAT, forwarding, and unowned rules are not deleted.
+- Managed the Ubuntu MOTD news path through the documented ENABLED=0 setting
+  while preserving the executable hook required by motd-news.service and the
+  reboot-required notice.
 
-### Changed
+### Tooling and repository behavior
 
-- Kein SSH-Port-Write und keine GRUB-Passwortlogik.
-- `systemd-analyze verify` prüft einen zusammengeführten Kandidaten vor der
-  Installation sowie die installierte Unit vor `daemon-reload`.
+- CI checks the committed Base-to-Head diff for whitespace, runs ShellCheck and
+  regression tests, validates SHA256SUMS, and tests the installer against the
+  exact CI commit in temporary target paths.
+- install.sh treats --install-path as an executable destination file, validates
+  the checksum before install, preserves existing parent-directory metadata,
+  and never runs hardening automatically.
+- Existing valid service and configuration state converges without needless
+  daemon reloads, service restarts, package changes, update-initramfs,
+  update-grub, compiler metadata changes, or rkhunter property updates.
 
-### Validation status
+## Recorded validation status
 
-- Ubuntu 26.04.1 Target-System-Abnahme bestanden.
-- Fresh Lynis 63 -> 87; konvergiert 87 -> 87.
-- AIDE baseline rebuilt 1 -> 0.
-- Gepatchter Reboot: Tailscale/Netfilter/NAT gesund; `kernel.modules_disabled=1`
-  erst nach dem Runtime-Gate.
-- Finaler konvergierter Lauf: keine Packages installed/removed, keine Failed
-  Services/Rollbacks, Reboot required NO.
+- Ubuntu 26.04.1 fresh Apply: Lynis 63 → 87; AIDE baseline rebuilt 1.
+- Ubuntu 26.04.1 converged Apply: Lynis 87 → 87; AIDE baseline rebuilt 0.
+- Patched reboot acceptance confirmed Tailscale/Netfilter/NAT health and set
+  kernel.modules_disabled=1 only after the runtime gate.
+- The documented converged run recorded no installed or removed packages, no
+  failed services, no rollbacks, no reboot request, and Phase 18 SUCCESS.
+- Separate focused target acceptances also cover modern failed-login evidence,
+  interactive TMOUT=900 with unchanged non-interactive shells, detection-only
+  UEFI MOR UNSUPPORTED status, IPv6/banner/MOTD policy, and anonymous memfd
+  deleted-open-file handling.
+
+This is historical acceptance evidence, not a score promise or a general
+production-release certification. Current feature branches require their own
+target validation. No >=90 Lynis target is claimed.

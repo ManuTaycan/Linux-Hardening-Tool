@@ -1,199 +1,210 @@
 # Linux Hardening Tool
 
-> **WORK IN PROGRESS / PRE-RELEASE / NOT PRODUCTION READY**
+> **WORK IN PROGRESS · PRE-RELEASE · NOT PRODUCTION READY**
 >
-> Real target validation is currently incomplete. The Ubuntu 26.04.1 Apply
-> path still requires a fresh full-system retest through phase 18, and open
-> issues remain. No stability or release readiness is promised. Use only on a
-> disposable test system or with a verified snapshot and recovery access.
+> This repository changes system-wide security configuration. It is intended
+> for fresh Ubuntu and Debian servers, only with a verified snapshot or backup
+> and a tested recovery path. Target-system acceptance exists for bounded
+> changes, but the current development branch has not received release
+> approval. Do not treat a Lynis score as a security guarantee.
 
-[![CI](https://github.com/ManuTaycan/Linux-Hardening-Tool/actions/workflows/ci.yml/badge.svg)](https://github.com/ManuTaycan/Linux-Hardening-Tool/actions/workflows/ci.yml)
-
-Idempotentes Bash-Werkzeug zur aggressiven, überprüfbaren Härtung frischer
-Ubuntu- und Debian-Server mit Dry-Run, Backups, Rollback, Lynis-Auswertung und
-systemd-Service-Sandboxing.
+harden.sh is an idempotent Bash tool for observable Ubuntu/Debian server
+hardening. It separates planning from mutation, records a backup before
+changes, validates high-risk transitions, and reports decisions instead of
+hiding unresolved findings.
 
 **Version:** 1.1.3
-**Status:** Pre-Release / Zielsystemtest ausstehend
 
-## Wichtiger Sicherheitshinweis
+**Release status:** pre-release; not production-ready
 
-Das Skript verändert systemweite Sicherheitskonfigurationen. Erstelle vorher
-einen Snapshot oder ein vollständiges Backup, halte eine zweite SSH-Sitzung
-offen und starte immer mit einem Dry-Run. `--aggressive` kann die Kompatibilität
-einschränken. Das Werkzeug ist primär für frische Server gedacht.
+**Supported families:** Ubuntu and Debian with systemd and APT
 
-Es wird kein Lynis-Score garantiert. Ein hoher Lynis-Score ersetzt keine
-Bedrohungsanalyse, keine Rollenprüfung und keine Abnahme auf dem Zielsystem.
+## What it does
 
-## Aktueller Validierungsstatus
+- Supports --dry-run, --apply, and an explicit --aggressive mode.
+- Takes a pre-change backup and uses transaction-backed rollback for risky
+  changes.
+- Runs a measured Lynis baseline during Apply, then validates and records
+  post-hardening results. Dry-run does not start a write-producing Lynis scan.
+- Hardens package handling, logging, authentication, SSH, firewalling,
+  filesystems, selected services, AppArmor, AIDE, kernel/sysctl settings, and
+  audit paths.
+- Treats Tailscale, IPv6, boot state, systemd service health, and kernel module
+  locking as runtime policies with safety gates.
+- Preserves deliberate exceptions such as anonymous memfd entries and
+  Tailscale-compatible rp_filter=2 in reports instead of score gaming.
 
-Version 1.1.3:
+## Hardening flow
 
-- `bash -n` bestanden
-- statische Regressionstests bestanden
-- simulierte pwck-/Phasen-/AIDE-/systemd-Pfade bestanden
-- realer vollständiger Ubuntu-26.04.1-Lauf noch ausstehend
-- Ziel Hardening Index >= 90 noch nicht bestätigt
+~~~mermaid
+flowchart LR
+    O[Operator] --> D[Dry run]
+    O --> A[Apply]
+    D --> P[Plan and diagnostics only]
+    A --> B[Phase 01: preflight and Lynis baseline]
+    B --> K[Phase 02: backup]
+    K --> H[Phases 03-12: controlled hardening]
+    H --> V[Phase 13: validation]
+    V --> L[Phases 14-17: Lynis, AIDE, final gates]
+    L --> S[Phase 18: summary]
+    H -. failed validation .-> R[Targeted rollback and visible failure]
+~~~
 
-Letzter realer Stand mit Version 1.1.2: Lynis Hardening Index **86**.
+The phase order is fixed. An incomplete Apply is reported by the EXIT trap and
+cannot exit successfully before Phase 18.
 
-## Funktionen
+## Recorded validation evidence
 
-- Ubuntu-/Debian-Erkennung, Dry-Run, Apply und aggressiver Modus
-- Backups, transaktionale Rollbacks und farbige Phasenanzeige
-- SSH-Hardening ohne Portänderung, nftables mit Tailscale-Rücksicht und
-  optionales Remote-rsyslog
-- auditd, AIDE, AppArmor, Fail2ban, PAM-/Passwortregeln sowie Kernel-/sysctl-
-  Hardening und Modulblockierung
-- Paket-/Update-Hardening, gezielte Service-Deaktivierung und systemd-
-  Sandboxing mit gemessener Exposure vor/nach der Änderung
-- gemessene Lynis-Baseline plus zwei Post-Hardening-Läufe, offene Findings und
-  Abschlussberichte; im Dry-Run wird kein schreibender Lynis-Scan gestartet
-- nachvollziehbare AIDE-/PackageKit-/Compiler-/binfmt-Entscheidungsartefakte
-  sowie zeitlich wiederholte, rein diagnostische PROC-3614-Snapshots
-- ein spätes Tailscale-/Netfilter-aware Kernelmodul-Gate, das benötigte
-  modulare NAT-Komponenten vorlädt und den irreversiblen Lock bei unbewiesener
-  Dual-Stack-/Tailscale-Gesundheit sicher blockiert
+The following is historical target-system acceptance evidence, not a release
+promise or a guarantee for another server role:
 
-## Installation per Git
+| Environment | Recorded outcome |
+| --- | --- |
+| Ubuntu 26.04.1 fresh aggressive Apply | Lynis 63 → 87; AIDE baseline rebuilt 1 |
+| Ubuntu 26.04.1 converged Apply | Lynis 87 → 87; AIDE baseline rebuilt 0; no package changes, failed services, rollbacks, or reboot request |
+| Failed-login and shell-timeout acceptance | Lynis recorded failed-login logging enabled and session timeout found; interactive TMOUT=900, non-interactive shell unchanged |
+| UEFI MOR acceptance | efivarfs was available but firmware exposed neither standardized MOR variable; status UNSUPPORTED, detection-only, no EFI write |
 
-```bash
+~~~mermaid
+flowchart LR
+    F[Fresh Ubuntu 26.04.1] --> L1[Lynis 63 → 87]
+    F --> A1[AIDE baseline rebuilt: 1]
+    C[Converged second Apply] --> L2[Lynis 87 → 87]
+    C --> A2[AIDE baseline rebuilt: 0]
+    C --> N[No package changes · no failed services · no rollbacks · reboot NO]
+~~~
+
+Scores are run-specific observations. The tool does not skip Lynis checks,
+tune profiles, or claim a target score.
+
+## Before you run it
+
+1. Create a tested snapshot or full backup.
+2. Keep a second SSH session and a recovery method available.
+3. Review the dry-run before Apply.
+4. Use a maintenance window for any real server.
+5. Read [Testing](docs/TESTING.md), [Known findings](docs/KNOWN-FINDINGS.md),
+   and [Troubleshooting](docs/TROUBLESHOOTING.md).
+
+--aggressive can reduce compatibility. Do not use it as a substitute for threat
+modeling, role-specific review, access control, monitoring, or a tested
+rollback plan.
+
+## Quick start
+
+~~~bash
 git clone https://github.com/ManuTaycan/Linux-Hardening-Tool.git
 cd Linux-Hardening-Tool
-git pull --ff-only
-chmod +x harden.sh
-sha256sum -c SHA256SUMS
-sudo ./harden.sh --dry-run --aggressive
-```
-
-## Aktualisierung
-
-```bash
-cd Linux-Hardening-Tool
-git status
-git pull --ff-only
 sha256sum -c SHA256SUMS
 bash -n harden.sh
-```
-
-`git pull --ff-only` überschreibt keine lokalen Änderungen automatisch.
-
-## Direkter Download per curl
-
-Lade herunter, prüfe die Prüfsumme und führe erst dann bewusst aus:
-
-```bash
-mkdir -p ~/Linux-Hardening-Tool
-cd ~/Linux-Hardening-Tool
-
-curl -fsSLO https://raw.githubusercontent.com/ManuTaycan/Linux-Hardening-Tool/main/harden.sh
-curl -fsSLO https://raw.githubusercontent.com/ManuTaycan/Linux-Hardening-Tool/main/SHA256SUMS
-
-sha256sum -c SHA256SUMS
-chmod +x harden.sh
 sudo ./harden.sh --dry-run --aggressive
-```
+~~~
 
-## Installer
+After reviewing the plan:
 
-Der Installer installiert nur das geprüfte Skript; er startet kein Hardening.
+~~~bash
+sudo ./harden.sh --apply --aggressive
+~~~
 
-```bash
+Run the official Apply directly in a TTY; do not wrap it in external tee. The
+script preserves interactive color output and writes an ANSI-free complete log
+to /var/log/server-hardening.log itself.
+
+## Installation
+
+The installer verifies the checksum and installs the executable; it never runs
+hardening automatically.
+
+~~~bash
 curl -fsSLO https://raw.githubusercontent.com/ManuTaycan/Linux-Hardening-Tool/main/install.sh
 less install.sh
-sudo bash install.sh --ref main
-```
-
-`main` ist der Entwicklungsstand. Für einen späteren geprüften Tag verwende
-`--ref <tag>`. `--install-path` bezeichnet immer die Zieldatei, nicht ein
-Verzeichnis; angelegt wird nur der übergeordnete Pfad. Für einen späteren
-geprüften Tag verwende beispielsweise `--ref v1.1.3`.
-
-```bash
 sudo bash install.sh --ref main \
   --install-path /usr/local/sbin/linux-hardening-tool
+
 linux-hardening-tool --help
 sudo linux-hardening-tool --dry-run --aggressive
-```
+~~~
 
-## Nutzung
+main is a development branch. --ref <tag> is intended for a future reviewed tag.
+--install-path is always the target executable file; only its parent directory
+is created when missing.
 
-```bash
+## Common commands
+
+~~~bash
 sudo ./harden.sh --dry-run
 sudo ./harden.sh --dry-run --aggressive
 sudo ./harden.sh --apply
 sudo ./harden.sh --apply --aggressive
-# Only on an unequivocally unused IPv6 host, after reviewing the dry-run:
+
+# Only after a dry-run proves IPv6 is unused and safe to disable:
 sudo ./harden.sh --apply --aggressive --disable-ipv6
-# Optional reversible SSH port stage; the old port remains active:
+
+# Optional, staged SSH port migration; the old port remains active:
 sudo ./harden.sh --apply --aggressive --ssh-port 52022
-# Only after a separately verified new SSH session:
+
+# Only after proving a new SSH session on the staged port:
 sudo ./harden.sh --apply --aggressive --non-interactive --retire-ssh-port
-```
+~~~
 
-Nicht-interaktives Remote Logging:
+For remote logging:
 
-```bash
-sudo ./harden.sh \
-  --apply \
-  --aggressive \
+~~~bash
+sudo ./harden.sh --apply --aggressive \
   --remote-log-server 10.0.0.9 \
   --remote-log-port 5140 \
   --remote-log-protocol tcp
-```
+~~~
 
-## Absichtlich unveränderte Bereiche
+## Safety boundaries
 
-- Der SSH-Port bleibt standardmäßig unverändert.
-- Eine Portänderung ist ausschließlich eine optionale, zweistufige Migration:
-  `--ssh-port PORT` hält den bisherigen Port zunächst parallel aktiv. Ein anderer
-  Port verringert nur Scan- und Log-Noise; starke Authentifizierung, Firewall
-  und Fail2ban bleiben die tatsächlichen Schutzmaßnahmen. Der alte Port wird
-  erst in einem späteren Lauf nach bestätigter neuer SSH-Sitzung mit
-  `--retire-ssh-port` entfernt.
-- Es wird kein GRUB-Passwort eingerichtet.
-- `/home` und `/var` werden nicht automatisch live repartitioniert.
-- Für den Admin-Account wird kein festes Ablaufdatum erzwungen.
-- Fehlgeschlagene Anmeldungen werden mit getrennten Nachweisen geprüft:
-  `FAILLOG_ENAB`/gegebenenfalls `faillog` für Shadow `login(1)` sowie
-  `btmp`/`lastb` für die utmp-Historie. Die bestehende `pam_faillock`-Policy
-  wird dabei nicht durch eine zweite Lockout-Policy ersetzt.
-- Interaktive Login-Shells erhalten standardmäßig `TMOUT=900`. Nichtinteraktive
-  SSH-Kommandos, scp/sftp, Cron, systemd und Skripte werden nicht beeinflusst;
-  ein bereits gesetztes `TMOUT` oder `HARDEN_SHELL_TMOUT` bleibt maßgeblich.
-- IPv6 bleibt standardmäßig aktiviert. `--disable-ipv6` ist nur zusammen mit
-  `--aggressive` ein explizites Opt-in und wird bei Tailscale, IPv6-Nutzung
-  oder einer unklaren Routing-Situation sicher verweigert.
-- Der aggressive Modus entfernt keine dynamischen-MOTD-Pakete oder Dienste;
-  er schaltet nur ausgewählte Ubuntu-Präsentations-Hooks ab und erhält die
-  technisch getrennte Reboot-Benachrichtigung.
-- Kein Lynis-Test wird deaktiviert; es gibt keine kosmetische Score-Manipulation.
+- SSH port 22 remains the default. A different port only reduces scan and log
+  noise; it is not an authentication control. The two-stage migration keeps
+  the old port until a separately verified new session exists.
+- No GRUB password is created, and /home or /var are never live repartitioned.
+- IPv6 remains enabled by default. Disabling it is an aggressive explicit
+  opt-in and is blocked when Tailscale, addresses, routes, listeners,
+  forwarding, or ambiguous routing make it unsafe.
+- Tailscale preferences, routes, exit-node state, and owned firewall rules are
+  not changed merely to satisfy a scanner.
+- kernel.modules_disabled=1 is only written after the final runtime gate.
+- FAILLOG_ENAB/optional faillog, legacy btmp/lastb, and the modern
+  journald/SSH path are distinct forms of failed-login evidence. Existing
+  pam_faillock remains the only lockout policy.
+- Interactive login shells receive TMOUT=900 by default. Non-interactive SSH
+  commands, scp/sftp, cron, systemd, and scripts are not affected.
+- Aggressive Ubuntu MOTD handling changes presentation hooks only. It does not
+  remove APT, unattended-upgrades, Ubuntu Pro, network, or monitoring packages.
 
-## Ergebnisdateien
+## Reports and backups
 
-Nach einem Apply-Lauf sind unter anderem folgende Dateien relevant:
+Important outputs include:
 
-```text
+~~~text
 /var/log/server-hardening.log
 /root/hardening-open-findings.txt
 /root/systemd-hardening-report.txt
-/root/lynis-after-hardening-pass1.txt
+/root/lynis-before-hardening.txt
 /root/lynis-after-hardening.txt
 /root/lynis-after-hardening-report.dat
-/root/lynis-summary-parse-diagnostics.txt (nur bei Parsefehler)
-/root/hardening-iowait-processes.txt
 /root/kernel-module-lockdown-report.txt
 /root/hardening-backup-YYYYMMDD-HHMMSS/
-```
+~~~
 
-## Tests und Issues
+Inspect and redact logs before sharing them. Never publish credentials, tokens,
+private keys, IP-sensitive production data, or unredacted diagnostic archives.
 
-Der vollständige Zielsystemablauf steht in [docs/TESTING.md](docs/TESTING.md).
-Nach einem Zielsystemtest wird jedes Finding als einzelnes, begrenztes Issue
-angelegt. Prüfe Logs vor einer Veröffentlichung auf sensible Daten; poste niemals
-Sicherheitsgeheimnisse in einem öffentlichen Issue.
+## Documentation
 
-## Lizenz
+- [Architecture and hardening flow](docs/ARCHITECTURE.md)
+- [Target-system and local testing](docs/TESTING.md)
+- [Known findings and deliberate exceptions](docs/KNOWN-FINDINGS.md)
+- [Troubleshooting](docs/TROUBLESHOOTING.md)
+- [Contributing](CONTRIBUTING.md)
+- [Security reporting](SECURITY.md)
+- [Release procedure](docs/RELEASING.md)
 
-Für dieses Repository ist noch keine Lizenz festgelegt.
+## License
+
+No license has been selected. This repository does not grant a license by
+implication; release and licensing decisions remain outside this change.

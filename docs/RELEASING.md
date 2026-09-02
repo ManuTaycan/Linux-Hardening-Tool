@@ -1,15 +1,17 @@
-# Release-Ablauf
+# Releasing
 
-Vor einem Release:
+This repository is currently pre-release. No tag or GitHub Release is created
+by this document.
 
-1. Zielsystemtest erfolgreich abschließen.
-2. Offene Findings und ihre Risikoabwägung prüfen.
-3. Version und Changelog aktualisieren.
-4. `SHA256SUMS` neu erzeugen und prüfen.
-5. CI grün abwarten.
-6. Tag erstellen.
-7. GitHub Release erstellen.
-8. Download über den gepinnten Tag mit `install.sh --ref TAG` testen.
+Before proposing a release:
 
-Für 1.1.3 wird jetzt weder ein Tag noch ein GitHub Release erzeugt. Das erfolgt
-erst nach dem realen Ubuntu-26.04.1-Test.
+1. Complete target-system acceptance for the exact release commit.
+2. Review open findings, accepted exceptions, and their risk decisions.
+3. Update VERSION, CHANGELOG.md, README.md, and SHA256SUMS as required.
+4. Run make check and wait for green CI.
+5. Test installation from the pinned candidate tag with install.sh --ref TAG.
+6. Review public logs and artifacts for secrets or production-sensitive data.
+7. Obtain the project decision on release readiness and licensing.
+
+Version 1.1.3 remains an unreleased development version. A release tag and
+licensing decision require separate explicit approval.

@@ -1,24 +1,24 @@
-# Bewusst offene Lynis-Findings
+# Known findings and deliberate exceptions
 
-Diese Punkte werden nicht durch kosmetische Änderungen verborgen. Sie benötigen
-eine konkrete Betreiberentscheidung oder ein Wartungsfenster.
+These findings are not hidden by cosmetic changes. Each requires an operator
+decision, a maintenance window, or a platform capability outside the tool.
 
-| Finding | Begründung und Sicherheitsauswirkung | Mögliche manuelle Alternative |
+| Finding | Rationale and security impact | Manual alternative |
 | --- | --- | --- |
-| DEB-0810 | `apt-listbugs` ist Debian-orientiert; ein erzwungener Ubuntu-Einsatz kann Update-Abläufe stören. | Nur aus einer vertrauenswürdigen, passenden Quelle einsetzen. |
-| BOOT-5122 | Kein GRUB-Passwort, damit unbeaufsichtigter Reboot und Remote-Recovery möglich bleiben. | Konsolenprozess und Recovery-Verfahren für Boot-Authentifizierung planen. |
-| SSH-7408: Port | Eine Portänderung ist keine belastbare Sicherheitsgrenze und kann Lockout verursachen. | Zugriff über Firewall, Schlüssel, MFA/Bastion und Monitoring absichern. |
-| FILE-6310 | `/home` und `/var` werden nicht live repartitioniert. | Geplante LVM-/Partitionsmigration mit getesteter Rückkehrstrategie. |
-| AUTH-9230 | YESCRYPT wird nicht mit Legacy-SHA-Runden „optimiert“. | Lynis-/Profilunterstützung prüfen, nicht wirkungslose SHA-Werte setzen. |
-| NAME-4028 | Keine erfundene DNS-Domain. | Gültiges Forward-/Reverse-DNS mit dem Betreiber einrichten. |
-| AUTH-9282 | Kein pauschales Account-Ablaufdatum; das könnte Recovery oder Dienstkonten sperren. | Kontospezifische Ablaufdaten nach Eigentümerfreigabe setzen. |
-| Failed-login audit | `FAILLOG_ENAB=yes` ist der Lynis-/Shadow-Indikator für `login(1)`/`faillog`; `/var/log/btmp` und `lastb` sind ein separater utmp-basierter Verlauf. Bestehendes `pam_faillock` ist die einzige Lockout-Policy. | Keine absichtlichen Fehlversuche gegen Remote-Admin-Konten; nur in einer lokalen, entbehrlichen Testumgebung prüfen. |
-| Tailscale/rp_filter | Bei aktivem Tailscale ist `rp_filter=2` für `all`, `default`, relevante aktive Interfaces und `tailscale0` eine bewusste Kompatibilitäts-/Sicherheitsabwägung für asymmetrische Overlay-Routen. Ohne Tailscale wird `1` nur bei eindeutig einfachem IPv4-Routing gesetzt; Policy-Routing oder mehrere Default-Pfade bleiben mit Diagnosebericht unverändert. | Tailscale entfernen oder Routing so vereinfachen, dass striktes Filtering nachweislich sicher ist. |
-| IPv6 policy | IPv6 wird nicht allein für einen Lynis-Wert deaktiviert. Tailscale, globale Adressen, Default-/Policy-Routes, Listener oder Forwarding blockieren eine Deaktivierung; ohne explizites `--disable-ipv6` bleibt IPv6 aktiviert. | Nur auf einem nachweislich ungenutzten IPv6-Host `--apply --aggressive --disable-ipv6` wählen und den IPv6-Bericht prüfen. |
-| KRNL-6000: IPv6 source routing | Lynis 3.1.6 erwartet `accept_source_route=0`; Linux behandelt `-1` jedoch strenger, weil damit alle IPv6-Routing-Header abgelehnt werden, während Werte ab `0` noch Type 2 zulassen. | Die validierte `-1`-Policy beibehalten; keine Lynis-Profile oder Tests überspringen. |
-| FIRE-4513 | iptables-nft/nftables können Regeln enthalten, die Lynis als ungenutzt einordnet. Das Tool inventarisiert sie, löscht aber keine fremden, Tailscale-, SSH-, Fail2ban-, NAT- oder Forwarding-Regeln. | `/root/firewall-rule-inventory.txt` während eines Wartungsfensters prüfen und nur nachweislich redundante, lokal verantwortete Regeln entfernen. |
-| LOGG-2190 anonymous memfd | `/memfd:* (deleted)` mit Link-Count 0 sind volatile anonyme RAM-Objekte, keine verwaisten persistenten Dateien. Sie bleiben sichtbar und lösen keine Restart-/Reboot-Schleife aus. | Nur echte actionable deleted-open files gemäß Report und Service-Klassifikation behandeln. |
-| TOOL-5002 | Ein fehlendes Automationswerkzeug ist deploymentspezifisch. Ansible/Puppet/Chef/Salt werden nicht allein für eine Lynis-Heuristik installiert. | Ein vorhandenes, betriebenes Configuration-Management-System bewusst einführen und absichern. |
-| MOR variable not found | Nur bei verfügbarer `efivarfs`-Runtime und fehlenden standardisierten MOR-Variablen ist dies ein bestätigtes Firmware-Limit. Fehlt der UEFI-Runtime-Variablen-Zugriff, bleibt der Support unbekannt. Das Tool erzeugt oder überschreibt keine EFI-Variable. | Firmware-/Plattformdokumentation prüfen und nur eine vom Hersteller unterstützte MOR-Konfiguration verwenden. |
+| DEB-0810 | apt-listbugs is Debian-oriented; forcing it on Ubuntu can disrupt updates. | Use a trusted, distribution-appropriate source only. |
+| BOOT-5122 | No GRUB password is configured so unattended reboot and remote recovery remain possible. | Design a console and recovery process for boot authentication. |
+| SSH-7408: Port | Changing the port is not a strong security boundary and can cause lockout. | Protect access with keys, firewalling, MFA/bastion, and monitoring. |
+| FILE-6310 | /home and /var are never repartitioned live. | Plan and test an LVM or partition migration. |
+| AUTH-9230 | YESCRYPT is not “optimized” with legacy SHA rounds. | Use supported Lynis/profile behavior; do not add ineffective SHA settings. |
+| NAME-4028 | The tool does not invent a DNS domain. | Configure valid forward and reverse DNS. |
+| AUTH-9282 | No blanket account-expiration date is set because it can lock out recovery or service accounts. | Set account-specific expiry after owner approval. |
+| Failed-login audit | FAILLOG_ENAB=yes is the Lynis/Shadow indicator for login(1)/faillog; btmp/lastb is separate history. Existing pam_faillock remains the only lockout policy. | Test failures only on a disposable local VM or approved test account. |
+| Tailscale / rp_filter | Active Tailscale uses loose mode 2 for compatible asymmetric overlay routes. Without Tailscale, strict mode 1 is set only after simple-routing proof. | Remove Tailscale or simplify routing before enforcing strict filtering. |
+| IPv6 policy | IPv6 is not disabled merely for a Lynis value. Tailscale, addresses, routes, listeners, or forwarding block disable. | Use explicit disable only on a proven-unused IPv6 host. |
+| KRNL-6000 | Linux accept_source_route=-1 is stricter than Lynis 3.1.6 prefval=0: it rejects all routing headers. | Keep the validated -1 policy; do not skip Lynis tests. |
+| FIRE-4513 | Foreign nftables/iptables rules are inventoried but not deleted without ownership proof. | Review /root/firewall-rule-inventory.txt in a maintenance window. |
+| LOGG-2190 anonymous memfd | /memfd:* (deleted) with link count 0 is volatile anonymous RAM, not an orphaned persistent file. | Act only on actionable deleted-open files in the report. |
+| TOOL-5002 | A configuration-management tool is deployment-specific. | Introduce an operated CM system deliberately. |
+| MOR variable not found | With available efivarfs and absent standardized MOR variables, this is a firmware limit. The tool never writes EFI variables. | Follow firmware vendor guidance only. |
 
-Jede Zeile ist eine dokumentierte Risikoabwägung, keine Score-Manipulation.
+These entries document risk decisions; they are not score manipulation.
