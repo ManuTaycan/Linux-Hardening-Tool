@@ -155,6 +155,14 @@ sudo fail2ban-client status sshd
 sudo nft list chain inet hardening_filter input
 ```
 
+Wenn `ssh.socket` der aktive Listener-Carrier ist, zeigt der Report
+`listener-mode=socket`. In diesem Modus bleibt `ssh.service` beim Test
+gegebenenfalls inaktiv: maßgeblich sind ein aktives `ssh.socket` und die beiden
+realen Listener. Der Stage legt zusätzlich ein reversibles, managed
+`ssh.socket.d`-Drop-in mit genau den alten und neuen `ListenStream`-Ports an.
+Nach `sshd -t` erfolgen ausschließlich `daemon-reload` und ein Neustart von
+`ssh.socket`; `ssh.service` wird nicht neugestartet.
+
 Öffne jetzt in einem separaten Terminal eine echte neue SSH-Sitzung auf dem
 neuen Port und verifiziere Administration und Tailscale, bevor irgendein
 Retire-Schritt erfolgt:
