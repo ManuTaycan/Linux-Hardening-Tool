@@ -151,10 +151,14 @@ For remote logging:
 
 ~~~bash
 sudo ./harden.sh --apply --aggressive \
-  --remote-log-server 10.0.0.9 \
-  --remote-log-port 5140 \
-  --remote-log-protocol tcp
+  --remote-log-server YOUR_SYSLOG_SERVER \
+  --remote-log-port YOUR_SYSLOG_PORT \
+  --remote-log-protocol YOUR_SYSLOG_PROTOCOL
 ~~~
+
+- `YOUR_SYSLOG_SERVER`: your receiving syslog server hostname or IP address.
+- `YOUR_SYSLOG_PORT`: the listener port configured on that receiver.
+- `YOUR_SYSLOG_PROTOCOL`: `tcp`, `udp`, or `tls`.
 
 ## Safety boundaries
 
