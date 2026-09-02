@@ -753,6 +753,7 @@ run_lynis_summary_tests() {
     local case_root="$test_root/lynis-summary"
     local report="$case_root/final.txt" data="$case_root/final-report.dat" diagnostic="$case_root/diagnostic.txt"
     install -d "$case_root"
+    # Synthetic minimal parser fixtures; no upstream report or control text is copied.
     cat > "$case_root/fresh.txt" <<'EOF'
   Hardening index : 61 [############        ]
 EOF
@@ -803,7 +804,7 @@ EOF
 EOF
     cat > "$data" <<'EOF'
 hardening_index=86
-suggestion[]=PROC-3614|Check process listing for processes waiting for IO requests|||
+suggestion[]=PROC-3614|synthetic parser fixture|||
 EOF
     env HARDEN_SOURCE_ONLY=1 HARDEN_LYNIS_FINAL_REPORT="$report" HARDEN_LYNIS_FINAL_DATA="$data" \
         HARDEN_LYNIS_PARSE_DIAGNOSTIC="$diagnostic" bash -c '
@@ -820,8 +821,8 @@ EOF
 EOF
     cat > "$data" <<'EOF'
 hardening_index=87
-suggestion[]=FINT-4402|Use SHA256 or SHA512|||
-suggestion[]=PROC-3614|Check process listing|||
+suggestion[]=FINT-4402|synthetic parser fixture one|||
+suggestion[]=PROC-3614|synthetic parser fixture two|||
 EOF
     env HARDEN_SOURCE_ONLY=1 HARDEN_LYNIS_FINAL_REPORT="$report" HARDEN_LYNIS_FINAL_DATA="$data" \
         HARDEN_LYNIS_PARSE_DIAGNOSTIC="$diagnostic" bash -c '
