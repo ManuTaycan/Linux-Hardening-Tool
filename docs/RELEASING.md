@@ -14,7 +14,9 @@ Before proposing a release:
 7. Re-run the [third-party software review](../THIRD_PARTY.md): verify the
    exact release does not add vendored code, plugins, reports, logos,
    screenshots, copied control text, or other third-party material without the
-   required attribution and license review.
+   required attribution and license review. On the release target, record the
+   actual Lynis package version and inspect its package copyright/license data,
+   including any distribution-shipped plugin.
 8. Obtain separate project decisions on release readiness and the repository's
    own license. The GPLv3 status of external Lynis Community/Client software
    does not select a license for this project.
