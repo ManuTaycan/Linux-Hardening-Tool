@@ -1,14 +1,14 @@
 name: Feature request
-description: Beschreibe einen klar abgegrenzten Verbesserungsvorschlag.
+description: Describe a focused improvement proposal.
 title: "feature: "
 body:
   - type: textarea
     attributes:
-      label: Problem und Ziel
+      label: Problem and goal
     validations:
       required: true
   - type: textarea
     attributes:
-      label: Sicherheitsauswirkung, Nicht-Ziele und Alternativen
+      label: Security impact, non-goals, and alternatives
     validations:
       required: true

@@ -1,19 +1,18 @@
-# Architektur
+# Architecture
 
-`harden.sh` ist ein idempotentes Bash-Werkzeug mit getrenntem Dry-Run- und
-Apply-Modell. Managed Files werden atomar erstellt; vor Änderungen werden
-Konfigurationen und relevante Zustände in einem Backup-Verzeichnis gesichert.
-Einzelne riskante Änderungen verwenden zusätzlich transaktionale Rollbacks.
+harden.sh is an idempotent Bash tool with separate Dry-run and Apply models.
+Managed files are installed atomically. Apply captures a backup before mutation,
+and high-risk operations add transaction-backed rollback and runtime validation.
 
-## Ablauf
+## Phase model
 
-Nur `main()` steuert die Phasenfolge:
+Only main() controls the fixed 18-phase order:
 
-1. Preflight
+1. Preflight and Lynis baseline
 2. Backup
-3. Package Security
+3. Package security
 4. Logging
-5. Kernel Hardening
+5. Kernel hardening
 6. Authentication
 7. Firewall
 8. SSH
@@ -22,49 +21,39 @@ Nur `main()` steuert die Phasenfolge:
 11. Services
 12. AppArmor
 13. Validation
-14. Lynis Pass 1
-15. Optimization Pass
+14. Lynis pass 1
+15. Optimisation pass
 16. AIDE
-17. Lynis Final
+17. Final Lynis and final kernel gate
 18. Summary
 
-`CURRENT_PHASE` verhindert doppelte oder gemischte Aufrufe. Der EXIT-Trap
-meldet einen unvollständigen Lauf sichtbar und liefert dann keinen Exit 0.
+CURRENT_PHASE rejects skipped, duplicated, or out-of-order calls. The EXIT trap
+reports incomplete runs and prevents a successful exit before Phase 18.
 
-## Validierung und Abschluss
+## Validation gates
 
-Im Apply-Modus erfasst Phase 01 vor den Hardening-Änderungen eine separate
-Lynis-Baseline einschließlich `report.dat`; im Dry-Run bleibt dieser schreibende
-Scan aus. Phase 13 sammelt Validierungsdaten. Phase 14 und 17 führen die beiden
-Post-Hardening-Lynis-Läufe aus; Phase 16 stellt sicher, dass die
-AIDE-Konfiguration, eine nichtleere Datenbank, ein
-lesbarer Check und der Timer vor dem finalen Lynis-Lauf vorhanden sind. Ein
-erfolgreicher Apply-Lauf benötigt Phase 18 sowie erfolgreiche Validation-,
-Final-Lynis- und Summary-Gates.
+In Apply mode, Phase 01 captures a separate pre-hardening Lynis console report
+and report.dat. Dry-run reports N/A / NOT RUN and does not launch that
+write-producing scan. Phase 13 validates the configured system state; phases
+14 and 17 collect post-hardening Lynis evidence. Phase 16 requires a valid AIDE
+runtime configuration, non-empty active database, successful check-service run,
+and enabled timer before final completion.
 
-Der aggressive Kernelmodul-Lock bleibt der letzte irreversible Schritt in
-Phase 17. Ein Tailscale-Drop-in zieht beim Boot zuerst
-`kernel-module-netfilter-preload.service` ein und ordnet diese vor
-`tailscaled.service`; Apply, Preload-Unit und `kernel-module-lockdown.service`
-verwenden denselben Helper. Bei aktivem Tailscale klassifiziert er relevante laufende Kernel-
-Features als builtin/module/unavailable, lädt nur vorhandene `=m`-Module und
-prüft danach Firewall-Service, iptables/ip6tables-nft, NAT-POSTROUTING,
-Tailscale-Ketten/-Hooks, Backend und ausschließlich passende Router-/Netfilter-
-Healthmeldungen. Erst dann wird `kernel.modules_disabled=1` geschrieben. Eine
-fehlende Voraussetzung lässt den Wert 0 und die Boot-Unit fehlschlagen; der
-Diagnosebericht liegt unter `/root/kernel-module-lockdown-report.txt`.
+The aggressive kernel-module lock is intentionally last. On Tailscale hosts,
+the shared runtime helper classifies required netfilter/NAT features, loads only
+available modular components, and proves firewall, NAT, Tailscale chain,
+backend, and router/netfilter health before writing kernel.modules_disabled=1.
+Failed prerequisites leave module loading enabled, fail visibly, and record
+/root/kernel-module-lockdown-report.txt.
 
-Die Unit verlangt den owned Firewall-Service und läuft nach Network-online,
-Firewall, AppArmor und einem gegebenenfalls mitgestarteten tailscaled. Diese
-Ordnung allein gilt nicht als Readiness-Beweis: Der Helper wartet begrenzt auf
-die konkreten Runtime-Prädikate. Er liest keine Tailscale-Prefs und führt weder
-`tailscale up` noch `tailscale set` aus.
+The helper does not change Tailscale preferences and never calls tailscale up
+or tailscale set.
 
-## Dienste
+## Service controls
 
-Deaktivierte Dienste und gehärtete Dienste sind getrennte Konzepte. Eine
-Deaktivierung wird über enabled-, active- und mask-Zustand geprüft. Ein
-Sandbox-Drop-in wird als zusammengeführte Kandidaten-Unit vor der Installation
-und anschließend nochmals als installierte Unit geprüft. Nur nach
-`daemon-reload`, Dienst-Healthcheck und Exposure-Messung bleibt es erhalten;
-bei Fehlern wird der vorherige Zustand wiederhergestellt.
+Service disabling and service sandboxing are different operations. Disabled
+services are checked for enabled, active, and masked state. A sandbox drop-in
+is rendered as a merged candidate and validated before installation; the
+installed unit is validated again. It is retained only after daemon-reload,
+service-specific health checks, and the relevant exposure or compatibility
+gate. Otherwise the prior state is restored.

@@ -1,16 +1,16 @@
 name: Work package
-description: Plane ein klar begrenztes Sicherheits-Arbeitspaket.
+description: Plan a focused security work package.
 title: "work: "
 body:
   - type: textarea
-    attributes: {label: Ursprung/Finding und Ziel}
+    attributes: {label: Origin or finding and goal}
     validations: {required: true}
   - type: textarea
-    attributes: {label: Scope, Nicht-Ziele und Sicherheitsgrenzen}
+    attributes: {label: Scope, non-goals, and safety boundaries}
     validations: {required: true}
   - type: textarea
-    attributes: {label: Implementierungsschritte und Testplan}
+    attributes: {label: Implementation steps and test plan}
     validations: {required: true}
   - type: textarea
-    attributes: {label: Rollback-Plan, Abnahmekriterien und abhängige Issues}
+    attributes: {label: Rollback plan, acceptance criteria, and dependent issues}
     validations: {required: true}

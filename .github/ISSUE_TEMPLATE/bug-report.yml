@@ -1,19 +1,19 @@
 name: Bug report
-description: Melde einen reproduzierbaren Fehler ohne Geheimnisse.
+description: Report a reproducible defect without secrets.
 title: "bug: "
 body:
   - type: textarea
     attributes:
-      label: Erwartetes und tatsächliches Verhalten
+      label: Expected and actual behavior
     validations:
       required: true
   - type: textarea
     attributes:
-      label: Reproduktionsschritte und bereinigte Logs
+      label: Reproduction steps and redacted logs
     validations:
       required: true
   - type: input
     attributes:
-      label: Version und Commit
+      label: Version and commit
     validations:
       required: true

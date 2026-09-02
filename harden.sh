@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Debian/Ubuntu server hardening driven by the supplied Lynis 3.1.6 report.
-# Source system: Ubuntu 26.04.1, kernel 7.0.0, x86_64; last validated Lynis index 86/100.
+# Source system: Ubuntu 26.04.1, kernel 7.0.0, x86_64.
 #
 # Usage:
 #   ./harden.sh --dry-run
@@ -391,7 +391,7 @@ prompt_yes_no() {
         case "$answer" in
             y|yes|j|ja) return 0 ;;
             n|no|nein|'') return 1 ;;
-            *) printf '%s\n' 'Bitte mit y/yes/j/ja oder n/no/nein antworten.' > /dev/tty ;;
+            *) printf '%s\n' 'Please answer y/yes or n/no (legacy j/ja/nein aliases are also accepted).' > /dev/tty ;;
         esac
     done
 }
@@ -1173,7 +1173,7 @@ ask_remote_logging() {
         return 0
     fi
     local prompt_status=0
-    if prompt_yes_no "Soll ein Remote-Log-Server verwendet werden? [y/N] "; then
+    if prompt_yes_no "Use a remote log server? [y/N] "; then
         prompt_status=0
     else
         prompt_status=$?
@@ -1187,14 +1187,14 @@ ask_remote_logging() {
         log INFO "Remote logging deliberately disabled by operator choice"
         return 0
     fi
-    prompt_value "IP-Adresse oder Hostname des Log-Servers: " \
+    prompt_value "Remote log server IP address or hostname: " \
         || die "Could not read the remote log server from /dev/tty"
     REMOTE_LOG_SERVER="$PROMPT_REPLY"
     [[ -n "$REMOTE_LOG_SERVER" ]] || die "Remote logging was selected, but no host was entered"
     prompt_value "Port [${REMOTE_LOG_PORT:-514}]: " "${REMOTE_LOG_PORT:-514}" \
         || die "Could not read the remote log port from /dev/tty"
     REMOTE_LOG_PORT="$PROMPT_REPLY"
-    prompt_value "Protokoll [${REMOTE_LOG_PROTOCOL:-tcp}] (tcp/udp/tls): " "${REMOTE_LOG_PROTOCOL:-tcp}" \
+    prompt_value "Protocol [${REMOTE_LOG_PROTOCOL:-tcp}] (tcp/udp/tls): " "${REMOTE_LOG_PROTOCOL:-tcp}" \
         || die "Could not read the remote log protocol from /dev/tty"
     REMOTE_LOG_PROTOCOL="$PROMPT_REPLY"
     validate_remote_logging
