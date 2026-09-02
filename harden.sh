@@ -3161,6 +3161,7 @@ suggest_ssh_port() {
 }
 
 detect_ssh_context() {
+    local sshd_effective="" configured_port="" connection_port=""
     SSHD_BIN="$(command -v sshd 2>/dev/null || true)"
     if unit_file_exists ssh.service; then
         SSH_SERVICE="ssh.service"
@@ -3168,17 +3169,20 @@ detect_ssh_context() {
         SSH_SERVICE="sshd.service"
     fi
     if [[ -n "$SSHD_BIN" ]] && "$SSHD_BIN" -T >/dev/null 2>&1; then
-        local sshd_effective
         sshd_effective="$("$SSHD_BIN" -T 2>/dev/null)"
-        SSH_PORT="$(awk '$1 == "port" && port == "" {port=$2} END {print port}' <<<"$sshd_effective")"
+        configured_port="$(awk '$1 == "port" && port == "" {port=$2} END {print port}' <<<"$sshd_effective")"
+        SSH_PORT="$configured_port"
     fi
     if [[ -n "${SSH_CONNECTION:-}" ]]; then
-        local connection_port
         connection_port="$(awk '{print $4}' <<<"$SSH_CONNECTION")"
         [[ "$connection_port" =~ ^[0-9]+$ ]] && SSH_PORT="$connection_port"
     fi
     [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || SSH_PORT=22
     load_ssh_port_migration_state || true
+    if [[ "$SSH_PORT_MIGRATION_STATE_UNSAFE" -eq 1 && "$configured_port" =~ ^[0-9]+$ ]]; then
+        SSH_PORT="$configured_port"
+        log WARN "Unsafe SSH migration state: ignoring SSH_CONNECTION port ${connection_port:-unknown} for policy decisions and retaining effective sshd port ${configured_port}"
+    fi
 
     local candidate="${SUDO_USER:-}"
     if [[ -n "$candidate" && "$candidate" != "root" ]] && id "$candidate" >/dev/null 2>&1; then
@@ -3380,6 +3384,12 @@ EOF
 }
 
 configure_firewall() {
+    if [[ "$SSH_PORT_MIGRATION_STATE_UNSAFE" -eq 1 ]]; then
+        FIREWALL_STATUS="REVIEW REQUIRED/FROZEN (SSH migration state is inconsistent; existing owned firewall retained unchanged)"
+        record_skip "firewall" "SSH port migration state is unsafe; Phase 07 is frozen so no SSH_CONNECTION/state-derived port can replace the existing owned firewall rule"
+        log WARN "Firewall policy is frozen: persisted SSH migration state is inconsistent; retaining the existing owned table without rendering a new SSH port rule"
+        return 0
+    fi
     if ! command -v nft >/dev/null 2>&1; then
         FIREWALL_STATUS="FAILED"
         record_skip "firewall" "nft binary unavailable after package checks"
@@ -3682,6 +3692,11 @@ stage_ssh_port_migration() {
         die "Requested SSH port ${new_port} is already the effective current port"
     fi
     migration_config="$(ssh_migration_config_path)"
+    if ! ssh_port_is_available "$new_port"; then
+        SSH_PORT_MIGRATION_STATUS="BLOCKED (${old_port}->${new_port}; requested port is already bound)"
+        log ERROR "Requested SSH port ${new_port} is already bound by another listener; no migration is planned or applied"
+        return 1
+    fi
     if [[ "$MODE" == dry-run ]]; then
         log INFO "Would stage SSH migration ${old_port}->${new_port}: allow new firewall port while retaining old, validate dual listeners, update Fail2ban for both, then persist awaiting-confirmation state"
         SSH_PORT_MIGRATION_STATUS="PLANNED (${old_port}->${new_port}; old port retained)"
@@ -3690,9 +3705,6 @@ stage_ssh_port_migration() {
     mapfile -t effective_ports < <(ssh_effective_port_list)
     if ((${#effective_ports[@]} != 1)) || [[ "${effective_ports[0]:-}" != "$old_port" ]]; then
         die "SSH port migration requires one unambiguous effective current SSH port; current effective ports are: ${effective_ports[*]:-unavailable}"
-    fi
-    if ! ssh_port_is_available "$new_port"; then
-        die "Requested SSH port ${new_port} is already bound by another listener"
     fi
     transaction_copy "$migration_config" ssh-port-migration.conf
     transaction_copy /etc/nftables.d/99-security-hardening.nft ssh-port-firewall.nft
@@ -3751,10 +3763,8 @@ retire_ssh_port_migration() {
         SSH_PORT_MIGRATION_STATUS="PLANNED RETIRE (${old_port}->${new_port})"
         return 0
     fi
-    if ! ssh_effective_port_present "$old_port" || ! ssh_effective_port_present "$new_port" \
-        || ! ssh_port_is_listening "$old_port" || ! ssh_port_is_listening "$new_port" \
-        || ! systemctl is-active --quiet "$SSH_SERVICE"; then
-        SSH_PORT_MIGRATION_STATUS="REVIEW REQUIRED (staged state/listeners are inconsistent)"
+    if ! ssh_port_policy_healthy dual "$old_port" "$new_port"; then
+        SSH_PORT_MIGRATION_STATUS="REVIEW REQUIRED (proven dual-port preflight failed; no old SSH port removal)"
         write_ssh_port_migration_report retire "$SSH_PORT_MIGRATION_STATUS" || true
         return 1
     fi

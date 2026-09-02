@@ -2024,7 +2024,12 @@ run_apparmor_profile_tests() {
 
 run_ssh_port_migration_tests() {
     local case_root="$test_root/ssh-port-migration"
-    install -d "$case_root/config" "$case_root/log"
+    install -d "$case_root/config" "$case_root/log" "$case_root/mock-bin"
+    cat > "$case_root/mock-bin/sshd" <<'EOF'
+#!/usr/bin/env bash
+[[ "${1:-}" == -T ]] && printf 'port 52022\n'
+EOF
+    chmod +x "$case_root/mock-bin/sshd"
 
     env HARDEN_SOURCE_ONLY=1 bash -c '
         source "$1/harden.sh"; trap - ERR EXIT
@@ -2077,6 +2082,35 @@ run_ssh_port_migration_tests() {
         load_ssh_port_migration_state || true; manage_ssh_port_migration
         [[ "$SSH_PORT_MIGRATION_STATE_UNSAFE" == 1 && "$SSH_PORT" == 22 && "$mutation" == 0 ]]
     ' _ "$repo_root" "$case_root" || fail "unsafe SSH migration state was not blocked without mutation"
+
+    env PATH="$case_root/mock-bin:$PATH" HARDEN_SOURCE_ONLY=1 HARDEN_SSH_PORT_STATE_FILE="$case_root/phase07-unsafe-state" SSH_CONNECTION='198.51.100.10 50000 192.0.2.10 22' bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        MODE=apply; forbidden=0
+        printf "version=1\nstatus=retired\nold_port=22\nnew_port=2222\n" > "$HARDEN_SSH_PORT_STATE_FILE"; chmod 0600 "$HARDEN_SSH_PORT_STATE_FILE"
+        unit_file_exists() { [[ "$1" == ssh.service ]]; }; systemctl() { [[ "$1" == is-active && "$3" == ssh.service ]]; }
+        ssh_port_is_listening() { [[ "$1" == 52022 ]]; }; ssh_port_migration_file_is_safe() { return 0; }
+        nft() { forbidden=1; return 1; }; record_skip() { :; }; log() { :; }
+        detect_ssh_context
+        [[ "$SSH_PORT" == 52022 && "$SSH_PORT_MIGRATION_STATE_UNSAFE" == 1 ]]
+        configure_firewall
+        [[ "$FIREWALL_STATUS" == REVIEW\ REQUIRED/FROZEN* && "$forbidden" == 0 ]]
+    ' _ "$repo_root" "$case_root" || fail "unsafe migration state did not freeze Phase 07 before an old SSH_CONNECTION could remove the real port"
+
+    env HARDEN_SOURCE_ONLY=1 HARDEN_SSH_CONFIG_DIR="$case_root/config" HARDEN_SSH_PORT_STATE_FILE="$case_root/retire-preflight-state" HARDEN_SSH_PORT_REPORT="$case_root/retire-preflight-report" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        MODE=apply; BACKUP_DIR="$2/retire-preflight-backup"; mkdir -p "$BACKUP_DIR"; SSH_PORT=22; SSH_STAGED_OLD_PORT=22; SSH_STAGED_NEW_PORT=2222; SSH_PORT_RETIRE=1; NON_INTERACTIVE=1; SSH_SERVICE=ssh.service; mutated=0
+        ssh_port_policy_healthy() { return 1; }; transaction_copy() { mutated=1; }; install_managed_file() { mutated=1; }; write_ssh_port_migration_report() { :; }
+        ! retire_ssh_port_migration
+        [[ "$SSH_PORT_MIGRATION_STATUS" == "REVIEW REQUIRED (proven dual-port preflight failed; no old SSH port removal)" && "$mutated" == 0 ]]
+    ' _ "$repo_root" "$case_root" || fail "retire did not require a full dual-port policy proof before modifying SSH"
+
+    env HARDEN_SOURCE_ONLY=1 HARDEN_SSH_CONFIG_DIR="$case_root/config" HARDEN_SSH_PORT_STATE_FILE="$case_root/dry-occupied-state" HARDEN_SSH_PORT_REPORT="$case_root/dry-occupied-report" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        MODE=dry-run; SSH_PORT=22; SSH_PORT_REQUEST=2222; SSH_SERVICE=ssh.service; SSHD_BIN=sshd; planned=0
+        ssh_port_is_available() { return 1; }; log() { [[ "$*" == *"Would stage SSH migration"* ]] && planned=1; return 0; }
+        ! stage_ssh_port_migration
+        [[ "$SSH_PORT_MIGRATION_STATUS" == "BLOCKED (22->2222; requested port is already bound)" && "$planned" == 0 && ! -e "$(ssh_migration_config_path)" && ! -e "$HARDEN_SSH_PORT_STATE_FILE" ]]
+    ' _ "$repo_root" "$case_root" || fail "occupied dry-run SSH port was presented as a successful migration plan"
 
     env HARDEN_SOURCE_ONLY=1 HARDEN_SSH_CONFIG_DIR="$case_root/config" \
         HARDEN_SSH_PORT_STATE_FILE="$case_root/state" HARDEN_SSH_PORT_REPORT="$case_root/report" bash -c '
@@ -2170,6 +2204,7 @@ run_ssh_port_migration_tests() {
             transaction_copy() { :; }; transaction_restore() { printf "restore %s\n" "$1" >> "$test_dir/log/retire.log"; }; install_managed_file() { local target="$1"; shift 2; cat > "$target"; MANAGED_FILE_CHANGED=1; }
             sshd() { if [[ "$1" == -t ]]; then return 0; fi; awk "\$1 == \"Port\" {print \"port \" \$2}" "$(ssh_migration_config_path)"; }; ssh_port_is_listening() { grep -Fxq "Port $1" "$(ssh_migration_config_path)"; }
             systemctl() { printf "systemctl %s\n" "$*" >> "$test_dir/log/retire.log"; return 0; }; run_streamed() { "$@"; }; configure_fail2ban() { printf "fail2ban %s\n" "$(ssh_fail2ban_ports)" >> "$test_dir/log/retire.log"; FAIL2BAN_STATUS=OK; return 0; }; configure_firewall() { printf "firewall %s\n" "$(ssh_fail2ban_ports)" >> "$test_dir/log/retire.log"; return 0; }
+            ssh_port_policy_healthy() { [[ "$1" == dual && "$2" == 22 && "$3" == 2222 ]]; }
             write_ssh_port_migration_state() { printf "status=%s\nold_port=%s\nnew_port=%s\n" "$1" "$2" "$3" > "$HARDEN_SSH_PORT_STATE_FILE"; }; write_ssh_port_migration_report() { :; }; record_change() { :; }
             retire_ssh_port_migration
             grep -Fxq "Port 2222" "$(ssh_migration_config_path)" && ! grep -Fxq "Port 22" "$(ssh_migration_config_path)"
