@@ -9,6 +9,9 @@ release tag or GitHub Release is created by this file.
 
 - Reworked repository-facing documentation, templates, examples, and
   troubleshooting guidance into consistent English.
+- Added a factual third-party/Lynis dependency review with authoritative source
+  links, distribution inventory, Enterprise and plugin separation, and explicit
+  release controls. No project license was selected.
 - Reorganized the README around scope, safety boundaries, common commands,
   historical validation evidence, and documentation links.
 - Added repository-native Mermaid visuals for the hardening flow and recorded

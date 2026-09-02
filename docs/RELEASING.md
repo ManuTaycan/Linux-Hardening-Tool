@@ -11,7 +11,16 @@ Before proposing a release:
 4. Run make check and wait for green CI.
 5. Test installation from the pinned candidate tag with install.sh --ref TAG.
 6. Review public logs and artifacts for secrets or production-sensitive data.
-7. Obtain the project decision on release readiness and licensing.
+7. Re-run the [third-party software review](../THIRD_PARTY.md): verify the
+   exact release does not add vendored code, plugins, reports, logos,
+   screenshots, copied control text, or other third-party material without the
+   required attribution and license review. On the release target, record the
+   actual Lynis package version and inspect its package copyright/license data,
+   including any distribution-shipped plugin.
+8. Obtain separate project decisions on release readiness and the repository's
+   own license. The GPLv3 status of external Lynis Community/Client software
+   does not select a license for this project.
 
 Version 1.1.3 remains an unreleased development version. A release tag and
-licensing decision require separate explicit approval.
+licensing decision require separate explicit approval. Release remains blocked
+until the project's own license is explicitly decided.

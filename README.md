@@ -203,8 +203,11 @@ private keys, IP-sensitive production data, or unredacted diagnostic archives.
 - [Contributing](CONTRIBUTING.md)
 - [Security reporting](SECURITY.md)
 - [Release procedure](docs/RELEASING.md)
+- [Third-party software and Lynis review](THIRD_PARTY.md)
 
 ## License
 
 No license has been selected. This repository does not grant a license by
-implication; release and licensing decisions remain outside this change.
+implication; release and licensing decisions remain outside this change. The
+external Lynis dependency and its separate licensing status are documented in
+[THIRD_PARTY.md](THIRD_PARTY.md).
