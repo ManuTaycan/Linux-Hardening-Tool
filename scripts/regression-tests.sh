@@ -2346,6 +2346,41 @@ EOF
 
     env HARDEN_SOURCE_ONLY=1 bash -c '
         source "$1/harden.sh"; trap - ERR EXIT
+        SSH_SERVICE=ssh.service; SSH_LISTENER_MODE=socket; SSH_PORT_MIGRATION_RELOADED=1; SSH_HARDENING_CONFIG_CHANGED=1; reloads=0; socket_restarts=0
+        systemctl() {
+            if [[ "$1" == is-active && "$3" == ssh.service ]]; then return 0; fi
+            [[ "$1" != restart || "$2" != ssh.socket ]] || socket_restarts=$((socket_restarts + 1))
+            return 1
+        }
+        run_streamed() { [[ "$1" == systemctl && "$2" == reload && "$3" == ssh.service ]] && { reloads=$((reloads + 1)); return 0; }; return 1; }
+        reload_ssh_service_after_socket_migration && [[ "$reloads" == 1 && "$socket_restarts" == 0 ]]
+    ' _ "$repo_root" || fail "socket migration plus changed normal SSH config did not reload an active ssh.service exactly once"
+
+    env HARDEN_SOURCE_ONLY=1 bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        SSH_SERVICE=ssh.service; SSH_LISTENER_MODE=socket; SSH_PORT_MIGRATION_RELOADED=1; SSH_HARDENING_CONFIG_CHANGED=1; reloads=0; starts=0
+        systemctl() { [[ "$1" == is-active && "$3" == ssh.socket ]]; }
+        run_streamed() { starts=$((starts + 1)); return 1; }
+        reload_ssh_service_after_socket_migration && [[ "$reloads" == 0 && "$starts" == 0 ]]
+    ' _ "$repo_root" || fail "socket migration plus changed normal SSH config touched an inactive ssh.service"
+
+    env HARDEN_SOURCE_ONLY=1 bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        SSH_SERVICE=ssh.service; SSH_LISTENER_MODE=socket; SSH_PORT_MIGRATION_RELOADED=1; SSH_HARDENING_CONFIG_CHANGED=0; mutations=0
+        systemctl() { [[ "$1" == is-active && "$3" == ssh.service ]]; }
+        run_streamed() { mutations=1; return 1; }
+        reload_ssh_service_after_socket_migration && [[ "$mutations" == 0 ]]
+    ' _ "$repo_root" || fail "socket migration with unchanged normal SSH config performed an extra service reload"
+
+    env HARDEN_SOURCE_ONLY=1 bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        SSH_SERVICE=ssh.service; SSH_LISTENER_MODE=service; SSH_PORT_MIGRATION_RELOADED=1; SSH_HARDENING_CONFIG_CHANGED=1; mutations=0
+        systemctl() { mutations=1; return 1; }; run_streamed() { mutations=1; return 1; }
+        reload_ssh_service_after_socket_migration && [[ "$mutations" == 0 ]]
+    ' _ "$repo_root" || fail "service-mode migration performed an extra normal-hardening reload"
+
+    env HARDEN_SOURCE_ONLY=1 bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
         SSH_SERVICE=ssh.service; SSH_LISTENER_MODE=service; SSH_PORT=22; SSHD_BIN=sshd; reloaded=0
         sshd() { [[ "$1" == -t ]]; }; systemctl() { [[ "$1" == is-active && "$3" == ssh.service ]]; }; run_streamed() { [[ "$1" == systemctl && "$2" == reload && "$3" == ssh.service ]] && reloaded=1; }
         hardened_ssh_runtime_healthy && [[ "$reloaded" == 1 ]]

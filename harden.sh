@@ -4014,6 +4014,18 @@ restore_hardened_ssh_config() {
     [[ "$restore_ok" -eq 1 ]]
 }
 
+reload_ssh_service_after_socket_migration() {
+    [[ "$SSH_PORT_MIGRATION_RELOADED" -eq 1 ]] || return 0
+    [[ "$SSH_LISTENER_MODE" == socket ]] || return 0
+    [[ "$SSH_HARDENING_CONFIG_CHANGED" -eq 1 ]] || return 0
+    if systemctl is-active --quiet "$SSH_SERVICE"; then
+        run_streamed systemctl reload "$SSH_SERVICE" \
+            && systemctl is-active --quiet "$SSH_SERVICE" || return 1
+        log INFO "Socket migration completed; reloaded the already active ssh.service once for the changed normal SSH configuration; ssh.socket was not restarted again"
+    fi
+    return 0
+}
+
 harden_ssh() {
     if [[ -z "$SSHD_BIN" || -z "$SSH_SERVICE" ]]; then
         SSH_STATUS="NOT INSTALLED"
@@ -4119,8 +4131,13 @@ EOF
         die "Firewall does not visibly allow every effective staged SSH port; refusing to reload SSH"
     fi
     if [[ "$SSH_PORT_MIGRATION_RELOADED" -eq 1 ]]; then
+        if ! reload_ssh_service_after_socket_migration; then
+            restore_hardened_ssh_config "$SSH_HARDENING_CONFIG_CHANGED" || log ERROR "SSH configuration rollback could not fully reload its active listener context"
+            SSH_STATUS="FAILED/ROLLED BACK"
+            die "Changed SSH configuration could not be reloaded after socket migration"
+        fi
         SSH_STATUS="OK"
-        log INFO "SSH was already reloaded and listener-validated by the requested port migration; no second reload is needed"
+        log INFO "SSH was already reloaded and listener-validated by the requested port migration; no second socket restart is needed"
     elif hardened_ssh_runtime_healthy "$SSH_HARDENING_CONFIG_CHANGED"; then
         SSH_STATUS="OK"
         if [[ "$SSH_LISTENER_MODE" == socket ]]; then
@@ -4129,7 +4146,6 @@ EOF
                 record_change "Validated changed SSH hardening configuration in socket listener mode without restarting ssh.socket"
             else
                 log INFO "Validated hardened SSH configuration against active ssh.socket and current listener; no SSH service or socket mutation was needed"
-                record_change "Validated unchanged SSH hardening configuration in socket listener mode without restarting ssh.service or ssh.socket"
             fi
         else
             record_change "Validated and reloaded hardened SSH configuration without terminating existing sessions"
