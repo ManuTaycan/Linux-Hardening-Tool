@@ -135,6 +135,58 @@ akzeptabel, wenn der präzise Pfad, Unit-Validierung, One-shot und
 `root:adm`/`0640` nachweislich erfolgreich sind; andere Service-Drop-ins
 behalten weiterhin ihr messbares Score-Gate.
 
+### Ubuntu-26.04.1-Retest SSH-Port-Migration (#31)
+
+Eine Portänderung ist optional und keine primäre Sicherheitsmaßnahme. Führe die
+erste Stufe aus einer bestehenden SSH- oder Recovery-Sitzung aus und halte sie
+nach erfolgreichem Apply an. Der alte Port muss bis zur ausdrücklichen späteren
+Freigabe erreichbar bleiben; Tailscale wird dabei nicht verändert.
+
+```bash
+# Zuerst nur planen und den vorgeschlagenen bzw. gewählten Port prüfen.
+sudo ./harden.sh --dry-run --aggressive --ssh-port 52022
+
+# Stage: alter und neuer Port müssen danach beide lauschen.
+sudo ./harden.sh --apply --aggressive --ssh-port 52022
+sudo cat /root/ssh-port-migration-report.txt
+sudo ss -H -ltn 'sport = :22'
+sudo ss -H -ltn 'sport = :52022'
+sudo fail2ban-client status sshd
+sudo nft list chain inet hardening_filter input
+```
+
+Wenn `ssh.socket` der aktive Listener-Carrier ist, zeigt der Report
+`listener-mode=socket`. In diesem Modus bleibt `ssh.service` beim Test
+gegebenenfalls inaktiv: maßgeblich sind ein aktives `ssh.socket` und die beiden
+realen Listener. Der Stage legt zusätzlich ein reversibles, managed
+`ssh.socket.d`-Drop-in mit genau den alten und neuen `ListenStream`-Ports an.
+Nach `sshd -t` erfolgen ausschließlich `daemon-reload` und ein Neustart von
+`ssh.socket`; `ssh.service` wird nicht neugestartet.
+
+Öffne jetzt in einem separaten Terminal eine echte neue SSH-Sitzung auf dem
+neuen Port und verifiziere Administration und Tailscale, bevor irgendein
+Retire-Schritt erfolgt:
+
+```bash
+ssh -p 52022 <admin>@<server>
+tailscale status
+```
+
+Erst nach dieser Bestätigung kann der alte Port interaktiv bestätigt oder bei
+einem bewusst nichtinteraktiven Lauf explizit entfernt werden:
+
+```bash
+sudo ./harden.sh --apply --aggressive --non-interactive --retire-ssh-port
+sudo ss -H -ltn 'sport = :52022'
+sudo ss -H -ltn 'sport = :22' # darf keinen Listener mehr zeigen
+sudo cat /root/ssh-port-migration-state.conf
+```
+
+Bei einem fehlgeschlagenen Listener-, `sshd -t`-, Reload-, Firewall- oder
+Fail2ban-Check muss der Bericht einen Rollback zeigen und der alte Port weiter
+lauschen. Ein zweiter Stage- oder finaler Lauf darf keine erneute Portmutation
+auslösen.
+
 ### Ubuntu-26.04.1-Retest AppArmor service coverage (#15)
 
 Der Lauf darf keine automatisch erzeugten Profile oder pauschales Enforcing

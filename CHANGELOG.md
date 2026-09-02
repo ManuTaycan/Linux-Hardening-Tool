@@ -7,6 +7,14 @@ für 1.1.3 wird erst nach dem vollständigen Zielsystemtest erstellt.
 
 ### Changed
 
+- SSH-Port changes are now an operator-opt-in, two-stage migration. The stage
+  first adds the new port only to the harden.sh-owned firewall table while
+  retaining the old port, validates dual `sshd` listeners and Fail2ban coverage,
+  then persists root-only `awaiting-confirmation` state. A later explicit retire
+  validates the staged new listener before removing old SSH, firewall and
+  Fail2ban coverage; any failure restores the dual-port state. Port changes are
+  documented as scan/log-noise reduction only, not an authentication or
+  hardening substitute.
 - AppArmor now writes a before/after inventory of unconfined processes and
   their systemd context to `/root/apparmor-service-coverage-report.txt`.
   It no longer bulk-enforces every top-level profile. Only a matching,
