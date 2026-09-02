@@ -41,6 +41,8 @@ SSH_PORT_MIGRATION_REPORT="${HARDEN_SSH_PORT_REPORT:-/root/ssh-port-migration-re
 SSH_STAGED_OLD_PORT=""
 SSH_STAGED_NEW_PORT=""
 SSH_PORT_MIGRATION_RELOADED=0
+SSH_PORT_MIGRATION_STATE_UNSAFE=0
+SSH_PORT_MIGRATION_STATE_STATUS=""
 SSH_SERVICE=""
 SSHD_BIN=""
 ADMIN_USER=""
@@ -2976,8 +2978,11 @@ ssh_port_migration_file_is_safe() {
 
 load_ssh_port_migration_state() {
     local state_file="$SSH_PORT_MIGRATION_STATE_FILE" status="" old_port="" new_port=""
+    SSH_PORT_MIGRATION_STATE_UNSAFE=0
+    SSH_PORT_MIGRATION_STATE_STATUS=""
     [[ -e "$state_file" || -L "$state_file" ]] || return 0
     if ! ssh_port_migration_file_is_safe "$state_file"; then
+        SSH_PORT_MIGRATION_STATE_UNSAFE=1
         SSH_PORT_MIGRATION_STATUS="REVIEW REQUIRED (state path is not a root-owned regular 0600 file)"
         record_skip "SSH port migration" "$SSH_PORT_MIGRATION_STATUS"
         return 1
@@ -2986,25 +2991,69 @@ load_ssh_port_migration_state() {
     old_port="$(awk -F= '$1 == "old_port" {print $2; exit}' "$state_file")"
     new_port="$(awk -F= '$1 == "new_port" {print $2; exit}' "$state_file")"
     if ! ssh_port_is_valid_migration_target "$new_port" || [[ ! "$old_port" =~ ^[0-9]+$ ]]; then
+        SSH_PORT_MIGRATION_STATE_UNSAFE=1
         SSH_PORT_MIGRATION_STATUS="REVIEW REQUIRED (state has invalid ports)"
+        record_skip "SSH port migration" "$SSH_PORT_MIGRATION_STATUS"
+        return 1
+    fi
+    if ! ssh_port_state_matches_runtime "$status" "$old_port" "$new_port"; then
+        SSH_PORT_MIGRATION_STATE_UNSAFE=1
+        SSH_PORT_MIGRATION_STATUS="REVIEW REQUIRED (persisted ${status} state does not match effective SSH ports/listeners; no migration mutation)"
         record_skip "SSH port migration" "$SSH_PORT_MIGRATION_STATUS"
         return 1
     fi
     case "$status" in
         staged)
+            SSH_PORT_MIGRATION_STATE_STATUS="staged"
             SSH_STAGED_OLD_PORT="$old_port"
             SSH_STAGED_NEW_PORT="$new_port"
             SSH_PORT_MIGRATION_STATUS="STAGED (${old_port}->${new_port}; awaiting explicit confirmation)"
             ;;
         retired)
+            SSH_PORT_MIGRATION_STATE_STATUS="retired"
+            # Do not let persisted state replace a currently detected working port
+            # until the exact effective configuration and listener state are proven.
             SSH_PORT="$new_port"
             SSH_PORT_MIGRATION_STATUS="RETIRED (${old_port}->${new_port})"
             ;;
         *)
+            SSH_PORT_MIGRATION_STATE_UNSAFE=1
             SSH_PORT_MIGRATION_STATUS="REVIEW REQUIRED (unknown state status)"
             record_skip "SSH port migration" "$SSH_PORT_MIGRATION_STATUS"
             return 1
             ;;
+    esac
+}
+
+ssh_effective_ports_match() {
+    local expected_port actual_port
+    local -a actual_ports=("$@") effective_ports=()
+    mapfile -t effective_ports < <(ssh_effective_port_list)
+    ((${#effective_ports[@]} == ${#actual_ports[@]})) || return 1
+    for expected_port in "${actual_ports[@]}"; do
+        for actual_port in "${effective_ports[@]}"; do
+            [[ "$actual_port" == "$expected_port" ]] && break
+        done
+        [[ "$actual_port" == "$expected_port" ]] || return 1
+    done
+}
+
+ssh_port_state_matches_runtime() {
+    local status="$1" old_port="$2" new_port="$3"
+    [[ -n "$SSHD_BIN" && -n "$SSH_SERVICE" ]] || return 1
+    systemctl is-active --quiet "$SSH_SERVICE" || return 1
+    case "$status" in
+        staged)
+            ssh_effective_ports_match "$old_port" "$new_port" \
+                && ssh_port_is_listening "$old_port" \
+                && ssh_port_is_listening "$new_port"
+            ;;
+        retired)
+            ssh_effective_ports_match "$new_port" \
+                && ssh_port_is_listening "$new_port" \
+                && ! ssh_port_is_listening "$old_port"
+            ;;
+        *) return 1 ;;
     esac
 }
 
@@ -3041,6 +3090,66 @@ ssh_owned_firewall_allows_ports() {
     while IFS= read -r port; do
         awk -v port="$port" '$0 ~ /tcp dport/ && $0 ~ ("(^|[^0-9])" port "([^0-9]|$)") { found=1 } END { exit !found }' <<<"$hardening_input" || return 1
     done < <(ssh_firewall_ports)
+}
+
+ssh_owned_firewall_matches_ports() {
+    local ssh_port_set="" expected_rule="" runtime_rule=""
+    local -a ports=("$@")
+    ((${#ports[@]} >= 1)) || return 1
+    if ((${#ports[@]} == 1)); then
+        expected_rule="        tcp dport ${ports[0]} ct state new limit rate 30/minute burst 20 packets accept comment \"administrative SSH\""
+    else
+        printf -v ssh_port_set '%s, ' "${ports[@]}"
+        ssh_port_set="${ssh_port_set%, }"
+        expected_rule="        tcp dport { ${ssh_port_set} } ct state new limit rate 30/minute burst 20 packets accept comment \"administrative SSH migration\""
+    fi
+    grep -Fqx "$expected_rule" /etc/nftables.d/99-security-hardening.nft || return 1
+    runtime_rule="$(nft list chain inet hardening_filter input 2>/dev/null || true)"
+    grep -Fq "${expected_rule#        }" <<<"$runtime_rule"
+}
+
+ssh_fail2ban_policy_matches_ports() {
+    local expected_ports="" actual_ports="" jail_config="${HARDEN_FAIL2BAN_DIR:-/etc/fail2ban}/jail.d/99-sshd-hardening.local"
+    local IFS=,
+    expected_ports="$*"
+    [[ -f "$jail_config" ]] || return 1
+    actual_ports="$(awk -F= '/^[[:space:]]*port[[:space:]]*=/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "$jail_config")"
+    [[ "$actual_ports" == "$expected_ports" ]]
+}
+
+ssh_migration_state_matches() {
+    local expected_status="$1" expected_old="$2" expected_new="$3" state_status="" state_old="" state_new=""
+    ssh_port_migration_file_is_safe "$SSH_PORT_MIGRATION_STATE_FILE" || return 1
+    state_status="$(awk -F= '$1 == "status" {print $2; exit}' "$SSH_PORT_MIGRATION_STATE_FILE")"
+    state_old="$(awk -F= '$1 == "old_port" {print $2; exit}' "$SSH_PORT_MIGRATION_STATE_FILE")"
+    state_new="$(awk -F= '$1 == "new_port" {print $2; exit}' "$SSH_PORT_MIGRATION_STATE_FILE")"
+    [[ "$state_status" == "$expected_status" && "$state_old" == "$expected_old" && "$state_new" == "$expected_new" ]]
+}
+
+ssh_port_policy_healthy() {
+    local state_status="$1" old_port="$2" new_port="$3"
+    case "$state_status" in
+        single)
+            systemctl is-active --quiet "$SSH_SERVICE" \
+                && ssh_effective_ports_match "$old_port" \
+                && ssh_port_is_listening "$old_port" \
+                && ! ssh_port_is_listening "$new_port" \
+                && ssh_owned_firewall_matches_ports "$old_port" \
+                && ssh_fail2ban_policy_matches_ports "$old_port" \
+                && verify_fail2ban_runtime 10
+            ;;
+        dual)
+            systemctl is-active --quiet "$SSH_SERVICE" \
+                && ssh_effective_ports_match "$old_port" "$new_port" \
+                && ssh_port_is_listening "$old_port" \
+                && ssh_port_is_listening "$new_port" \
+                && ssh_owned_firewall_matches_ports "$old_port" "$new_port" \
+                && ssh_fail2ban_policy_matches_ports "$old_port" "$new_port" \
+                && ssh_migration_state_matches staged "$old_port" "$new_port" \
+                && verify_fail2ban_runtime 10
+            ;;
+        *) return 1 ;;
+    esac
 }
 
 suggest_ssh_port() {
@@ -3497,35 +3606,67 @@ selected_ssh_port_for_stage() {
     fi
     [[ "$NON_INTERACTIVE" -eq 0 ]] || return 1
     prompt_yes_no "Change SSH port? [y/N] " || return 1
-    suggested="$(suggest_ssh_port || true)"
-    [[ -n "$suggested" ]] || { log WARN "No unused high TCP port could be suggested; 2222 is only a commonly scanned example, not a recommendation"; return 1; }
-    log INFO "Suggested unused high port ${suggested}; 2222 is commonly scanned and is not suggested as a security control"
-    prompt_value "New SSH port [${suggested}]: " "$suggested" || return 1
-    requested="$PROMPT_REPLY"
-    printf '%s\n' "$requested"
+    while true; do
+        suggested="$(suggest_ssh_port || true)"
+        [[ -n "$suggested" ]] || { log WARN "No unused high TCP port could be suggested; 2222 is only a commonly scanned example, not a recommendation"; return 1; }
+        log INFO "Suggested unused high port ${suggested}; 2222 is commonly scanned and is not suggested as a security control"
+        prompt_value "New SSH port [${suggested}]: " "$suggested" || return 1
+        requested="$PROMPT_REPLY"
+        if ! ssh_port_is_valid_migration_target "$requested"; then
+            log WARN "SSH port must be a number in the range 1024-65535; please choose again"
+        elif [[ "$requested" == "$SSH_PORT" ]]; then
+            log WARN "SSH port ${requested} is already the effective current port; please choose another port"
+        elif ! ssh_port_is_available "$requested"; then
+            log WARN "SSH port ${requested} is already bound by another listener; please choose another port"
+        else
+            printf '%s\n' "$requested"
+            return 0
+        fi
+    done
 }
 
-rollback_ssh_port_stage() {
-    local old_port="$1" reason="$2" migration_config
+rollback_ssh_port_migration() {
+    local rollback_kind="$1" old_port="$2" new_port="$3" reason="$4" migration_config restore_ok=1
     migration_config="$(ssh_migration_config_path)"
-    transaction_restore "$migration_config" ssh-port-migration.conf
-    transaction_restore /etc/nftables.d/99-security-hardening.nft ssh-port-firewall.nft
-    transaction_restore /etc/fail2ban/jail.local ssh-port-fail2ban-global.local
-    transaction_restore /etc/fail2ban/jail.d/99-sshd-hardening.local ssh-port-fail2ban.local
-    transaction_restore "$SSH_PORT_MIGRATION_STATE_FILE" ssh-port-state.conf
-    SSH_STAGED_OLD_PORT=""
-    SSH_STAGED_NEW_PORT=""
-    run_streamed systemctl daemon-reload || true
-    run_streamed nft -f /etc/nftables.d/99-security-hardening.nft || true
-    run_streamed systemctl reload "$SSH_SERVICE" || true
-    run_streamed systemctl restart fail2ban.service || true
-    if ssh_port_is_listening "$old_port"; then
-        SSH_PORT_MIGRATION_STATUS="FAILED/ROLLED BACK (${reason}; old listener ${old_port} verified)"
-    else
-        SSH_PORT_MIGRATION_STATUS="FAILED/ROLLBACK REVIEW REQUIRED (${reason}; old listener ${old_port} could not be proven)"
+    transaction_restore "$migration_config" ssh-port-migration.conf || restore_ok=0
+    transaction_restore /etc/nftables.d/99-security-hardening.nft ssh-port-firewall.nft || restore_ok=0
+    transaction_restore /etc/fail2ban/jail.local ssh-port-fail2ban-global.local || restore_ok=0
+    transaction_restore /etc/fail2ban/jail.d/99-sshd-hardening.local ssh-port-fail2ban.local || restore_ok=0
+    transaction_restore "$SSH_PORT_MIGRATION_STATE_FILE" ssh-port-state.conf || restore_ok=0
+    if ! run_streamed systemctl daemon-reload \
+        || ! run_streamed nft -f /etc/nftables.d/99-security-hardening.nft \
+        || ! run_streamed systemctl reload "$SSH_SERVICE" \
+        || ! run_streamed systemctl restart fail2ban.service; then
+        restore_ok=0
     fi
-    write_ssh_port_migration_report rollback "$SSH_PORT_MIGRATION_STATUS" || true
+    case "$rollback_kind" in
+        stage)
+            SSH_PORT="$old_port"; SSH_STAGED_OLD_PORT=""; SSH_STAGED_NEW_PORT=""
+            if [[ "$restore_ok" -eq 1 ]] && ssh_port_policy_healthy single "$old_port" "$new_port" \
+                && [[ ! -e "$SSH_PORT_MIGRATION_STATE_FILE" && ! -L "$SSH_PORT_MIGRATION_STATE_FILE" ]]; then
+                SSH_PORT_MIGRATION_STATUS="FAILED/ROLLED BACK (${reason}; previous single-port SSH/firewall/Fail2ban state proven)"
+            else
+                SSH_PORT_MIGRATION_STATUS="FAILED/ROLLBACK-FAILED (${reason}; previous single-port state could not be proven)"
+                restore_ok=0
+            fi
+            ;;
+        retire)
+            SSH_PORT="$old_port"; SSH_STAGED_OLD_PORT="$old_port"; SSH_STAGED_NEW_PORT="$new_port"
+            if [[ "$restore_ok" -eq 1 ]] && ssh_port_policy_healthy dual "$old_port" "$new_port"; then
+                SSH_PORT_MIGRATION_STATUS="FAILED/ROLLED BACK (${reason}; previous dual-port SSH/firewall/Fail2ban state proven)"
+            else
+                SSH_PORT_MIGRATION_STATUS="FAILED/ROLLBACK-FAILED (${reason}; previous dual-port state could not be proven)"
+                restore_ok=0
+            fi
+            ;;
+        *) SSH_PORT_MIGRATION_STATUS="FAILED/ROLLBACK-FAILED (unknown rollback target)"; restore_ok=0 ;;
+    esac
+    if ! write_ssh_port_migration_report rollback "$SSH_PORT_MIGRATION_STATUS"; then
+        restore_ok=0
+        SSH_PORT_MIGRATION_STATUS="FAILED/ROLLBACK-FAILED (${reason}; restored state could not be reported)"
+    fi
     log ROLLBACK "$SSH_PORT_MIGRATION_STATUS"
+    [[ "$restore_ok" -eq 1 ]]
 }
 
 stage_ssh_port_migration() {
@@ -3570,7 +3711,7 @@ stage_ssh_port_migration() {
         return 1
     fi
     if ! install_managed_file "$migration_config" 0600 < "$stage"; then
-        rm -f -- "$stage"; rollback_ssh_port_stage "$old_port" "could not install dual-port SSH configuration"; return 1
+        rm -f -- "$stage"; rollback_ssh_port_migration stage "$old_port" "$new_port" "could not install dual-port SSH configuration" || log ERROR "SSH stage rollback proof failed"; return 1
     fi
     rm -f -- "$stage"
     if ! "$SSHD_BIN" -t \
@@ -3578,17 +3719,17 @@ stage_ssh_port_migration() {
         || ! systemctl is-active --quiet "$SSH_SERVICE" \
         || ! ssh_port_is_listening "$old_port" \
         || ! ssh_port_is_listening "$new_port"; then
-        rollback_ssh_port_stage "$old_port" "firewall, sshd validation, reload, or dual-listener verification failed"
+        rollback_ssh_port_migration stage "$old_port" "$new_port" "firewall, sshd validation, reload, or dual-listener verification failed" || log ERROR "SSH stage rollback proof failed"
         return 1
     fi
     SSH_PORT_MIGRATION_RELOADED=1
     if ! configure_fail2ban || [[ "$FAIL2BAN_STATUS" != OK* ]]; then
-        rollback_ssh_port_stage "$old_port" "Fail2ban did not validate the dual-port policy"
+        rollback_ssh_port_migration stage "$old_port" "$new_port" "Fail2ban did not validate the dual-port policy" || log ERROR "SSH stage rollback proof failed"
         return 1
     fi
     SSH_PORT_MIGRATION_STATUS="STAGED (${old_port}->${new_port}; awaiting explicit confirmation)"
     if ! write_ssh_port_migration_state staged "$old_port" "$new_port"; then
-        rollback_ssh_port_stage "$old_port" "could not persist root-only staged migration state"
+        rollback_ssh_port_migration stage "$old_port" "$new_port" "could not persist root-only staged migration state" || log ERROR "SSH stage rollback proof failed"
         return 1
     fi
     write_ssh_port_migration_report stage "new firewall rule was active before SSH reload; old and new listeners verified; Fail2ban covers both ports" || true
@@ -3625,13 +3766,13 @@ retire_ssh_port_migration() {
     stage="$(mktemp)" || return 1
     printf '# Managed by harden.sh: completed SSH port migration\nPort %s\n' "$new_port" > "$stage"
     if ! install_managed_file "$migration_config" 0600 < "$stage"; then
-        rm -f -- "$stage"; rollback_ssh_port_stage "$old_port" "could not stage final SSH port configuration"; return 1
+        rm -f -- "$stage"; rollback_ssh_port_migration retire "$old_port" "$new_port" "could not stage final SSH port configuration" || log ERROR "SSH retire rollback proof failed"; return 1
     fi
     rm -f -- "$stage"
     if ! "$SSHD_BIN" -t || ssh_effective_port_present "$old_port" || ! ssh_effective_port_present "$new_port" \
         || ! run_streamed systemctl reload "$SSH_SERVICE" || ! ssh_port_is_listening "$new_port" \
         || ssh_port_is_listening "$old_port"; then
-        rollback_ssh_port_stage "$old_port" "final SSH configuration or listener verification failed"
+        rollback_ssh_port_migration retire "$old_port" "$new_port" "final SSH configuration or listener verification failed" || log ERROR "SSH retire rollback proof failed"
         return 1
     fi
     SSH_PORT="$new_port"
@@ -3640,13 +3781,13 @@ retire_ssh_port_migration() {
     SSH_PORT_MIGRATION_RELOADED=1
     if ! configure_fail2ban || [[ "$FAIL2BAN_STATUS" != OK* ]] || ! configure_firewall; then
         SSH_PORT="$old_port"; SSH_STAGED_OLD_PORT="$old_port"; SSH_STAGED_NEW_PORT="$new_port"
-        rollback_ssh_port_stage "$old_port" "Fail2ban or final firewall retirement failed"
+        rollback_ssh_port_migration retire "$old_port" "$new_port" "Fail2ban or final firewall retirement failed" || log ERROR "SSH retire rollback proof failed"
         return 1
     fi
     SSH_PORT_MIGRATION_STATUS="RETIRED (${old_port}->${new_port})"
     if ! write_ssh_port_migration_state retired "$old_port" "$new_port"; then
         SSH_PORT="$old_port"; SSH_STAGED_OLD_PORT="$old_port"; SSH_STAGED_NEW_PORT="$new_port"
-        rollback_ssh_port_stage "$old_port" "could not persist final root-only migration state"
+        rollback_ssh_port_migration retire "$old_port" "$new_port" "could not persist final root-only migration state" || log ERROR "SSH retire rollback proof failed"
         return 1
     fi
     write_ssh_port_migration_report retire "new listener, SSH health, Fail2ban and final owned firewall policy verified before old port retirement" || true
@@ -3655,11 +3796,36 @@ retire_ssh_port_migration() {
 }
 
 manage_ssh_port_migration() {
+    if [[ "$SSH_PORT_MIGRATION_STATE_UNSAFE" -eq 1 ]]; then
+        if [[ -n "$SSH_PORT_REQUEST" || "$SSH_PORT_RETIRE" -eq 1 ]]; then
+            log ERROR "SSH port migration state is inconsistent; refusing requested port/firewall/Fail2ban mutation"
+            return 1
+        fi
+        log WARN "SSH port migration state is inconsistent; retaining the currently detected functional SSH port without migration"
+        return 0
+    fi
     if [[ -n "$SSH_STAGED_NEW_PORT" ]]; then
         if [[ -n "$SSH_PORT_REQUEST" && "$SSH_PORT_REQUEST" != "$SSH_STAGED_NEW_PORT" ]]; then
             die "A migration to ${SSH_STAGED_NEW_PORT} is already staged; explicitly retire or roll it back before selecting another port"
         fi
+        if [[ -n "$SSH_PORT_REQUEST" && "$SSH_PORT_REQUEST" == "$SSH_STAGED_NEW_PORT" && "$SSH_PORT_RETIRE" -eq 0 ]]; then
+            log INFO "SSH port migration ${SSH_STAGED_OLD_PORT}->${SSH_STAGED_NEW_PORT} is already staged; no cutover was requested"
+            return 0
+        fi
         retire_ssh_port_migration
+    elif [[ "$SSH_PORT_MIGRATION_STATE_STATUS" == retired ]]; then
+        if [[ "$SSH_PORT_RETIRE" -eq 1 ]]; then
+            log INFO "SSH port migration is already retired on port ${SSH_PORT}; no further retirement is needed"
+            return 0
+        fi
+        if [[ -n "$SSH_PORT_REQUEST" ]]; then
+            if [[ "$SSH_PORT_REQUEST" == "$SSH_PORT" ]]; then
+                log INFO "SSH port ${SSH_PORT} is already the final retired migration port; no mutation is needed"
+                return 0
+            fi
+            die "SSH migration is already retired on port ${SSH_PORT}; refusing a different requested port without manual review"
+        fi
+        return 0
     elif [[ "$SSH_PORT_RETIRE" -eq 1 ]]; then
         die "--retire-ssh-port requires a valid previously staged root-only migration state"
     else
