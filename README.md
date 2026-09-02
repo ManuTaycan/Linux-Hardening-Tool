@@ -141,7 +141,7 @@ sudo ./harden.sh --apply --aggressive
 sudo ./harden.sh --apply --aggressive --disable-ipv6
 
 # Optional, staged SSH port migration; the old port remains active:
-sudo ./harden.sh --apply --aggressive --ssh-port 52022
+sudo ./harden.sh --apply --aggressive --ssh-port 2222
 
 # Only after proving a new SSH session on the staged port:
 sudo ./harden.sh --apply --aggressive --non-interactive --retire-ssh-port

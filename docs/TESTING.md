@@ -86,7 +86,6 @@ sudo cat /root/kernel-module-lockdown-report.txt
 iptables -t nat -S POSTROUTING
 ip6tables -t nat -S POSTROUTING
 tailscale status
-tailscale status --json | jq '{BackendState,Health}'
 tailscale ping <TAILSCALE-PEER>
 nft list table inet hardening_filter
 systemctl --failed --no-pager
@@ -105,17 +104,17 @@ port until a separately proven new connection exists.
 
 ~~~bash
 # Inspect the plan first.
-sudo ./harden.sh --dry-run --aggressive --ssh-port 52022
+sudo ./harden.sh --dry-run --aggressive --ssh-port 2222
 
 # Stage: firewall first, then dual listeners and Fail2ban coverage.
-sudo ./harden.sh --apply --aggressive --ssh-port 52022
+sudo ./harden.sh --apply --aggressive --ssh-port 2222
 ss -H -ltn
 sudo cat /root/ssh-port-migration-report.txt
 sudo cat /root/ssh-port-migration-state.conf
 ~~~
 
 Stop here. From a separate terminal, establish and verify a real new SSH session
-on port 52022. Only then may the old port be retired:
+on port 2222. Only then may the old port be retired:
 
 ~~~bash
 sudo ./harden.sh --apply --aggressive --non-interactive --retire-ssh-port

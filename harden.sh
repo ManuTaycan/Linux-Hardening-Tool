@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Debian/Ubuntu server hardening driven by the supplied Lynis 3.1.6 report.
-# Source system: Ubuntu 26.04.1, kernel 7.0.0, x86_64; last validated Lynis index 86/100.
+# Source system: Ubuntu 26.04.1, kernel 7.0.0, x86_64.
 #
 # Usage:
 #   ./harden.sh --dry-run
@@ -1194,7 +1194,7 @@ ask_remote_logging() {
     prompt_value "Port [${REMOTE_LOG_PORT:-514}]: " "${REMOTE_LOG_PORT:-514}" \
         || die "Could not read the remote log port from /dev/tty"
     REMOTE_LOG_PORT="$PROMPT_REPLY"
-    prompt_value "Protokoll [${REMOTE_LOG_PROTOCOL:-tcp}] (tcp/udp/tls): " "${REMOTE_LOG_PROTOCOL:-tcp}" \
+    prompt_value "Protocol [${REMOTE_LOG_PROTOCOL:-tcp}] (tcp/udp/tls): " "${REMOTE_LOG_PROTOCOL:-tcp}" \
         || die "Could not read the remote log protocol from /dev/tty"
     REMOTE_LOG_PROTOCOL="$PROMPT_REPLY"
     validate_remote_logging
