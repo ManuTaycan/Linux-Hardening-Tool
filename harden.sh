@@ -404,14 +404,20 @@ package_lock_sleep() {
     sleep "$1"
 }
 
+package_lock_now() {
+    printf '%s\n' "$SECONDS"
+}
+
 package_command_lock_aware() {
     local output_mode="$1" label="$2"
     shift 2
     local wait_seconds="${HARDEN_APT_LOCK_WAIT_SECONDS:-300}"
     local retry_seconds="${HARDEN_APT_LOCK_RETRY_SECONDS:-3}"
     local max_attempts="${HARDEN_APT_LOCK_MAX_ATTEMPTS:-102}"
-    local started_at deadline attempt=0 status=0 temporary="" owner_summary="" remaining=0 delay=0
-    local -a pipeline_status=()
+    local native_timeout="${HARDEN_APT_NATIVE_LOCK_TIMEOUT:-30}"
+    local started_at deadline now attempt=0 status=0 temporary="" owner_summary="" remaining=0 delay=0
+    local attempt_native_timeout=0
+    local -a pipeline_status=() command_args=()
     PACKAGE_COMMAND_OUTPUT=""
     PACKAGE_COMMAND_ERROR_CLASS="none"
     PACKAGE_COMMAND_LOCK_STATUS="not-contended"
@@ -422,21 +428,35 @@ package_command_lock_aware() {
         log ERROR "Invalid package lock wait settings: wait=${wait_seconds}, retry=${retry_seconds}, attempts=${max_attempts}"
         return 2
     fi
+    if [[ "${1:-}" == apt-get && ! "$native_timeout" =~ ^[0-9]+$ ]]; then
+        PACKAGE_COMMAND_ERROR_CLASS="invalid-lock-wait-configuration"
+        log ERROR "Invalid native APT lock timeout: ${native_timeout}"
+        return 2
+    fi
     if [[ "$MODE" == "dry-run" ]]; then
         PACKAGE_COMMAND_ERROR_CLASS="not-run"
         PACKAGE_COMMAND_LOCK_STATUS="dry-run-no-wait"
         log INFO "Would run package operation without waiting or changing lock state: ${label}"
         return 0
     fi
-    started_at="$SECONDS"
+    started_at="$(package_lock_now)"
     deadline=$((started_at + wait_seconds))
     while true; do
         attempt=$((attempt + 1))
+        now="$(package_lock_now)"
+        remaining=$((deadline - now))
+        ((remaining >= 0)) || remaining=0
+        command_args=("$@")
+        if [[ "${command_args[0]:-}" == apt-get ]]; then
+            attempt_native_timeout="$native_timeout"
+            ((attempt_native_timeout <= remaining)) || attempt_native_timeout="$remaining"
+            command_args+=(-o "DPkg::Lock::Timeout=${attempt_native_timeout}")
+        fi
         temporary="$(mktemp)" || return 1
         pipeline_status=()
         if [[ "$output_mode" == streamed ]]; then
             {
-                "$@" 2>&1 | tee "$temporary" | emit_block
+                LC_ALL=C "${command_args[@]}" 2>&1 | tee "$temporary" | emit_block
                 pipeline_status=("${PIPESTATUS[@]}")
             } || :
             status="${pipeline_status[0]:-1}"
@@ -444,7 +464,7 @@ package_command_lock_aware() {
                 [[ "$status" -ne 0 ]] || status=1
             fi
         else
-            if "$@" > "$temporary" 2>&1; then status=0; else status=$?; fi
+            if LC_ALL=C "${command_args[@]}" > "$temporary" 2>&1; then status=0; else status=$?; fi
         fi
         PACKAGE_COMMAND_OUTPUT="$(<"$temporary")"
         rm -f -- "$temporary"
@@ -475,14 +495,15 @@ package_command_lock_aware() {
         else
             log WARN "Package lock owner could not be identified reliably"
         fi
-        if ((wait_seconds == 0 || SECONDS >= deadline || attempt >= max_attempts)); then
+        now="$(package_lock_now)"
+        if ((wait_seconds == 0 || now >= deadline || attempt >= max_attempts)); then
             PACKAGE_COMMAND_ERROR_CLASS="lock-wait-expired"
             PACKAGE_COMMAND_LOCK_STATUS="expired"
             [[ "$output_mode" == streamed || -z "$PACKAGE_COMMAND_OUTPUT" ]] || emit_block <<< "$PACKAGE_COMMAND_OUTPUT"
             log ERROR "Package lock wait expired during ${label} after ${attempt} attempts (limit ${wait_seconds}s); the active package process was left untouched"
             return 75
         fi
-        remaining=$((deadline - SECONDS))
+        remaining=$((deadline - now))
         delay="$retry_seconds"
         ((delay <= remaining)) || delay="$remaining"
         ((delay > 0)) || delay=1
@@ -493,18 +514,7 @@ package_command_lock_aware() {
 package_apt_command() {
     local output_mode="$1" label="$2"
     shift 2
-    local native_timeout="${HARDEN_APT_NATIVE_LOCK_TIMEOUT:-30}"
-    local wait_seconds="${HARDEN_APT_LOCK_WAIT_SECONDS:-300}"
-    if [[ ! "$native_timeout" =~ ^[0-9]+$ ]]; then
-        PACKAGE_COMMAND_ERROR_CLASS="invalid-lock-wait-configuration"
-        log ERROR "Invalid native APT lock timeout: ${native_timeout}"
-        return 2
-    fi
-    if [[ "$wait_seconds" =~ ^[0-9]+$ && "$native_timeout" -gt "$wait_seconds" ]]; then
-        native_timeout="$wait_seconds"
-    fi
-    package_command_lock_aware "$output_mode" "$label" \
-        apt-get "$@" -o "DPkg::Lock::Timeout=${native_timeout}"
+    package_command_lock_aware "$output_mode" "$label" apt-get "$@"
 }
 
 package_apt_streamed() {

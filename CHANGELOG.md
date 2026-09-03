@@ -30,10 +30,12 @@ release tag or GitHub Release is created by this file.
 - Ordered Phase 03 as APT metadata refresh, controlled no-removal upgrade, then
   hardening/security package preparation. Upgrade simulation is locale-stable,
   blocks removals and downgrades, and records reboot state.
-- Made package operations lock-aware at the command boundary. APT uses its
-  native lock timeout plus bounded delayed retries for confirmed contention,
-  reports reliable owner evidence when available, and leaves package processes
-  and lock files untouched; non-lock package errors still fail immediately.
+- Made package operations lock-aware at the command boundary. Locale-stable
+  APT output drives classification; each native lock timeout is capped by the
+  remaining total wait budget, followed by bounded delayed retries only for
+  confirmed contention. Reliable owner evidence is reported when available,
+  package processes and lock files remain untouched, and non-lock errors fail
+  immediately.
 - Validated AIDE against the actual distribution runtime configuration without
   requiring update-aide.conf. The baseline is atomically activated, the real
   check-service context is proven, and the timer is enabled only after success.

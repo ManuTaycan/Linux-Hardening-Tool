@@ -1092,7 +1092,7 @@ run_package_lock_tests() {
 count="$(cat "$LOCK_TEST_COUNT" 2>/dev/null || printf 0)"
 count=$((count + 1))
 printf '%s\n' "$count" > "$LOCK_TEST_COUNT"
-printf '%s\n' "$*" >> "$LOCK_TEST_COMMAND_LOG"
+printf 'locale=%s args=%s\n' "${LC_ALL:-unset}" "$*" >> "$LOCK_TEST_COMMAND_LOG"
 case "${LOCK_TEST_CASE:-success}" in
     temporary)
         if [[ "$count" -eq 1 ]]; then
@@ -1107,6 +1107,9 @@ case "${LOCK_TEST_CASE:-success}" in
     dependency-error)
         printf 'E: Unmet dependencies. Try apt --fix-broken install.\n' >&2
         exit 100
+        ;;
+    success-over-budget)
+        printf '999\n' > "$LOCK_TEST_TIME"
         ;;
     success) ;;
     *) exit 91 ;;
@@ -1135,6 +1138,7 @@ EOF
                 [[ "$(cat "$LOCK_TEST_COUNT")" == 2 ]]
                 kill -0 "$LOCK_TEST_OWNER_PID"
                 grep -Fq "pid=$LOCK_TEST_OWNER_PID" "$LOCK_TEST_LOG"
+                grep -Fq "locale=C " "$LOCK_TEST_COMMAND_LOG"
                 grep -Fq "DPkg::Lock::Timeout=0" "$LOCK_TEST_COMMAND_LOG"
             ' _ "$repo_root"
     ) || fail "temporary package lock did not retry safely or preserve its owner"
@@ -1163,6 +1167,43 @@ EOF
                 grep -Fq "Package lock wait expired" "$LOCK_TEST_LOG"
             ' _ "$repo_root"
     ) || fail "persistent package lock did not return an explicit expiry"
+
+    : > "$count_file"; : > "$command_log"; : > "$log_file"
+    printf '100\n' > "$case_root/time"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 LOCK_TEST_CASE=persistent \
+        LOCK_TEST_OWNER_PID=0 LOCK_TEST_COUNT="$count_file" LOCK_TEST_COMMAND_LOG="$command_log" \
+        LOCK_TEST_LOG="$log_file" LOCK_TEST_TIME="$case_root/time" \
+        HARDEN_APT_LOCK_WAIT_SECONDS=5 HARDEN_APT_LOCK_RETRY_SECONDS=3 \
+        HARDEN_APT_LOCK_MAX_ATTEMPTS=10 HARDEN_APT_NATIVE_LOCK_TIMEOUT=30 bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply
+            log() { :; }; emit_block() { cat >/dev/null; }
+            package_lock_now() { cat "$LOCK_TEST_TIME"; }
+            package_lock_sleep() {
+                now="$(cat "$LOCK_TEST_TIME")"
+                printf "%s\n" "$((now + $1))" > "$LOCK_TEST_TIME"
+            }
+            if package_apt_capture "remaining lock budget regression" check; then exit 1; else status=$?; fi
+            [[ "$status" -eq 75 && "$PACKAGE_COMMAND_ERROR_CLASS" == lock-wait-expired ]]
+            [[ "$(cat "$LOCK_TEST_COUNT")" == 3 ]]
+            sed -n "1p" "$LOCK_TEST_COMMAND_LOG" | grep -Fq "DPkg::Lock::Timeout=5"
+            sed -n "2p" "$LOCK_TEST_COMMAND_LOG" | grep -Fq "DPkg::Lock::Timeout=2"
+            sed -n "3p" "$LOCK_TEST_COMMAND_LOG" | grep -Fq "DPkg::Lock::Timeout=0"
+        ' _ "$repo_root" || fail "native APT lock timeout did not track the remaining total wait budget"
+
+    : > "$count_file"; : > "$command_log"; : > "$log_file"
+    printf '100\n' > "$case_root/time"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 LOCK_TEST_CASE=success-over-budget \
+        LOCK_TEST_OWNER_PID=0 LOCK_TEST_COUNT="$count_file" LOCK_TEST_COMMAND_LOG="$command_log" \
+        LOCK_TEST_LOG="$log_file" LOCK_TEST_TIME="$case_root/time" \
+        HARDEN_APT_LOCK_WAIT_SECONDS=5 HARDEN_APT_NATIVE_LOCK_TIMEOUT=30 bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; log() { :; }; emit_block() { cat >/dev/null; }
+            package_lock_now() { cat "$LOCK_TEST_TIME"; }
+            package_apt_capture "successful long package operation" check
+            [[ "$PACKAGE_COMMAND_ERROR_CLASS" == none ]]
+            grep -Fq "DPkg::Lock::Timeout=5" "$LOCK_TEST_COMMAND_LOG"
+        ' _ "$repo_root" || fail "successful package execution was incorrectly capped by the lock-wait budget"
 
     : > "$count_file"; : > "$command_log"; : > "$log_file"
     env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 LOCK_TEST_CASE=dependency-error \
