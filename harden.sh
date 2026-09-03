@@ -85,6 +85,10 @@ AIDE_STATUS="NOT RUN"
 FAIL2BAN_STATUS="NOT RUN"
 UPDATES_STATUS="NOT RUN"
 PACKAGE_UPGRADE_STATUS="NOT RUN"
+PACKAGE_COMMAND_OUTPUT=""
+PACKAGE_COMMAND_ERROR_CLASS="none"
+PACKAGE_COMMAND_LOCK_STATUS="not-contended"
+PACKAGE_COMMAND_EXIT_STATUS=0
 NEEDRESTART_STATUS="NOT RUN"
 NEEDRESTART_REPORT="${HARDEN_NEEDRESTART_REPORT:-/root/needrestart-pending-report.txt}"
 RESIDUAL_PURGE_STATUS="NOT RUN"
@@ -357,6 +361,178 @@ run_streamed() {
     "$@" 2>&1 | emit_block
     pipeline_status=("${PIPESTATUS[@]}")
     [[ "${pipeline_status[0]}" -eq 0 && "${pipeline_status[1]}" -eq 0 ]]
+}
+
+package_lock_contention_output() {
+    local output="$1"
+    grep -Eqi \
+        'Could not get lock|Unable to acquire the .* lock|Unable to lock (the )?directory|Waiting for cache lock|frontend lock.*locked by another process|lock.*held by process|another process.*(apt|dpkg).*lock' \
+        <<< "$output"
+}
+
+package_lock_owner_summary() {
+    local output="$1" pid process path
+    local -a lock_paths=(
+        /var/lib/dpkg/lock-frontend
+        /var/lib/dpkg/lock
+        /var/lib/apt/lists/lock
+        /var/cache/apt/archives/lock
+    )
+    declare -A seen=()
+    while IFS= read -r pid; do
+        [[ "$pid" =~ ^[0-9]+$ && -z "${seen[$pid]+seen}" ]] || continue
+        seen["$pid"]=1
+        process="unknown"
+        [[ -r "/proc/${pid}/comm" ]] && IFS= read -r process < "/proc/${pid}/comm"
+        printf 'pid=%s process=%s source=package-manager-output\n' "$pid" "${process:-unknown}"
+    done < <(grep -Eio '(held by process|with pid)[[:space:]]+[0-9]+' <<< "$output" \
+        | grep -Eo '[0-9]+' | sort -u || true)
+    command -v fuser >/dev/null 2>&1 || return 0
+    for path in "${lock_paths[@]}"; do
+        [[ -e "$path" ]] || continue
+        while IFS= read -r pid; do
+            [[ "$pid" =~ ^[0-9]+$ && -z "${seen[$pid]+seen}" ]] || continue
+            seen["$pid"]=1
+            process="unknown"
+            [[ -r "/proc/${pid}/comm" ]] && IFS= read -r process < "/proc/${pid}/comm"
+            printf 'pid=%s process=%s lock=%s source=fuser\n' "$pid" "${process:-unknown}" "$path"
+        done < <(fuser "$path" 2>/dev/null | tr -cs '0-9' '\n' | sed '/^$/d' | sort -u || true)
+    done
+}
+
+package_lock_sleep() {
+    sleep "$1"
+}
+
+package_lock_now() {
+    printf '%s\n' "$SECONDS"
+}
+
+package_command_lock_aware() {
+    local output_mode="$1" label="$2"
+    shift 2
+    local wait_seconds="${HARDEN_APT_LOCK_WAIT_SECONDS:-300}"
+    local retry_seconds="${HARDEN_APT_LOCK_RETRY_SECONDS:-3}"
+    local max_attempts="${HARDEN_APT_LOCK_MAX_ATTEMPTS:-102}"
+    local native_timeout="${HARDEN_APT_NATIVE_LOCK_TIMEOUT:-30}"
+    local started_at deadline now attempt=0 status=0 temporary="" owner_summary="" remaining=0 delay=0
+    local attempt_native_timeout=0
+    local -a pipeline_status=() command_args=()
+    PACKAGE_COMMAND_OUTPUT=""
+    PACKAGE_COMMAND_ERROR_CLASS="none"
+    PACKAGE_COMMAND_LOCK_STATUS="not-contended"
+    PACKAGE_COMMAND_EXIT_STATUS=0
+    if [[ ! "$wait_seconds" =~ ^[0-9]+$ || ! "$retry_seconds" =~ ^[1-9][0-9]*$ \
+        || ! "$max_attempts" =~ ^[1-9][0-9]*$ ]]; then
+        PACKAGE_COMMAND_ERROR_CLASS="invalid-lock-wait-configuration"
+        log ERROR "Invalid package lock wait settings: wait=${wait_seconds}, retry=${retry_seconds}, attempts=${max_attempts}"
+        return 2
+    fi
+    if [[ "${1:-}" == apt-get && ! "$native_timeout" =~ ^[0-9]+$ ]]; then
+        PACKAGE_COMMAND_ERROR_CLASS="invalid-lock-wait-configuration"
+        log ERROR "Invalid native APT lock timeout: ${native_timeout}"
+        return 2
+    fi
+    if [[ "$MODE" == "dry-run" ]]; then
+        PACKAGE_COMMAND_ERROR_CLASS="not-run"
+        PACKAGE_COMMAND_LOCK_STATUS="dry-run-no-wait"
+        log INFO "Would run package operation without waiting or changing lock state: ${label}"
+        return 0
+    fi
+    started_at="$(package_lock_now)"
+    deadline=$((started_at + wait_seconds))
+    while true; do
+        attempt=$((attempt + 1))
+        now="$(package_lock_now)"
+        remaining=$((deadline - now))
+        ((remaining >= 0)) || remaining=0
+        command_args=("$@")
+        if [[ "${command_args[0]:-}" == apt-get ]]; then
+            attempt_native_timeout="$native_timeout"
+            ((attempt_native_timeout <= remaining)) || attempt_native_timeout="$remaining"
+            command_args+=(-o "DPkg::Lock::Timeout=${attempt_native_timeout}")
+        fi
+        temporary="$(mktemp)" || return 1
+        pipeline_status=()
+        if [[ "$output_mode" == streamed ]]; then
+            {
+                LC_ALL=C "${command_args[@]}" 2>&1 | tee "$temporary" | emit_block
+                pipeline_status=("${PIPESTATUS[@]}")
+            } || :
+            status="${pipeline_status[0]:-1}"
+            if [[ "${pipeline_status[1]:-0}" -ne 0 || "${pipeline_status[2]:-0}" -ne 0 ]]; then
+                [[ "$status" -ne 0 ]] || status=1
+            fi
+        else
+            if LC_ALL=C "${command_args[@]}" > "$temporary" 2>&1; then status=0; else status=$?; fi
+        fi
+        PACKAGE_COMMAND_OUTPUT="$(<"$temporary")"
+        rm -f -- "$temporary"
+        PACKAGE_COMMAND_EXIT_STATUS="$status"
+        if [[ "$status" -eq 0 ]]; then
+            if package_lock_contention_output "$PACKAGE_COMMAND_OUTPUT"; then
+                PACKAGE_COMMAND_LOCK_STATUS="waited-then-succeeded"
+                log INFO "Package lock contention cleared and ${label} completed successfully"
+            elif ((attempt > 1)); then
+                PACKAGE_COMMAND_LOCK_STATUS="retried-then-succeeded"
+                log INFO "Package lock contention cleared after ${attempt} attempts; ${label} completed successfully"
+            fi
+            PACKAGE_COMMAND_ERROR_CLASS="none"
+            return 0
+        fi
+        if ! package_lock_contention_output "$PACKAGE_COMMAND_OUTPUT"; then
+            PACKAGE_COMMAND_ERROR_CLASS="package-command-error"
+            [[ "$output_mode" == streamed || -z "$PACKAGE_COMMAND_OUTPUT" ]] || emit_block <<< "$PACKAGE_COMMAND_OUTPUT"
+            log ERROR "${label} failed with exit ${status} for a non-lock APT/dpkg error"
+            return "$status"
+        fi
+        PACKAGE_COMMAND_ERROR_CLASS="temporary-lock-contention"
+        PACKAGE_COMMAND_LOCK_STATUS="waiting"
+        owner_summary="$(package_lock_owner_summary "$PACKAGE_COMMAND_OUTPUT")"
+        log WARN "Temporary package-manager lock contention during ${label} (attempt ${attempt}); waiting without killing a process or deleting a lock file"
+        if [[ -n "$owner_summary" ]]; then
+            log WARN "Package lock owner evidence: ${owner_summary//$'\n'/; }"
+        else
+            log WARN "Package lock owner could not be identified reliably"
+        fi
+        now="$(package_lock_now)"
+        if ((wait_seconds == 0 || now >= deadline || attempt >= max_attempts)); then
+            PACKAGE_COMMAND_ERROR_CLASS="lock-wait-expired"
+            PACKAGE_COMMAND_LOCK_STATUS="expired"
+            [[ "$output_mode" == streamed || -z "$PACKAGE_COMMAND_OUTPUT" ]] || emit_block <<< "$PACKAGE_COMMAND_OUTPUT"
+            log ERROR "Package lock wait expired during ${label} after ${attempt} attempts (limit ${wait_seconds}s); the active package process was left untouched"
+            return 75
+        fi
+        remaining=$((deadline - now))
+        delay="$retry_seconds"
+        ((delay <= remaining)) || delay="$remaining"
+        ((delay > 0)) || delay=1
+        package_lock_sleep "$delay"
+    done
+}
+
+package_apt_command() {
+    local output_mode="$1" label="$2"
+    shift 2
+    package_command_lock_aware "$output_mode" "$label" apt-get "$@"
+}
+
+package_apt_streamed() {
+    local label="$1"
+    shift
+    package_apt_command streamed "$label" "$@"
+}
+
+package_apt_capture() {
+    local label="$1"
+    shift
+    package_apt_command capture "$label" "$@"
+}
+
+package_unattended_capture() {
+    local label="$1"
+    shift
+    package_command_lock_aware capture "$label" unattended-upgrade "$@"
 }
 
 record_change() {
@@ -668,7 +844,8 @@ install_package() {
         log INFO "Would install available package: ${package}"
         return 0
     fi
-    if run_streamed env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$package"; then
+    if DEBIAN_FRONTEND=noninteractive package_apt_streamed "install package ${package}" \
+        install -y --no-install-recommends "$package"; then
         PACKAGES_INSTALLED+=("$package")
         record_change "Installed package ${package}"
         return 0
@@ -680,7 +857,7 @@ install_package() {
 refresh_apt_metadata() {
     if [[ "$MODE" == "apply" ]]; then
         log INFO "Refreshing APT metadata from configured repositories"
-        run_streamed env DEBIAN_FRONTEND=noninteractive apt-get update
+        DEBIAN_FRONTEND=noninteractive package_apt_streamed "APT metadata refresh" update
     else
         log INFO "Would run apt-get update"
     fi
@@ -733,7 +910,7 @@ EOF
         if [[ "$suspicious" -eq 1 ]]; then
             record_skip "APT repositories" "trusted=yes or allow-insecure=yes found; source was not silently rewritten"
         fi
-        run_streamed apt-get check
+        package_apt_streamed "APT configuration validation" check
     fi
 }
 
@@ -763,7 +940,7 @@ EOF
         run systemctl enable --now apt-daily.timer apt-daily-upgrade.timer || true
     fi
     if [[ "$MODE" == "apply" ]] && command -v unattended-upgrade >/dev/null 2>&1; then
-        if unattended-upgrade --dry-run --debug >/dev/null 2>&1; then
+        if package_unattended_capture "unattended-upgrades configuration validation" --dry-run --debug; then
             UPDATES_STATUS="OK"
         else
             UPDATES_STATUS="FAILED"
@@ -834,16 +1011,18 @@ upgrade_packages_safely() {
         log INFO "Would simulate/apply conservative apt-get upgrade without removals or downgrades"
         return 0
     fi
-    if ! run_streamed apt-get check; then
+    if ! package_apt_streamed "pre-upgrade APT dependency check" check; then
         PACKAGE_UPGRADE_STATUS="FAILED (APT check before upgrade)"
         record_skip "PKGS-7392" "apt-get check failed before the controlled upgrade; no package was changed"
         return 1
     fi
-    simulation="$(LC_ALL=C apt-get -s --no-remove upgrade 2>&1)" || {
+    if LC_ALL=C package_apt_capture "conservative upgrade simulation" -s --no-remove upgrade; then
+        simulation="$PACKAGE_COMMAND_OUTPUT"
+    else
         PACKAGE_UPGRADE_STATUS="FAILED (upgrade simulation)"
-        record_skip "PKGS-7392" "apt-get --no-remove upgrade simulation failed; no package was changed"
+        record_skip "PKGS-7392" "apt-get --no-remove upgrade simulation failed (${PACKAGE_COMMAND_ERROR_CLASS}); no package was changed"
         return 1
-    }
+    fi
     removals="$(awk '$1 == "Remv" || $1 == "Purg" {print $2}' <<<"$simulation")"
     if [[ -n "$removals" ]] || grep -Eqi 'downgrad(e|ing)|DOWNGRADED' <<<"$simulation"; then
         PACKAGE_UPGRADE_STATUS="BLOCKED (simulation proposed removal or downgrade)"
@@ -856,13 +1035,14 @@ upgrade_packages_safely() {
         log INFO "APT upgrade simulation reports no upgradeable packages"
         return 0
     fi
-    if ! run_streamed env NEEDRESTART_MODE=l DEBIAN_FRONTEND=noninteractive apt-get -y --no-remove \
+    if ! NEEDRESTART_MODE=l DEBIAN_FRONTEND=noninteractive package_apt_streamed \
+        "conservative package upgrade" -y --no-remove \
         -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold upgrade; then
         PACKAGE_UPGRADE_STATUS="FAILED (apt-get upgrade)"
         record_skip "PKGS-7392" "conservative apt-get upgrade failed; inspect APT/dpkg output before retrying"
         return 1
     fi
-    if ! run_streamed apt-get check; then
+    if ! package_apt_streamed "post-upgrade APT dependency check" check; then
         PACKAGE_UPGRADE_STATUS="FAILED (APT check after upgrade)"
         record_skip "PKGS-7392" "apt-get check failed after upgrade; inspect APT/dpkg before further hardening"
         return 1
@@ -1073,11 +1253,13 @@ purge_removed_packages() {
         return 0
     fi
     for package in "${safe[@]}"; do requested["$package"]=1; done
-    simulation="$(LC_ALL=C apt-get -s purge "${safe[@]}" 2>&1)" || {
+    if LC_ALL=C package_apt_capture "residual configuration purge simulation" -s purge "${safe[@]}"; then
+        simulation="$PACKAGE_COMMAND_OUTPUT"
+    else
         RESIDUAL_PURGE_STATUS="REVIEW REQUIRED (APT simulation failed)"
-        record_skip "PKGS-7346" "APT simulation failed; nothing was purged"
+        record_skip "PKGS-7346" "APT simulation failed (${PACKAGE_COMMAND_ERROR_CLASS}); nothing was purged"
         return 0
-    }
+    fi
     removals="$(parse_apt_purge_packages <<<"$simulation")"
     mapfile -t simulated_removals <<<"$removals"
     for package in "${safe[@]}"; do
@@ -1103,7 +1285,8 @@ purge_removed_packages() {
         return 0
     }
     reboot_required_before="$REBOOT_REQUIRED"
-    if run_streamed env DEBIAN_FRONTEND=noninteractive apt-get purge -y "${safe[@]}"; then
+    if DEBIAN_FRONTEND=noninteractive package_apt_streamed "residual configuration purge" \
+        purge -y "${safe[@]}"; then
         PACKAGES_REMOVED+=("${safe[@]}")
         for package in "${safe[@]}"; do
             status="$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)"
@@ -1114,7 +1297,7 @@ purge_removed_packages() {
         for package in "${safe[@]}"; do
             if [[ "${package%%:*}" == grub-pc ]] && ! efi_grub_stack_is_valid; then validation_failed=1; fi
         done
-        if ! run_streamed apt-get check; then validation_failed=1; fi
+        if ! package_apt_streamed "post-residual-purge APT dependency check" check; then validation_failed=1; fi
         if ((validation_failed)); then
             RESIDUAL_PURGE_STATUS="FAILED/REVIEW REQUIRED (post-purge validation failed)"
             record_skip "PKGS-7346" "post-purge validation failed; review dpkg status, APT health, running kernel, /boot, and EFI GRUB state before treating residual configurations as resolved"
@@ -2309,8 +2492,10 @@ configure_binfmt_misc() {
                 || validation_failed="${name} interpreter validation failed"
             [[ -n "$validation_failed" ]] || python3 -c 'import sys; raise SystemExit(0)' >/dev/null 2>&1 \
                 || validation_failed="default python3 validation failed"
-            [[ -n "$validation_failed" ]] || LC_ALL=C apt-get check >/dev/null 2>&1 \
-                || validation_failed="apt-get check failed"
+            if [[ -z "$validation_failed" ]] \
+                && ! LC_ALL=C package_apt_capture "python binfmt APT dependency check" check; then
+                validation_failed="apt-get check failed (${PACKAGE_COMMAND_ERROR_CLASS})"
+            fi
             [[ -n "$validation_failed" ]] || run_streamed systemctl daemon-reload \
                 || validation_failed="systemctl daemon-reload failed"
             if [[ -z "$validation_failed" ]]; then
@@ -5363,19 +5548,21 @@ configure_headless_packagekit() {
         record_change "Verified PackageKit absent and removed stale service masks on headless ${OS_ID}"
         return 0
     fi
-    if ! apt-get check >/dev/null 2>&1; then
-        record_skip "PKGS-7394:PackageKit" "APT is not healthy before simulation; PackageKit was unmasked and retained"
+    if ! package_apt_capture "pre-PackageKit-removal APT dependency check" check; then
+        record_skip "PKGS-7394:PackageKit" "APT is not healthy before simulation (${PACKAGE_COMMAND_ERROR_CLASS}); PackageKit was unmasked and retained"
         return 0
     fi
     if command -v unattended-upgrade >/dev/null 2>&1 \
-        && ! unattended-upgrade --dry-run >/dev/null 2>&1; then
-        record_skip "PKGS-7394:PackageKit" "unattended-upgrades failed its pre-removal dry-run; PackageKit was unmasked and retained"
+        && ! package_unattended_capture "pre-PackageKit-removal unattended-upgrades validation" --dry-run; then
+        record_skip "PKGS-7394:PackageKit" "unattended-upgrades failed its pre-removal dry-run (${PACKAGE_COMMAND_ERROR_CLASS}); PackageKit was unmasked and retained"
         return 0
     fi
-    simulation="$(LC_ALL=C apt-get -s purge "${installed[@]}" 2>&1)" || {
-        record_skip "PKGS-7394:PackageKit" "APT purge simulation failed; PackageKit was unmasked and retained"
+    if LC_ALL=C package_apt_capture "PackageKit purge simulation" -s purge "${installed[@]}"; then
+        simulation="$PACKAGE_COMMAND_OUTPUT"
+    else
+        record_skip "PKGS-7394:PackageKit" "APT purge simulation failed (${PACKAGE_COMMAND_ERROR_CLASS}); PackageKit was unmasked and retained"
         return 0
-    }
+    fi
     mapfile -t removals < <(parse_apt_purge_packages <<<"$simulation")
     if ((${#removals[@]} == 0)); then
         record_skip "PKGS-7394:PackageKit" "APT simulation did not confirm a removable PackageKit package"
@@ -5390,19 +5577,20 @@ configure_headless_packagekit() {
         record_skip "PKGS-7394:PackageKit" "APT simulation would also purge dependency packages: ${dependency_reason}; PackageKit was unmasked and retained"
         return 0
     fi
-    if run_streamed env DEBIAN_FRONTEND=noninteractive apt-get purge -y "${installed[@]}"; then
+    if DEBIAN_FRONTEND=noninteractive package_apt_streamed "PackageKit purge" purge -y "${installed[@]}"; then
         PACKAGES_REMOVED+=("${installed[@]}")
     else
         record_skip "PKGS-7394:PackageKit" "simulated PackageKit purge failed; no service was masked"
         return 0
     fi
-    if ! run_streamed apt-get check; then
+    if ! package_apt_streamed "post-PackageKit-removal APT dependency check" check; then
         UPDATES_STATUS="FAILED"
         record_skip "PKGS-7394:PackageKit" "APT failed validation after PackageKit removal"
         return 0
     fi
     if command -v unattended-upgrade >/dev/null 2>&1 \
-        && ! run_streamed unattended-upgrade --dry-run; then
+        && ! package_command_lock_aware streamed "post-PackageKit-removal unattended-upgrades validation" \
+            unattended-upgrade --dry-run; then
         UPDATES_STATUS="FAILED"
         record_skip "PKGS-7394:PackageKit" "unattended-upgrades failed validation after PackageKit removal"
         return 0
@@ -6740,7 +6928,8 @@ restrict_compilers() {
     if [[ "$AGGRESSIVE" -eq 1 && ${#owner_packages[@]} -gt 0 ]]; then
         if [[ "$MODE" == "dry-run" ]]; then
             log INFO "Would simulate purge of Lynis-detected compiler owner packages: ${owner_packages[*]}"
-        elif simulation="$(LC_ALL=C apt-get -s purge "${owner_packages[@]}" 2>&1)"; then
+        elif LC_ALL=C package_apt_capture "compiler package purge simulation" -s purge "${owner_packages[@]}"; then
+            simulation="$PACKAGE_COMMAND_OUTPUT"
             mapfile -t removals < <(parse_apt_purge_packages <<<"$simulation")
             if dkms_is_in_use; then
                 unsafe_reason="active DKMS modules or installed *-dkms packages require the build toolchain"
@@ -6757,10 +6946,11 @@ restrict_compilers() {
                 unsafe_reason="APT simulation would also purge non-toolchain/dependent packages: ${unsafe_list}"
             fi
             if [[ -z "$unsafe_reason" && ${#removals[@]} -gt 0 ]] \
-                && run_streamed env DEBIAN_FRONTEND=noninteractive apt-get purge -y "${owner_packages[@]}"; then
+                && DEBIAN_FRONTEND=noninteractive package_apt_streamed "compiler package purge" \
+                    purge -y "${owner_packages[@]}"; then
                 PACKAGES_REMOVED+=("${owner_packages[@]}")
                 purge_completed=1
-                if run_streamed apt-get check; then
+                if package_apt_streamed "post-compiler-purge APT dependency check" check; then
                     record_change "Removed safely dispensable Lynis-detected compiler packages after APT dependency simulation: ${owner_packages[*]}"
                 else
                     unsafe_reason="toolchain packages were removed but post-purge APT validation failed"
@@ -6769,7 +6959,7 @@ restrict_compilers() {
                 unsafe_reason="simulated toolchain purge failed"
             fi
         else
-            unsafe_reason="APT simulation failed"
+            unsafe_reason="APT simulation failed (${PACKAGE_COMMAND_ERROR_CLASS})"
         fi
     fi
     if [[ -n "$unsafe_reason" ]]; then
@@ -7502,7 +7692,7 @@ run_validation() {
             findmnt --verify --tab-file /etc/fstab || true
         fi
         printf '%s\n' '=== apt-get check ==='
-        apt-get check
+        package_apt_streamed "final validation APT dependency check" check
         printf '%s\n' '=== systemd-analyze security summary ==='
         systemd-analyze security --no-pager || true
     } >> "$report" 2>&1

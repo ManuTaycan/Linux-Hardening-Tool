@@ -1083,6 +1083,178 @@ EOF
         ' _ "$repo_root" "$case_root" || fail "unsafe PackageKit dependency simulation was not blocked"
 }
 
+run_package_lock_tests() {
+    local case_root="$test_root/package-lock" mock_bin="$test_root/package-lock/bin"
+    local command_log="$case_root/commands.log" count_file="$case_root/count" log_file="$case_root/hardening.log"
+    install -d "$mock_bin"
+    cat > "$mock_bin/apt-get" <<'EOF'
+#!/usr/bin/env bash
+count="$(cat "$LOCK_TEST_COUNT" 2>/dev/null || printf 0)"
+count=$((count + 1))
+printf '%s\n' "$count" > "$LOCK_TEST_COUNT"
+printf 'locale=%s args=%s\n' "${LC_ALL:-unset}" "$*" >> "$LOCK_TEST_COMMAND_LOG"
+case "${LOCK_TEST_CASE:-success}" in
+    temporary)
+        if [[ "$count" -eq 1 ]]; then
+            printf 'E: Could not get lock /var/lib/dpkg/lock-frontend. It is held by process %s (unattended-upgr)\n' "$LOCK_TEST_OWNER_PID" >&2
+            exit 100
+        fi
+        ;;
+    persistent)
+        printf 'E: Could not get lock /var/lib/dpkg/lock-frontend. It is held by process %s (unattended-upgr)\n' "$LOCK_TEST_OWNER_PID" >&2
+        exit 100
+        ;;
+    dependency-error)
+        printf 'E: Unmet dependencies. Try apt --fix-broken install.\n' >&2
+        exit 100
+        ;;
+    success-over-budget)
+        printf '999\n' > "$LOCK_TEST_TIME"
+        ;;
+    success) ;;
+    *) exit 91 ;;
+esac
+EOF
+    chmod +x "$mock_bin/apt-get"
+
+    : > "$count_file"; : > "$command_log"; : > "$log_file"
+    (
+        sleep 60 &
+        owner_pid=$!
+        trap 'kill "$owner_pid" 2>/dev/null || true; wait "$owner_pid" 2>/dev/null || true' EXIT
+        env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 LOCK_TEST_CASE=temporary \
+            LOCK_TEST_OWNER_PID="$owner_pid" LOCK_TEST_COUNT="$count_file" \
+            LOCK_TEST_COMMAND_LOG="$command_log" LOCK_TEST_LOG="$log_file" \
+            HARDEN_APT_LOCK_WAIT_SECONDS=300 HARDEN_APT_LOCK_RETRY_SECONDS=1 \
+            HARDEN_APT_LOCK_MAX_ATTEMPTS=3 HARDEN_APT_NATIVE_LOCK_TIMEOUT=0 bash -c '
+                source "$1/harden.sh"; trap - ERR EXIT
+                MODE=apply
+                log() { printf "%s\n" "$*" >> "$LOCK_TEST_LOG"; }
+                emit_block() { cat >/dev/null; }
+                package_lock_sleep() { :; }
+                package_apt_capture "temporary lock regression" check
+                [[ "$PACKAGE_COMMAND_ERROR_CLASS" == none ]]
+                [[ "$PACKAGE_COMMAND_LOCK_STATUS" == retried-then-succeeded ]]
+                [[ "$(cat "$LOCK_TEST_COUNT")" == 2 ]]
+                kill -0 "$LOCK_TEST_OWNER_PID"
+                grep -Fq "pid=$LOCK_TEST_OWNER_PID" "$LOCK_TEST_LOG"
+                grep -Fq "locale=C " "$LOCK_TEST_COMMAND_LOG"
+                grep -Fq "DPkg::Lock::Timeout=0" "$LOCK_TEST_COMMAND_LOG"
+            ' _ "$repo_root"
+    ) || fail "temporary package lock did not retry safely or preserve its owner"
+
+    : > "$count_file"; : > "$command_log"; : > "$log_file"
+    (
+        sleep 60 &
+        owner_pid=$!
+        trap 'kill "$owner_pid" 2>/dev/null || true; wait "$owner_pid" 2>/dev/null || true' EXIT
+        env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 LOCK_TEST_CASE=persistent \
+            LOCK_TEST_OWNER_PID="$owner_pid" LOCK_TEST_COUNT="$count_file" \
+            LOCK_TEST_COMMAND_LOG="$command_log" LOCK_TEST_LOG="$log_file" \
+            HARDEN_APT_LOCK_WAIT_SECONDS=300 HARDEN_APT_LOCK_RETRY_SECONDS=1 \
+            HARDEN_APT_LOCK_MAX_ATTEMPTS=2 HARDEN_APT_NATIVE_LOCK_TIMEOUT=0 bash -c '
+                source "$1/harden.sh"; trap - ERR EXIT
+                MODE=apply
+                log() { printf "%s\n" "$*" >> "$LOCK_TEST_LOG"; }
+                emit_block() { cat >/dev/null; }
+                package_lock_sleep() { :; }
+                if package_apt_capture "persistent lock regression" check; then exit 1; else status=$?; fi
+                [[ "$status" -eq 75 ]]
+                [[ "$PACKAGE_COMMAND_ERROR_CLASS" == lock-wait-expired ]]
+                [[ "$PACKAGE_COMMAND_LOCK_STATUS" == expired ]]
+                [[ "$(cat "$LOCK_TEST_COUNT")" == 2 ]]
+                kill -0 "$LOCK_TEST_OWNER_PID"
+                grep -Fq "Package lock wait expired" "$LOCK_TEST_LOG"
+            ' _ "$repo_root"
+    ) || fail "persistent package lock did not return an explicit expiry"
+
+    : > "$count_file"; : > "$command_log"; : > "$log_file"
+    printf '100\n' > "$case_root/time"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 LOCK_TEST_CASE=persistent \
+        LOCK_TEST_OWNER_PID=0 LOCK_TEST_COUNT="$count_file" LOCK_TEST_COMMAND_LOG="$command_log" \
+        LOCK_TEST_LOG="$log_file" LOCK_TEST_TIME="$case_root/time" \
+        HARDEN_APT_LOCK_WAIT_SECONDS=5 HARDEN_APT_LOCK_RETRY_SECONDS=3 \
+        HARDEN_APT_LOCK_MAX_ATTEMPTS=10 HARDEN_APT_NATIVE_LOCK_TIMEOUT=30 bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply
+            log() { :; }; emit_block() { cat >/dev/null; }
+            package_lock_now() { cat "$LOCK_TEST_TIME"; }
+            package_lock_sleep() {
+                now="$(cat "$LOCK_TEST_TIME")"
+                printf "%s\n" "$((now + $1))" > "$LOCK_TEST_TIME"
+            }
+            if package_apt_capture "remaining lock budget regression" check; then exit 1; else status=$?; fi
+            [[ "$status" -eq 75 && "$PACKAGE_COMMAND_ERROR_CLASS" == lock-wait-expired ]]
+            [[ "$(cat "$LOCK_TEST_COUNT")" == 3 ]]
+            sed -n "1p" "$LOCK_TEST_COMMAND_LOG" | grep -Fq "DPkg::Lock::Timeout=5"
+            sed -n "2p" "$LOCK_TEST_COMMAND_LOG" | grep -Fq "DPkg::Lock::Timeout=2"
+            sed -n "3p" "$LOCK_TEST_COMMAND_LOG" | grep -Fq "DPkg::Lock::Timeout=0"
+        ' _ "$repo_root" || fail "native APT lock timeout did not track the remaining total wait budget"
+
+    : > "$count_file"; : > "$command_log"; : > "$log_file"
+    printf '100\n' > "$case_root/time"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 LOCK_TEST_CASE=success-over-budget \
+        LOCK_TEST_OWNER_PID=0 LOCK_TEST_COUNT="$count_file" LOCK_TEST_COMMAND_LOG="$command_log" \
+        LOCK_TEST_LOG="$log_file" LOCK_TEST_TIME="$case_root/time" \
+        HARDEN_APT_LOCK_WAIT_SECONDS=5 HARDEN_APT_NATIVE_LOCK_TIMEOUT=30 bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; log() { :; }; emit_block() { cat >/dev/null; }
+            package_lock_now() { cat "$LOCK_TEST_TIME"; }
+            package_apt_capture "successful long package operation" check
+            [[ "$PACKAGE_COMMAND_ERROR_CLASS" == none ]]
+            grep -Fq "DPkg::Lock::Timeout=5" "$LOCK_TEST_COMMAND_LOG"
+        ' _ "$repo_root" || fail "successful package execution was incorrectly capped by the lock-wait budget"
+
+    : > "$count_file"; : > "$command_log"; : > "$log_file"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 LOCK_TEST_CASE=dependency-error \
+        LOCK_TEST_OWNER_PID=0 LOCK_TEST_COUNT="$count_file" LOCK_TEST_COMMAND_LOG="$command_log" LOCK_TEST_LOG="$log_file" \
+        HARDEN_APT_LOCK_WAIT_SECONDS=300 HARDEN_APT_LOCK_RETRY_SECONDS=1 \
+        HARDEN_APT_LOCK_MAX_ATTEMPTS=3 HARDEN_APT_NATIVE_LOCK_TIMEOUT=0 bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply
+            log() { printf "%s\n" "$*" >> "$LOCK_TEST_LOG"; }
+            emit_block() { cat >/dev/null; }
+            package_lock_sleep() { printf "unexpected-sleep\n" >> "$LOCK_TEST_LOG"; }
+            if package_apt_capture "dependency failure regression" check; then exit 1; else status=$?; fi
+            [[ "$status" -eq 100 && "$PACKAGE_COMMAND_ERROR_CLASS" == package-command-error ]]
+            [[ "$(cat "$LOCK_TEST_COUNT")" == 1 ]]
+            ! grep -Fq unexpected-sleep "$LOCK_TEST_LOG"
+            grep -Fq "non-lock APT/dpkg error" "$LOCK_TEST_LOG"
+        ' _ "$repo_root" || fail "non-lock apt-get check failure was misclassified as contention"
+
+    : > "$count_file"; : > "$command_log"; : > "$log_file"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 LOCK_TEST_CASE=success \
+        LOCK_TEST_OWNER_PID=0 LOCK_TEST_COUNT="$count_file" LOCK_TEST_COMMAND_LOG="$command_log" LOCK_TEST_LOG="$log_file" \
+        HARDEN_APT_NATIVE_LOCK_TIMEOUT=0 bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; log() { :; }; emit_block() { cat >/dev/null; }
+            package_apt_capture "no-contention regression" check
+            [[ "$PACKAGE_COMMAND_ERROR_CLASS" == none && "$PACKAGE_COMMAND_LOCK_STATUS" == not-contended ]]
+            [[ "$(cat "$LOCK_TEST_COUNT")" == 1 ]]
+        ' _ "$repo_root" || fail "no-contention package path did not remain a single-operation no-op"
+
+    : > "$count_file"; : > "$command_log"; : > "$log_file"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 LOCK_TEST_CASE=persistent \
+        LOCK_TEST_OWNER_PID=0 LOCK_TEST_COUNT="$count_file" LOCK_TEST_COMMAND_LOG="$command_log" LOCK_TEST_LOG="$log_file" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=dry-run
+            log() { printf "%s\n" "$*" >> "$LOCK_TEST_LOG"; }
+            emit_block() { cat >/dev/null; }
+            package_lock_sleep() { printf "unexpected-sleep\n" >> "$LOCK_TEST_LOG"; }
+            package_apt_capture "dry-run lock regression" check
+            [[ "$PACKAGE_COMMAND_ERROR_CLASS" == not-run && "$PACKAGE_COMMAND_LOCK_STATUS" == dry-run-no-wait ]]
+            [[ ! -s "$LOCK_TEST_COUNT" && ! -s "$LOCK_TEST_COMMAND_LOG" ]]
+            ! grep -Fq unexpected-sleep "$LOCK_TEST_LOG"
+        ' _ "$repo_root" || fail "dry-run waited for a package lock or executed apt-get"
+
+    local lock_section
+    lock_section="$(sed -n '/^package_command_lock_aware()/,/^package_apt_command()/p' "$repo_root/harden.sh")"
+    ! grep -Eq '(^|[[:space:]])kill([[:space:]]|$)' <<< "$lock_section" \
+        || fail "package lock handling contains a process kill"
+    ! grep -Eq 'rm[^#]*(/var/lib/(dpkg|apt)|/var/cache/apt)' <<< "$lock_section" \
+        || fail "package lock handling removes a package-manager lock file"
+}
+
 run_package_upgrade_tests() {
     local case_root="$test_root/package-upgrade" mock_bin="$test_root/package-upgrade/bin" apt_log="$test_root/package-upgrade/apt.log"
     install -d "$mock_bin"
@@ -1142,7 +1314,7 @@ EOF
     upgrade_line="$(awk '/^[[:space:]]*upgrade_packages_safely[[:space:]]*$/ { print NR; exit }' <<<"$main_section")"
     prepare_line="$(awk '/^[[:space:]]*prepare_packages[[:space:]]*$/ { print NR; exit }' <<<"$main_section")"
     backup_line="$(awk '/^[[:space:]]*backup_config[[:space:]]*$/ { print NR; exit }' <<<"$main_section")"
-    update_count="$(awk '!/^[[:space:]]*#/ && /run_streamed[[:space:]].*apt-get update/ {count++} END {print count+0}' "$repo_root/harden.sh")"
+    update_count="$(awk '!/^[[:space:]]*#/ && /package_apt_streamed "APT metadata refresh" update/ {count++} END {print count+0}' "$repo_root/harden.sh")"
     [[ "$update_count" == 1 && "$backup_line" -lt "$detect_line" && "$detect_line" -lt "$guard_line" \
         && "$guard_line" -lt "$migration_line" && "$migration_line" -lt "$refresh_line" \
         && "$refresh_line" -lt "$upgrade_line" && "$upgrade_line" -lt "$prepare_line" ]] \
@@ -1260,13 +1432,21 @@ if [[ "${1:-}" == -s ]]; then
     shift
     [[ "${1:-}" == purge ]] || exit 1
     shift
-    for package in "$@"; do printf 'Purg %s [1.0]\n' "$package"; done
+    while (($#)); do
+        if [[ "$1" == -o ]]; then shift 2; continue; fi
+        printf 'Purg %s [1.0]\n' "$1"
+        shift
+    done
     if [[ "${RESIDUAL_SIM_EXTRA:-0}" == 1 ]]; then printf 'Purg unrelated-installed [1.0]\n'; fi
 elif [[ "${1:-}" == check ]]; then
     exit 0
 elif [[ "${1:-}" == purge ]]; then
     printf '%s\n' "$*" >> "$RESIDUAL_FIXTURE_APT_LOG"
-    for package in "$@"; do
+    shift
+    while (($#)); do
+        if [[ "$1" == -o ]]; then shift 2; continue; fi
+        package="$1"
+        shift
         [[ "$package" == -y ]] && continue
         awk -F '\t' -v package="$package" '$1 != package {print $0}' "$RESIDUAL_FIXTURE_STATUS" > "${RESIDUAL_FIXTURE_STATUS}.next"
         mv "${RESIDUAL_FIXTURE_STATUS}.next" "$RESIDUAL_FIXTURE_STATUS"
@@ -3737,6 +3917,7 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
         ;;
     packages)
         run_packagekit_tests
+        run_package_lock_tests
         run_package_upgrade_tests
         run_residual_purge_tests
         run_firewall_inventory_tests
@@ -3769,6 +3950,7 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
         run_fail2ban_tests
         run_fail2ban_configuration_tests
         run_packagekit_tests
+        run_package_lock_tests
         run_package_upgrade_tests
         run_residual_purge_tests
         run_firewall_inventory_tests
@@ -3794,6 +3976,7 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
         run_fail2ban_tests
         run_fail2ban_configuration_tests
         run_packagekit_tests
+        run_package_lock_tests
         run_package_upgrade_tests
         run_residual_purge_tests
         run_firewall_inventory_tests
@@ -3810,6 +3993,9 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
         run_ipv6_banner_motd_tests
         run_rp_filter_tests
         run_iowait_tests
+        ;;
+    package-lock)
+        run_package_lock_tests
         ;;
     *) fail "unknown HARDEN_REGRESSION_FILTER value" ;;
 esac
