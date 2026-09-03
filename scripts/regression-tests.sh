@@ -2047,6 +2047,8 @@ EOF
         ssh_port_is_available() { return 1; }
         ! ssh_port_is_available 2222
         NON_INTERACTIVE=1; ! selected_ssh_port_for_stage
+        SSH_PORT_REQUEST=2222; selected_ssh_port_for_stage; [[ "$SSH_SELECTED_PORT" == 2222 ]]
+        grep -Fq "selected_ssh_port_for_stage ||" "$1/harden.sh"
     ' _ "$repo_root" || fail "SSH port CLI/default/dual-policy regression failed"
 
     env HARDEN_SOURCE_ONLY=1 bash -c '
@@ -2055,9 +2057,17 @@ EOF
         prompt_yes_no() { return 0; }
         prompt_value() { attempt=$((attempt + 1)); case "$attempt" in 1) PROMPT_REPLY=1023 ;; 2) PROMPT_REPLY=22 ;; 3) PROMPT_REPLY=2222 ;; *) PROMPT_REPLY=50022 ;; esac; }
         ssh_port_is_available() { [[ "$1" == 50022 ]]; }
-        log() { [[ "$1" != WARN ]] || warnings=$((warnings + 1)); return 0; }
+        interactive_log="$2/interactive-log"
+        : > "$interactive_log"
+        log() { [[ "$1" != WARN ]] || warnings=$((warnings + 1)); printf "%s\n" "$*" >> "$interactive_log"; return 0; }
         selected_ssh_port_for_stage > "$2/interactive-port"
-        [[ "$(< "$2/interactive-port")" == 50022 && "$warnings" == 3 && "$attempt" == 4 ]]
+        [[ ! -s "$2/interactive-port" && "$SSH_SELECTED_PORT" == 50022 && "$warnings" == 3 && "$attempt" == 4 ]]
+        grep -Fq "Suggested unused high port" "$interactive_log"
+
+        prompt_value() { PROMPT_REPLY=2222; }
+        ssh_port_is_available() { return 0; }
+        selected_ssh_port_for_stage > "$2/interactive-valid-port"
+        [[ ! -s "$2/interactive-valid-port" && "$SSH_SELECTED_PORT" == 2222 ]]
     ' _ "$repo_root" "$case_root" || fail "interactive SSH port invalid/same/occupied reprompt regression failed"
 
     env HARDEN_SOURCE_ONLY=1 HARDEN_SSH_PORT_STATE_FILE="$case_root/stale-retired-state" bash -c '

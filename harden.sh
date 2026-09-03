@@ -34,6 +34,7 @@ BACKUP_DIR=""
 CHANGE_LOG=""
 SSH_PORT="22"
 SSH_PORT_REQUEST=""
+SSH_SELECTED_PORT=""
 SSH_PORT_RETIRE=0
 SSH_PORT_MIGRATION_STATUS="NOT REQUESTED"
 SSH_PORT_MIGRATION_STATE_FILE="${HARDEN_SSH_PORT_STATE_FILE:-/root/ssh-port-migration-state.conf}"
@@ -3719,8 +3720,9 @@ write_ssh_port_migration_report() {
 
 selected_ssh_port_for_stage() {
     local suggested="" requested=""
+    SSH_SELECTED_PORT=""
     if [[ -n "$SSH_PORT_REQUEST" ]]; then
-        printf '%s\n' "$SSH_PORT_REQUEST"
+        SSH_SELECTED_PORT="$SSH_PORT_REQUEST"
         return 0
     fi
     [[ "$NON_INTERACTIVE" -eq 0 ]] || return 1
@@ -3738,7 +3740,7 @@ selected_ssh_port_for_stage() {
         elif ! ssh_port_is_available "$requested"; then
             log WARN "SSH port ${requested} is already bound by another listener; please choose another port"
         else
-            printf '%s\n' "$requested"
+            SSH_SELECTED_PORT="$requested"
             return 0
         fi
     done
@@ -3795,7 +3797,8 @@ stage_ssh_port_migration() {
     local new_port="" old_port="$SSH_PORT" migration_config="" stage=""
     local -a effective_ports=()
     [[ -z "$SSH_STAGED_NEW_PORT" ]] || return 0
-    new_port="$(selected_ssh_port_for_stage || true)"
+    selected_ssh_port_for_stage || return 0
+    new_port="$SSH_SELECTED_PORT"
     [[ -n "$new_port" ]] || return 0
     if ! ssh_port_is_valid_migration_target "$new_port"; then
         die "Requested SSH port must be in 1024-65535"
