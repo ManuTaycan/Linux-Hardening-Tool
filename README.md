@@ -169,6 +169,48 @@ sudo ./harden.sh --apply --aggressive \
 - IPv6 remains enabled by default. Disabling it is an aggressive explicit
   opt-in and is blocked when Tailscale, addresses, routes, listeners,
   forwarding, or ambiguous routing make it unsafe.
+
+## SSH port migration
+
+SSH port changes use a staged two-step workflow. The example port below is
+only a familiar value for illustrating the commands; changing a port reduces
+scan and log noise but does not replace strong authentication, firewall, or
+Fail2ban controls.
+
+### Stage a second port
+
+~~~bash
+sudo ./harden.sh --apply --ssh-port 2222
+~~~
+
+The current port remains active and the old and new listeners run in parallel.
+Keep the existing SSH session open. Before retiring the old port, establish an
+independent new SSH connection on the staged port and verify that `sudo` works
+there; optionally confirm both listeners with `ss`.
+
+### Retire the old port
+
+~~~bash
+sudo ./harden.sh --apply --retire-ssh-port
+~~~
+
+`--retire-ssh-port` is an option, not a standalone mode: `--apply` (or
+`--dry-run` to preview) is still required. The normal idempotent hardening
+workflow runs again. During Phase 08 the staged dual-port state is checked,
+SSH or socket activation is changed to the new port only, and the new listener
+is verified. Only after that succeeds are the old firewall and Fail2ban rules
+removed, and `RETIRED` state is persisted. Any failure rolls back to the
+previous proven dual-port state; port 22 is never stopped blindly.
+
+For automation, use the explicit non-interactive form:
+
+~~~bash
+sudo ./harden.sh --apply --non-interactive --retire-ssh-port
+~~~
+
+Never retire the old port until an independent connection through the new port
+has been successfully tested. Keep a recovery session and console/recovery
+path available throughout the change.
 - Tailscale preferences, routes, exit-node state, and owned firewall rules are
   not changed merely to satisfy a scanner.
 - kernel.modules_disabled=1 is only written after the final runtime gate.
