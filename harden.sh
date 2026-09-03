@@ -5,11 +5,11 @@
 # Usage:
 #   ./harden.sh --dry-run
 #   sudo ./harden.sh --apply [--aggressive] [--reboot]
-#   sudo ./harden.sh --apply --remote-log-server YOUR_SYSLOG_SERVER --remote-log-port YOUR_SYSLOG_PORT --remote-log-protocol YOUR_SYSLOG_PROTOCOL
+#   sudo ./harden.sh --apply --remote-log-server 10.0.0.9 --remote-log-port 5140 --remote-log-protocol tcp
 #
 # Optional non-interactive remote logging variables:
-#   REMOTE_LOG_SERVER=YOUR_SYSLOG_SERVER REMOTE_LOG_PORT=YOUR_SYSLOG_PORT
-#   REMOTE_LOG_PROTOCOL=YOUR_SYSLOG_PROTOCOL REMOTE_LOG_CA_FILE=/path/to/ca.pem
+#   REMOTE_LOG_SERVER=logs.example.test REMOTE_LOG_PORT=6514
+#   REMOTE_LOG_PROTOCOL=tls REMOTE_LOG_CA_FILE=/path/to/ca.pem
 
 set -Eeuo pipefail
 IFS=$'\n\t'
