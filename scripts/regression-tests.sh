@@ -1255,6 +1255,184 @@ EOF
         || fail "package lock handling removes a package-manager lock file"
 }
 
+run_unattended_lock_tests() {
+    local case_root="$test_root/unattended-lock" mock_bin="$test_root/unattended-lock/bin"
+    local count_file="$case_root/count" time_file="$case_root/time" sleep_file="$case_root/sleeps"
+    local log_file="$case_root/hardening.log" summary_file="$case_root/summary"
+    install -d "$mock_bin"
+    cat > "$mock_bin/unattended-upgrade" <<'EOF'
+#!/usr/bin/env bash
+count="$(cat "$UNATTENDED_TEST_COUNT" 2>/dev/null || printf 0)"
+count=$((count + 1))
+printf '%s\n' "$count" > "$UNATTENDED_TEST_COUNT"
+[[ "${LC_ALL:-}" == C ]] || exit 64
+case "${UNATTENDED_TEST_CASE:-converged}" in
+    timer-race)
+        [[ -s "$UNATTENDED_TEST_SYSTEMCTL_LOG" ]] || exit 65
+        if [[ "$count" -eq 1 ]]; then
+            printf 'Lock could not be acquired (another package manager running?)\n' >&2
+            exit 1
+        fi
+        ;;
+    zero-exit-lock)
+        if [[ "$count" -eq 1 ]]; then
+            printf 'upgrade result: False Lock could not be acquired\n'
+            exit 0
+        fi
+        ;;
+    persistent)
+        printf 'Cache lock can not be acquired, exiting\n' >&2
+        exit 1
+        ;;
+    package-error)
+        printf 'ERROR: Unable to parse unattended-upgrades configuration\n' >&2
+        exit 1
+        ;;
+    converged) ;;
+    *) exit 91 ;;
+esac
+printf 'unattended-ok\n'
+EOF
+    cat > "$mock_bin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$UNATTENDED_TEST_SYSTEMCTL_LOG"
+EOF
+    chmod +x "$mock_bin/unattended-upgrade" "$mock_bin/systemctl"
+
+    env HARDEN_SOURCE_ONLY=1 bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        for message in \
+            "Lock could not be acquired (another package manager running?)" \
+            "Cache lock can not be acquired, exiting" \
+            "upgrade result: False Lock could not be acquired"; do
+            package_lock_contention_output "$message"
+        done
+        ! package_lock_contention_output "ERROR: Unable to parse unattended-upgrades configuration"
+    ' _ "$repo_root" || fail "observed unattended-upgrade lock text was misclassified"
+
+    : > "$count_file"; : > "$sleep_file"; : > "$log_file"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 UNATTENDED_TEST_CASE=timer-race \
+        UNATTENDED_TEST_COUNT="$count_file" UNATTENDED_TEST_SYSTEMCTL_LOG="$case_root/systemctl.log" \
+        UNATTENDED_TEST_SLEEP="$sleep_file" UNATTENDED_TEST_LOG="$log_file" \
+        HARDEN_APT_LOCK_WAIT_SECONDS=30 HARDEN_APT_LOCK_RETRY_SECONDS=3 \
+        HARDEN_APT_LOCK_MAX_ATTEMPTS=3 bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply
+            install_managed_file() { cat >/dev/null; }
+            run() { "$@"; }
+            log() { printf "%s\n" "$*" >> "$UNATTENDED_TEST_LOG"; }
+            emit_block() { cat >/dev/null; }
+            record_skip() { printf "unexpected-skip\n" >> "$UNATTENDED_TEST_LOG"; }
+            package_lock_sleep() { printf "%s\n" "$1" >> "$UNATTENDED_TEST_SLEEP"; }
+            configure_updates
+            [[ "$UPDATES_STATUS" == OK && "$PACKAGE_COMMAND_ERROR_CLASS" == none ]]
+            [[ "$PACKAGE_COMMAND_LOCK_STATUS" == retried-then-succeeded ]]
+            [[ "$(cat "$UNATTENDED_TEST_COUNT")" == 2 ]]
+            [[ "$(cat "$UNATTENDED_TEST_SLEEP")" == 3 ]]
+            grep -Fxq "enable --now apt-daily.timer apt-daily-upgrade.timer" "$UNATTENDED_TEST_SYSTEMCTL_LOG"
+            ! grep -Fq unexpected-skip "$UNATTENDED_TEST_LOG"
+        ' _ "$repo_root" || fail "timer activation race did not retry unattended-upgrade validation"
+
+    : > "$count_file"; : > "$sleep_file"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 UNATTENDED_TEST_CASE=zero-exit-lock \
+        UNATTENDED_TEST_COUNT="$count_file" UNATTENDED_TEST_SLEEP="$sleep_file" \
+        HARDEN_APT_LOCK_WAIT_SECONDS=30 HARDEN_APT_LOCK_RETRY_SECONDS=3 \
+        HARDEN_APT_LOCK_MAX_ATTEMPTS=3 bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; log() { :; }; emit_block() { cat >/dev/null; }
+            package_lock_sleep() { printf "%s\n" "$1" >> "$UNATTENDED_TEST_SLEEP"; }
+            package_unattended_capture "zero-exit lock regression" --dry-run
+            [[ "$PACKAGE_COMMAND_ERROR_CLASS" == none && "$PACKAGE_COMMAND_LOCK_STATUS" == retried-then-succeeded ]]
+            [[ "$(cat "$UNATTENDED_TEST_COUNT")" == 2 && "$(cat "$UNATTENDED_TEST_SLEEP")" == 3 ]]
+        ' _ "$repo_root" || fail "unattended-upgrade exit 0 with lock failure was accepted as success"
+
+    : > "$count_file"; : > "$sleep_file"; printf '100\n' > "$time_file"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 UNATTENDED_TEST_CASE=persistent \
+        UNATTENDED_TEST_COUNT="$count_file" UNATTENDED_TEST_SLEEP="$sleep_file" \
+        UNATTENDED_TEST_TIME="$time_file" HARDEN_APT_LOCK_WAIT_SECONDS=5 \
+        HARDEN_APT_LOCK_RETRY_SECONDS=3 HARDEN_APT_LOCK_MAX_ATTEMPTS=10 bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; log() { :; }; emit_block() { cat >/dev/null; }
+            package_lock_now() { cat "$UNATTENDED_TEST_TIME"; }
+            package_lock_sleep() {
+                printf "%s\n" "$1" >> "$UNATTENDED_TEST_SLEEP"
+                printf "%s\n" "$(($(cat "$UNATTENDED_TEST_TIME") + $1))" > "$UNATTENDED_TEST_TIME"
+            }
+            if package_unattended_capture "persistent unattended lock" --dry-run; then exit 1; else status=$?; fi
+            [[ "$status" -eq 75 && "$PACKAGE_COMMAND_ERROR_CLASS" == lock-wait-expired ]]
+            [[ "$PACKAGE_COMMAND_LOCK_STATUS" == expired && "$(cat "$UNATTENDED_TEST_COUNT")" == 3 ]]
+            [[ "$(paste -sd, "$UNATTENDED_TEST_SLEEP")" == 3,2 ]]
+        ' _ "$repo_root" || fail "persistent unattended-upgrade lock exceeded wait budget or lacked review-required result"
+
+    : > "$count_file"; : > "$sleep_file"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 UNATTENDED_TEST_CASE=persistent \
+        UNATTENDED_TEST_COUNT="$count_file" UNATTENDED_TEST_SLEEP="$sleep_file" \
+        UNATTENDED_TEST_SYSTEMCTL_LOG="$case_root/systemctl.log" UNATTENDED_TEST_SUMMARY="$summary_file" \
+        HARDEN_APT_LOCK_WAIT_SECONDS=30 HARDEN_APT_LOCK_RETRY_SECONDS=3 \
+        HARDEN_APT_LOCK_MAX_ATTEMPTS=2 bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply
+            install_managed_file() { cat >/dev/null; }
+            run() { "$@"; }
+            log() { :; }
+            emit_block() { cat > "$UNATTENDED_TEST_SUMMARY"; }
+            package_lock_sleep() { printf "%s\n" "$1" >> "$UNATTENDED_TEST_SLEEP"; }
+            configure_updates
+            [[ "$UPDATES_STATUS" == "FAILED (unattended-upgrade validation: lock-wait-expired)" ]]
+            automatic_updates_failed
+            print_summary
+            grep -Fq "Automatic Updates  : FAILED" "$UNATTENDED_TEST_SUMMARY"
+            grep -Fq "Exit Status        : FAILED" "$UNATTENDED_TEST_SUMMARY"
+            [[ "$(cat "$UNATTENDED_TEST_COUNT")" == 2 && "$(cat "$UNATTENDED_TEST_SLEEP")" == 3 ]]
+        ' _ "$repo_root" || fail "expired unattended-upgrade validation did not fail the overall summary"
+
+    : > "$count_file"; : > "$sleep_file"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 UNATTENDED_TEST_CASE=package-error \
+        UNATTENDED_TEST_COUNT="$count_file" UNATTENDED_TEST_SLEEP="$sleep_file" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; log() { :; }; emit_block() { cat >/dev/null; }
+            package_lock_sleep() { printf "%s\n" "$1" >> "$UNATTENDED_TEST_SLEEP"; }
+            if package_unattended_capture "unattended configuration error" --dry-run; then exit 1; else status=$?; fi
+            [[ "$status" -eq 1 && "$PACKAGE_COMMAND_ERROR_CLASS" == package-command-error ]]
+            [[ "$(cat "$UNATTENDED_TEST_COUNT")" == 1 && ! -s "$UNATTENDED_TEST_SLEEP" ]]
+        ' _ "$repo_root" || fail "non-lock unattended-upgrade error was retried or misclassified"
+
+    : > "$count_file"; : > "$sleep_file"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 UNATTENDED_TEST_CASE=converged \
+        UNATTENDED_TEST_COUNT="$count_file" UNATTENDED_TEST_SLEEP="$sleep_file" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=apply; log() { :; }; emit_block() { cat >/dev/null; }
+            package_unattended_capture "converged unattended validation" --dry-run
+            [[ "$PACKAGE_COMMAND_ERROR_CLASS" == none && "$PACKAGE_COMMAND_LOCK_STATUS" == not-contended ]]
+            [[ "$(cat "$UNATTENDED_TEST_COUNT")" == 1 && ! -s "$UNATTENDED_TEST_SLEEP" ]]
+        ' _ "$repo_root" || fail "converged unattended-upgrade path changed"
+
+    : > "$count_file"; : > "$sleep_file"
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 UNATTENDED_TEST_CASE=persistent \
+        UNATTENDED_TEST_COUNT="$count_file" UNATTENDED_TEST_SLEEP="$sleep_file" bash -c '
+            source "$1/harden.sh"; trap - ERR EXIT
+            MODE=dry-run; log() { :; }
+            package_lock_sleep() { printf "%s\n" "$1" >> "$UNATTENDED_TEST_SLEEP"; }
+            package_unattended_capture "dry-run unattended validation" --dry-run
+            [[ "$PACKAGE_COMMAND_ERROR_CLASS" == not-run && "$PACKAGE_COMMAND_LOCK_STATUS" == dry-run-no-wait ]]
+            [[ ! -s "$UNATTENDED_TEST_COUNT" && ! -s "$UNATTENDED_TEST_SLEEP" ]]
+        ' _ "$repo_root" || fail "dry-run executed unattended-upgrade or waited for a lock"
+
+    env PATH="$mock_bin:$PATH" HARDEN_SOURCE_ONLY=1 UNATTENDED_TEST_SUMMARY="$summary_file" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        MODE=apply; log() { :; }; emit_block() { cat > "$UNATTENDED_TEST_SUMMARY"; }
+        UPDATES_STATUS="FAILED (unattended-upgrade validation: lock-wait-expired)"
+        automatic_updates_failed
+        print_summary
+        grep -Fq "Automatic Updates  : FAILED" "$UNATTENDED_TEST_SUMMARY"
+        grep -Fq "Exit Status        : FAILED" "$UNATTENDED_TEST_SUMMARY"
+        UPDATES_STATUS=OK
+        ! automatic_updates_failed
+        print_summary
+        grep -Fq "Exit Status        : SUCCESS" "$UNATTENDED_TEST_SUMMARY"
+    ' _ "$repo_root" || fail "automatic updates failure and overall exit status diverged"
+}
+
 run_package_upgrade_tests() {
     local case_root="$test_root/package-upgrade" mock_bin="$test_root/package-upgrade/bin" apt_log="$test_root/package-upgrade/apt.log"
     install -d "$mock_bin"
@@ -3918,6 +4096,7 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
     packages)
         run_packagekit_tests
         run_package_lock_tests
+        run_unattended_lock_tests
         run_package_upgrade_tests
         run_residual_purge_tests
         run_firewall_inventory_tests
@@ -3951,6 +4130,7 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
         run_fail2ban_configuration_tests
         run_packagekit_tests
         run_package_lock_tests
+        run_unattended_lock_tests
         run_package_upgrade_tests
         run_residual_purge_tests
         run_firewall_inventory_tests
@@ -3977,6 +4157,7 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
         run_fail2ban_configuration_tests
         run_packagekit_tests
         run_package_lock_tests
+        run_unattended_lock_tests
         run_package_upgrade_tests
         run_residual_purge_tests
         run_firewall_inventory_tests
@@ -3996,6 +4177,7 @@ case "${HARDEN_REGRESSION_FILTER:-all}" in
         ;;
     package-lock)
         run_package_lock_tests
+        run_unattended_lock_tests
         ;;
     *) fail "unknown HARDEN_REGRESSION_FILTER value" ;;
 esac
