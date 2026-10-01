@@ -366,7 +366,7 @@ run_streamed() {
 package_lock_contention_output() {
     local output="$1"
     grep -Eqi \
-        'Could not get lock|Unable to acquire the .* lock|Unable to lock (the )?directory|Waiting for cache lock|frontend lock.*locked by another process|lock.*held by process|another process.*(apt|dpkg).*lock' \
+        'Could not get lock|Unable to acquire the .* lock|Unable to lock (the )?directory|Waiting for cache lock|frontend lock.*locked by another process|lock.*held by process|another process.*(apt|dpkg).*lock|^[[:space:]]*(Lock could not be acquired \(another package manager running\?\)|Cache lock can not be acquired, exiting|upgrade result: False Lock could not be acquired)[[:space:]]*$' \
         <<< "$output"
 }
 
@@ -469,7 +469,11 @@ package_command_lock_aware() {
         PACKAGE_COMMAND_OUTPUT="$(<"$temporary")"
         rm -f -- "$temporary"
         PACKAGE_COMMAND_EXIT_STATUS="$status"
-        if [[ "$status" -eq 0 ]]; then
+        # unattended-upgrade can report a failed lock acquisition with exit 0.
+        if [[ "$status" -eq 0 ]] && ! {
+            [[ "${command_args[0]:-}" == unattended-upgrade ]] \
+                && package_lock_contention_output "$PACKAGE_COMMAND_OUTPUT"
+        }; then
             if package_lock_contention_output "$PACKAGE_COMMAND_OUTPUT"; then
                 PACKAGE_COMMAND_LOCK_STATUS="waited-then-succeeded"
                 log INFO "Package lock contention cleared and ${label} completed successfully"
@@ -943,8 +947,8 @@ EOF
         if package_unattended_capture "unattended-upgrades configuration validation" --dry-run --debug; then
             UPDATES_STATUS="OK"
         else
-            UPDATES_STATUS="FAILED"
-            record_skip "automatic updates" "unattended-upgrade dry-run validation failed"
+            UPDATES_STATUS="FAILED (unattended-upgrade validation: ${PACKAGE_COMMAND_ERROR_CLASS})"
+            record_skip "automatic updates" "unattended-upgrade dry-run validation failed (${PACKAGE_COMMAND_ERROR_CLASS})"
         fi
     else
         UPDATES_STATUS="PLANNED"
@@ -7997,8 +8001,13 @@ write_open_findings_report() {
     return 0
 }
 
+automatic_updates_failed() {
+    [[ "$MODE" == "apply" && "$UPDATES_STATUS" == FAILED* ]]
+}
+
 print_summary() {
-    local failed reboot="NO" mode_label="APPLY" aggressive_label="NO" service_exposure_lines="none measured"
+    local failed reboot="NO" mode_label="APPLY" aggressive_label="NO" service_exposure_lines="none measured" exit_status="SUCCESS"
+    if automatic_updates_failed; then exit_status="FAILED"; fi
     if [[ "$MODE" == "dry-run" ]]; then
         failed="N/A (dry-run)"
         reboot="N/A (dry-run)"
@@ -8080,7 +8089,7 @@ Backup directory   : ${BACKUP_DIR:-not created in dry-run}
 Log file           : $([[ "$MODE" == "apply" ]] && printf '%s' "$LOG_FILE" || printf 'not written in dry-run')
 Validation         : $([[ "$MODE" == "apply" ]] && printf '/root/hardening-validation.txt' || printf 'planned')
 Remaining findings : $([[ "$MODE" == "apply" ]] && printf '/root/hardening-open-findings.txt' || printf 'planned')
-Exit Status        : SUCCESS
+Exit Status        : ${exit_status}
 ============================================================
 EOF
     if [[ "$reboot" == "YES" ]]; then log WARN "REBOOT REQUIRED"; fi
@@ -8222,8 +8231,14 @@ main() {
         || "$FINAL_LYNIS_COMPLETED" -ne 1 || "$SUMMARY_PRINTED" -ne 1 ]]; then
         die "Internal completion-gate failure: phase=${CURRENT_PHASE}, validation=${VALIDATION_COMPLETED}, final-lynis=${FINAL_LYNIS_COMPLETED}, summary=${SUMMARY_PRINTED}"
     fi
-    log OK "Phase 18/18 reached; validation, final Lynis audit, and summary completed"
     COMPLETED=1
+
+    if automatic_updates_failed; then
+        log ERROR "Hardening completed with failed automatic-updates validation: ${UPDATES_STATUS}"
+        exit 1
+    fi
+
+    log OK "Phase 18/18 reached; validation, final Lynis audit, and summary completed"
 
     if [[ "$MODE" == "apply" && "$AUTO_REBOOT" -eq 1 \
         && ( "$REBOOT_REQUIRED" -eq 1 || -e /var/run/reboot-required ) ]]; then
