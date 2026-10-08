@@ -2206,6 +2206,9 @@ configure_sysctl() {
                 [[ -n "$desired_rp_filter" ]] || continue
                 value="$desired_rp_filter"
             fi
+            if [[ "$key" == net.ipv4.conf.all.forwarding ]] && docker_egress_enabled; then
+                value=1
+            fi
             if [[ "$RP_FILTER_TAILSCALE_STATE" == active && "$key" == *'.forwarding' ]] \
                 && [[ "$(sysctl -n "$key" 2>/dev/null || true)" == "1" ]]; then
                 value=1
@@ -3634,6 +3637,15 @@ WantedBy=multi-user.target
 EOF
 }
 
+# Explicit operator-owned IPv4 bridge egress opt-in. No wildcard bridge rules.
+docker_egress_rules_file() {
+    printf '%s' "${HARDEN_DOCKER_EGRESS_RULES:-/etc/nftables.d/90-docker-egress.rules}"
+}
+
+docker_egress_enabled() {
+    [[ -s "$(docker_egress_rules_file)" ]]
+}
+
 configure_firewall() {
     local recoverable=0
     [[ "${1:-}" != --recoverable ]] || recoverable=1
@@ -3657,6 +3669,11 @@ configure_firewall() {
         return 0
     fi
     local tailscale_input="" tailscale_forward="" wireguard_rule="" tailscale_healthy_before=0 ssh_rule="" ssh_port_set=""
+    local docker_forward=""
+    if docker_egress_enabled; then
+        # The root-owned fragment is nft syntax, never sourced as shell code.
+        docker_forward="        include \"$(docker_egress_rules_file)\""
+    fi
     local -a ssh_ports=()
     mapfile -t ssh_ports < <(ssh_firewall_ports)
     if ((${#ssh_ports[@]} == 1)); then
@@ -3709,6 +3726,7 @@ ${ssh_rule}
         ct state established,related accept
 ${tailscale_forward}
 ${wireguard_rule}
+${docker_forward}
         counter drop
     }
 

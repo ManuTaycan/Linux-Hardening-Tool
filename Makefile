@@ -17,6 +17,7 @@ static:
 	./scripts/ci-static-checks.sh
 
 regression:
+	./scripts/docker-egress-tests.sh
 	./scripts/regression-tests.sh
 
 checksum:
