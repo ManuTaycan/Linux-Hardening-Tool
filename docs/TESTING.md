@@ -270,3 +270,29 @@ Review the archive before transfer. Remove secrets, private keys, credentials,
 tokens, hostnames, addresses, and production-sensitive logs. Create one bounded
 issue per verified finding with the exact commit, command, phase, sanitized
 evidence, rollback state, and acceptance criteria.
+
+## Explicit Docker bridge egress opt-in
+
+The generator includes a nonempty operator-owned
+`/etc/nftables.d/90-docker-egress.rules` fragment inside its forward chain.
+The file must be root-owned and not writable by unprivileged users. It is nft
+syntax, never shell code. No Docker exception is enabled when the file is absent
+or empty. With this IPv4 opt-in, the managed IPv4 all.forwarding value is 1,
+including when Docker has not yet started.
+
+Use explicit input/output interfaces, IPv4 source subnet and required ports.
+For example, a default bridge on a host with uplink ens18 can allow TCP
+53/80/443 and UDP 53 from docker0, source 172.17.0.0/16, to ens18. This does not
+enable other bridges, inbound published ports, or IPv6 forwarding. Docker's
+separate firewall chains continue to apply.
+
+Run `scripts/docker-egress-tests.sh` for mocked generator/sysctl checks.
+For deployment, back up the owned nft table and sysctl file, syntax-check a
+batch containing deletion and recreation of only the owned table, then load
+that batch in one nft transaction. Avoid the service's current delete-then-load
+ExecReload path because it creates an intermediate gap. Do not restart Docker,
+SSH or Tailscale. Verify DNS and web egress on the bridge and in BuildKit.
+
+Removing the opt-in requires first removing its include from the persistent
+table and atomically reloading the table. Preserve IPv4 forwarding if another
+routing service still requires it.
