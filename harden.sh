@@ -4089,6 +4089,12 @@ EOF
     transaction_copy /usr/local/libexec/server-hardening-firewall firewall-helper
     if nft -s list table inet hardening_filter > "$BACKUP_DIR/nftables-hardening-table-before.nft" 2>/dev/null; then
         own_before="$BACKUP_DIR/nftables-hardening-table-before.nft"
+        if ! firewall_helper_command --check-stdin < "$own_before"; then
+            rm -f -- "$candidate" "$unit_candidate" "$helper_candidate"
+            FIREWALL_STATUS="FAILED (previous owned policy is not safely restorable)"
+            log ERROR "Existing owned table cannot pass atomic restore validation; no candidate was installed. Review custom chains/sets from console"
+            return 1
+        fi
     fi
     if install_managed_file /etc/nftables.d/99-security-hardening.nft 0600 < "$candidate"; then
         changed=$((changed + MANAGED_FILE_CHANGED))

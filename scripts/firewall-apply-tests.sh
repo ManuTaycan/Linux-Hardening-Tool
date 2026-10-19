@@ -4,7 +4,7 @@ set -Eeuo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 test_root="$(mktemp -d)"
 trap 'rm -rf -- "$test_root"' EXIT
-for scenario in fresh existing converged install-failure unit-failure nft-failure enable-failure start-failure health-failure rollback-failure; do
+for scenario in fresh existing converged install-failure unit-failure snapshot-failure nft-failure enable-failure start-failure health-failure rollback-failure; do
     env HARDEN_SOURCE_ONLY=1 TEST_CASE="$scenario" TEST_ROOT="$test_root/$scenario" bash -c '
         source "$1/harden.sh"; trap - ERR EXIT
         mkdir -p "$TEST_ROOT"; MODE=apply; BACKUP_DIR="$TEST_ROOT"; SSH_PORT=22
@@ -40,7 +40,10 @@ for scenario in fresh existing converged install-failure unit-failure nft-failur
             printf "%s\n" "$*" >> "$TEST_ROOT/helper"
             case "$1" in
                 --api-rule|--path-check|--docker-select) return 0 ;;
-                --check-stdin) cat > "$TEST_ROOT/candidate" ;;
+                --check-stdin)
+                    cat > "$TEST_ROOT/candidate"
+                    [[ "$TEST_CASE" != snapshot-failure ]] || ! grep -Fxq "previous snapshot" "$TEST_ROOT/candidate"
+                    ;;
                 --apply-stdin)
                     cat > "$TEST_ROOT/restored-runtime"
                     [[ "$TEST_CASE" != rollback-failure ]]
@@ -63,9 +66,13 @@ for scenario in fresh existing converged install-failure unit-failure nft-failur
             *)
                 ! configure_firewall --recoverable
                 [[ "$FIREWALL_STATUS" == FAILED* ]]
-                if [[ "$TEST_CASE" != unit-failure ]]; then
+                if [[ "$TEST_CASE" != unit-failure && "$TEST_CASE" != snapshot-failure ]]; then
                     grep -Fxq "previous snapshot" "$TEST_ROOT/restored-runtime"
                     grep -Fq firewall-service "$TEST_ROOT/restores"
+                fi
+                if [[ "$TEST_CASE" == snapshot-failure ]]; then
+                    [[ ! -e "$TEST_ROOT/99-security-hardening.nft" ]]
+                    ! grep -Fxq apply "$TEST_ROOT/helper"
                 fi
                 if [[ "$TEST_CASE" == rollback-failure ]]; then [[ "$FIREWALL_STATUS" == *restored=0* ]]; fi
                 ;;
