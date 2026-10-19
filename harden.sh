@@ -3795,7 +3795,8 @@ def expand(text):
             # Inline braces are limited to literal sets. No scope escape, include,
             # command separator, define, variable, wildcard or secondary file.
             plain = re.sub(r"\{ [A-Za-z0-9_, -]+ \}", "", line)
-            if any(c in plain for c in '{};\\$#') or re.search(r"\b(include|define|flush|delete|destroy|table|chain)\b", line):
+            plain = re.sub(r'"[^"\\]*"', '""', plain)
+            if any(c in plain for c in '{};\\$#') or re.search(r"\b(include|define|flush|delete|destroy|table|chain)\b", plain):
                 raise ValueError("unsupported rule or scope escape")
         result.append(raw)
     if not closed or chain or seen != {"input", "forward", "output"} or hooks != seen:
