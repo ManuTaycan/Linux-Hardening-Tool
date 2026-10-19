@@ -14,7 +14,12 @@ record_skip() { :; }
 record_change() { :; }
 systemctl() { return 1; }
 ip() { return 1; }
-nft() { return 1; }
+mock_protected=0
+mock_sysctl_fail=0
+nft() {
+    [[ "$mock_protected" -eq 1 ]] || return 1
+    printf 'type filter hook forward priority filter; policy drop;\n'
+}
 ssh_firewall_ports() { printf '2222\n'; }
 # Mock only the privileged helper boundary; real trust/grammar checks run in
 # firewall-helper-tests.py and the separate Linux network namespace test.
@@ -32,13 +37,17 @@ detect_rp_filter_routing_situation() { RP_FILTER_ROUTING_SITUATION=unknown; RP_F
 preserve_current_rp_filter_values() { :; }
 sysctl_candidates() { printf 'net.ipv4.conf.all.forwarding=0\n'; }
 ipv6_policy_candidates() { :; }
-transaction_copy() { :; }
+transaction_copy() { [[ ! -f "$1" ]] || cp "$1" "$test_root/$2"; }
+transaction_restore() { cp "$test_root/$2" "$1"; }
 install_managed_file() { cat > "$1"; MANAGED_FILE_CHANGED=1; }
 managed_sysctl_runtime_needs_reload() { return 1; }
 sysctl() {
-    if [[ "$1" == -p ]]; then return 0; fi
-    if [[ -f "$HARDEN_SYSCTL_CONFIG" ]]; then
-        awk '/^net.ipv4.conf.all.forwarding/ {print $3}' "$HARDEN_SYSCTL_CONFIG"
+    if [[ "$1" == -p ]]; then
+        awk '/^net.ipv4.conf.all.forwarding/ {print $3}' "$HARDEN_SYSCTL_CONFIG" > "$test_root/runtime"
+    elif [[ "$1" == -w ]]; then
+        [[ "$mock_sysctl_fail" -ne 1 || "$2" != net.ipv4.conf.all.forwarding=1 ]] || return 1
+        printf '%s\n' "${2##*=}" > "$test_root/runtime"
+    elif [[ -f "$test_root/runtime" ]]; then cat "$test_root/runtime"
     else printf '0\n'; fi
 }
 tailscale_rp_filter_health() { RP_FILTER_RUNTIME_STATUS=OK; }
@@ -49,7 +58,8 @@ mkdir -p "$HARDEN_PROC_SYS_ROOT/net/ipv4/conf/all"
 touch "$HARDEN_PROC_SYS_ROOT/net/ipv4/conf/all/forwarding"
 for state in absent empty enabled unsafe missing; do
     export HARDEN_DOCKER_EGRESS_RULES="$test_root/egress.rules"
-    rm -f "$HARDEN_DOCKER_EGRESS_RULES" "$HARDEN_SYSCTL_CONFIG"
+    mock_protected=0; mock_sysctl_fail=0
+    rm -f "$HARDEN_DOCKER_EGRESS_RULES" "$HARDEN_SYSCTL_CONFIG" "$test_root/runtime"
     case "$state" in
         empty) touch "$HARDEN_DOCKER_EGRESS_RULES" ;;
         enabled|unsafe) printf 'iifname "docker0" oifname "eth0" ip saddr 172.17.0.0/16 tcp dport 443 counter accept\n' > "$HARDEN_DOCKER_EGRESS_RULES" ;;
@@ -68,7 +78,20 @@ for state in absent empty enabled unsafe missing; do
     configure_sysctl
     if [[ "$state" == enabled ]]; then
         grep -Fq "include \"$HARDEN_DOCKER_EGRESS_RULES\"" "$test_root/candidate.nft"
+        grep -Fxq 'net.ipv4.conf.all.forwarding = 0' "$HARDEN_SYSCTL_CONFIG"
+        [[ "$DOCKER_FORWARDING_DEFERRED" -eq 1 && "$(sysctl -n net.ipv4.conf.all.forwarding)" == 0 ]]
+        ! activate_deferred_docker_forwarding
+        [[ "$(sysctl -n net.ipv4.conf.all.forwarding)" == 0 ]]
+        mock_protected=1; mock_sysctl_fail=1
+        ! activate_deferred_docker_forwarding
+        [[ "$DOCKER_FORWARDING_RESTORE_FAILED" -eq 0 && "$(sysctl -n net.ipv4.conf.all.forwarding)" == 0 ]]
+        grep -Fxq 'net.ipv4.conf.all.forwarding = 0' "$HARDEN_SYSCTL_CONFIG"
+        mock_sysctl_fail=0
+        activate_deferred_docker_forwarding
         grep -Fxq 'net.ipv4.conf.all.forwarding = 1' "$HARDEN_SYSCTL_CONFIG"
+        [[ "$DOCKER_FORWARDING_DEFERRED" -eq 0 && "$(sysctl -n net.ipv4.conf.all.forwarding)" == 1 ]]
+        configure_sysctl
+        [[ "$DOCKER_FORWARDING_DEFERRED" -eq 0 && "$(sysctl -n net.ipv4.conf.all.forwarding)" == 1 ]]
     else
         ! grep -Fq 'include ' "$test_root/candidate.nft"
         grep -Fxq 'net.ipv4.conf.all.forwarding = 0' "$HARDEN_SYSCTL_CONFIG"

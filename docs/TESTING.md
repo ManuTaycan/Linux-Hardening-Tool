@@ -314,6 +314,12 @@ run. To opt out deliberately, unset the path override and run
 `sudo env HARDEN_DOCKER_EGRESS_DISABLE=1 ./harden.sh --apply`; the fragment can
 then be removed. Simply deleting a selected fragment is a rejected
 configuration and leaves both forwarding sysctls and the live policy untouched.
+New Docker forwarding is enabled only after the owned default-drop firewall
+has committed and passed its health checks. Phase 05 defers a transition from
+forwarding=0 until that point; an already enabled routing role is preserved.
+Failed forwarding activation restores the prior sysctl file/value. If runtime
+restoration cannot be proven, the validated protective firewall stays active
+and Apply fails with a console-recovery diagnostic.
 
 An optional host TCP exception for Ollama/n8n or another API requires both
 `HARDEN_INPUT_TCP_SOURCE` (one IPv4/IPv6 host literal, no CIDR/hostname) and
