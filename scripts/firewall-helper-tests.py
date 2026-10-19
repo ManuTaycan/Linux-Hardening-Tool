@@ -107,14 +107,13 @@ class UnitTests(unittest.TestCase):
                 self.assertEqual(live[0], "previous policy")
             failure[0] = None
             loader.activate(POLICY)
-            count = len([c for c in calls if c[0] == ("-f", "-f", "-")])
             calls.clear()
             loader.activate(POLICY)
             self.assertFalse(any(c[0] == ("-f", "-") for c in calls))
             live[0] = "external drift"
             loader.activate(POLICY)
             self.assertTrue(any(c[0] == ("-f", "-") for c in calls))
-            self.assertEqual(count, 0)  # no alternate stand-alone mutation path
+            self.assertFalse(any(c[0][0] in ("delete", "flush") for c in calls))
 
     def test_no_legacy_delete_or_reload(self):
         shell = source.split("FIREWALL_PYTHON\n}", 1)[1]
@@ -216,7 +215,24 @@ class NamespaceTests(unittest.TestCase):
                 for expected in ("tailscale0", "wg0", "2222", "11434", "docker0", "policy drop"):
                     self.assertIn(expected, live)
                 self.check_source_boundary()
-                loader.activate(policy)
+                config.write_text(policy)
+                # Exercise the real persisted start/reload entry point as well
+                # as direct candidate application. Invalid includes must retain
+                # the active last-good policy and report the rejected reload.
+                with patch.object(sys, "argv", ["helper"]):
+                    loader.main()
+                    for mutation in ("mode", "empty", "missing"):
+                        fragment.write_text(DOCKER)
+                        os.chmod(fragment, 0o600)
+                        if mutation == "mode": os.chmod(fragment, 0o666)
+                        if mutation == "empty": fragment.write_text("")
+                        if mutation == "missing": fragment.unlink()
+                        with self.subTest(reload=mutation), self.assertRaises((ValueError, OSError)):
+                            loader.main()
+                        self.assertEqual(live, loader.nft("-s", "list", "table", "inet", "hardening_filter").stdout)
+                    fragment.write_text(DOCKER)
+                    os.chmod(fragment, 0o600)
+                    loader.main()
                 self.assertEqual(live, loader.nft("-s", "list", "table", "inet", "hardening_filter").stdout)
                 for bad in (policy.replace("ct state invalid drop", "invalid nft syntax"),
                             policy.replace(str(fragment), str(root / "missing")),
