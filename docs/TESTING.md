@@ -308,9 +308,12 @@ the unit still reports failure and requires operator attention. A first setup
 with no previous policy never rolls back by removing an already committed
 protective table. File installation, service activation or recovery failures
 are errors, and console recovery may be required. The snapshot does not depend
-on Docker's startup order. To opt out, unset the override, remove the fragment
-and Apply; simply deleting a fragment while the persisted policy includes it
-is a rejected configuration, not an instruction to drop existing forwarding.
+on Docker's startup order. Apply retains the persisted fragment selection,
+including a custom path, when its environment override is omitted on a later
+run. To opt out deliberately, unset the path override and run
+`sudo env HARDEN_DOCKER_EGRESS_DISABLE=1 ./harden.sh --apply`; the fragment can
+then be removed. Simply deleting a selected fragment is a rejected
+configuration and leaves both forwarding sysctls and the live policy untouched.
 
 An optional host TCP exception for Ollama/n8n or another API requires both
 `HARDEN_INPUT_TCP_SOURCE` (one IPv4/IPv6 host literal, no CIDR/hostname) and
