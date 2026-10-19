@@ -270,3 +270,75 @@ Review the archive before transfer. Remove secrets, private keys, credentials,
 tokens, hostnames, addresses, and production-sensitive logs. Create one bounded
 issue per verified finding with the exact commit, command, phase, sanitized
 evidence, rollback state, and acceptance criteria.
+
+
+## Atomic firewall loader and recovery (#53, #54, #52)
+
+Apply, systemd start/reload and SSH rollback use the embedded Python 3 loader,
+installed at `/usr/local/libexec/server-hardening-firewall`. It checks a complete
+batch then submits the same immutable bytes in one nft transaction. Only
+`inet hardening_filter` is replaced; there is no separate live deletion or
+ruleset flush. A converged runtime fingerprint avoids redundant nft commits.
+The unit has no firewall-removing stop action. Do not disable the vendor
+nftables service or restart Docker, networking, SSH or Tailscale to apply this.
+
+Docker fragments are optional, but an explicitly selected missing file, an
+existing empty file, unsafe permissions, or malformed rules now fail visibly.
+The default path is `/etc/nftables.d/90-docker-egress.rules`; an override must
+also be a canonical path beneath `/etc/nftables.d`. Every directory and file
+must be root-owned, with no group/other write access and no symlinks. Suggested
+modes: directories 0755, fragments 0600. The loader reads through directory FDs
+with O_NOFOLLOW and validates a snapshot before nft sees it, including on boot.
+
+The supported fragment grammar is one rule per line: explicit distinct
+`iifname` and `oifname`, an IPv4 source CIDR (never /0), `tcp` or `udp`, explicit
+`dport` or a literal port set, optional `counter`, `accept`, and an optional
+simple comment. Nested includes, commands, wildcard interfaces and bare
+accepts are rejected. Comments and empty lines are allowed around real rules.
+For example (replace the interfaces and subnet with your assessed bridge):
+
+~~~nft
+iifname "docker0" oifname "eth0" ip saddr 172.17.0.0/16 tcp dport { 80, 443 } counter accept
+~~~
+
+If a reload fails, the current policy stays active. A self-contained,
+root-owned `/etc/nftables.d/.hardening-last-good.nft` snapshot provides boot
+recovery if the configured file/fragment later disappears or becomes invalid;
+the unit still reports failure and requires operator attention. A first setup
+with no previous policy never rolls back by removing an already committed
+protective table. File installation, service activation or recovery failures
+are errors, and console recovery may be required. The snapshot does not depend
+on Docker's startup order. To opt out, unset the override, remove the fragment
+and Apply; simply deleting a fragment while the persisted policy includes it
+is a rejected configuration, not an instruction to drop existing forwarding.
+
+An optional host TCP exception for Ollama/n8n or another API requires both
+`HARDEN_INPUT_TCP_SOURCE` (one IPv4/IPv6 host literal, no CIDR/hostname) and
+`HARDEN_INPUT_TCP_PORT` (1..65535). Supply both to the same Apply command using
+your own values, for example:
+
+~~~bash
+sudo env HARDEN_INPUT_TCP_SOURCE=YOUR_TRUSTED_SOURCE_IP HARDEN_INPUT_TCP_PORT=YOUR_API_TCP_PORT ./harden.sh --apply
+~~~
+
+The generated source/port rule persists across reload and reboot. Neither
+variable enables an exception by default. Omit both on a subsequent Apply to
+remove it. Existing SSH/Tailscale rules and established-connection handling
+still apply; this is an additional path for a trusted source, not API
+authentication or revocation of existing overlay access. Published Docker
+ports traverse forwarding and need their own reviewed Docker policy.
+
+`make check` includes unit/mocked failures and rendering tests. Linux CI also
+runs `sudo unshare --net --fork python3 scripts/firewall-helper-tests.py --namespace`
+with real nft for fresh/replacement/no-op transactions, invalid/missing includes,
+permissions, scope rejection, snapshot rollback, boot recovery and preservation
+of a foreign table. This is not a full Ubuntu target deployment test.
+
+Before merging, use a disposable Ubuntu VM with console recovery to test:
+fresh Apply and unchanged second Apply; reload/restart/boot with valid, invalid,
+missing and permission-invalid fragment; forced nft failure; failed SSH stage
+and retire rollback; IPv4/IPv6 SSH and Tailscale/WireGuard connectivity; Docker
+DNS/web/BuildKit egress and denied unsolicited forwarding. For the API exception,
+verify an allowed source succeeds and a different non-overlay source fails,
+including after reload/reboot. Never run these service/reboot tests on a
+production server without explicit approval.
