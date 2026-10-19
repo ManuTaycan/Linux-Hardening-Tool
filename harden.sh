@@ -3883,6 +3883,8 @@ def trusted_destination(path):
             return None
         if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
             raise ValueError("unsafe installation path: " + str(current))
+        if current == Path(path) and not stat.S_ISREG(info.st_mode):
+            raise ValueError("installation destination must be a regular file: " + path)
 
 
 def ports(value):
