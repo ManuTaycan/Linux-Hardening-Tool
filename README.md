@@ -17,7 +17,11 @@ hiding unresolved findings.
 
 **Release status:** pre-release; not production-ready
 
-**Supported families:** Ubuntu and Debian with systemd and APT
+**Target families:** Ubuntu and Debian hosts/VMs with systemd as PID 1 and APT.
+Apply is blocked in detected containers, chroots, private user namespaces, WSL,
+and inconclusive environments before logging or host changes. Container dry-run
+is diagnostic only; it is not a claim of container compatibility. See
+[execution boundaries](docs/TESTING.md#execution-boundaries-51).
 
 ## What it does
 
