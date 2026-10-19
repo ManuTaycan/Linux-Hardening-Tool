@@ -2265,6 +2265,7 @@ configure_sysctl() {
     local sysctl_root="${HARDEN_PROC_SYS_ROOT:-/proc/sys}"
     local temporary key value proc_path interface desired_rp_filter="" config_changed=0 runtime_reload_needed=0 failed=0 ipv6_disable_snapshot=0 sysctl_backup_taken=0
     local docker_forwarding=0
+    select_docker_egress || { log ERROR "Docker selection invalid; sysctl state left untouched"; return 1; }
     if docker_egress_requested; then
         docker_egress_enabled || { log ERROR "Unsafe or unavailable Docker opt-in; sysctl state left untouched"; return 1; }
         docker_forwarding=1
@@ -3845,6 +3846,31 @@ def api_rule(source, port):
     return f'        {family} saddr {address} tcp dport {int(port)} ct state new counter accept comment "operator TCP source exception"'
 
 
+def select_docker(override, disabled):
+    if disabled not in ("0", "1") or (disabled == "1" and override):
+        raise ValueError("Docker opt-out requires HARDEN_DOCKER_EGRESS_DISABLE=1 and no path override")
+    if disabled == "1":
+        return ""
+    selected = override
+    if not selected and os.path.lexists(CONFIG):
+        persisted = trusted_read(CONFIG, directory=None)
+        # A previously selected fragment is part of the persisted policy. Its
+        # removal is an error, not permission to turn off bridge forwarding.
+        expand(persisted)
+        includes = re.findall(r'^\s*include "([^"]+)"\s*$', persisted, re.M)
+        if len(includes) > 1:
+            raise ValueError("only one Docker fragment can be selected")
+        if includes:
+            selected = includes[0]
+    if not selected:
+        default = "/etc/nftables.d/90-docker-egress.rules"
+        if os.path.lexists(default):
+            selected = default
+    if selected:
+        docker_rules(selected)
+    return selected
+
+
 def expand(text):
     """Accept one owned table with three chains; no includes outside forward."""
     result, chain, seen, hooks, opened, closed = [], None, set(), set(), False, False
@@ -3949,6 +3975,9 @@ def main():
     if mode == "--api-rule":
         print(api_rule(*sys.argv[2:]))
         return None
+    if mode == "--docker-select":
+        print(select_docker(*sys.argv[2:]))
+        return None
     if mode == "--docker-check":
         docker_rules(sys.argv[2])
         return None
@@ -4025,11 +4054,15 @@ EOF
 }
 
 docker_egress_rules_file() {
-    printf '%s' "${HARDEN_DOCKER_EGRESS_RULES:-/etc/nftables.d/90-docker-egress.rules}"
+    printf '%s' "${DOCKER_EGRESS_SELECTED:-${HARDEN_DOCKER_EGRESS_RULES:-/etc/nftables.d/90-docker-egress.rules}}"
+}
+
+select_docker_egress() {
+    DOCKER_EGRESS_SELECTED="$(firewall_helper_command --docker-select "${HARDEN_DOCKER_EGRESS_RULES:-}" "${HARDEN_DOCKER_EGRESS_DISABLE:-0}")"
 }
 
 docker_egress_requested() {
-    [[ -n "${HARDEN_DOCKER_EGRESS_RULES:-}" || -e "$(docker_egress_rules_file)" || -L "$(docker_egress_rules_file)" ]]
+    [[ -n "${DOCKER_EGRESS_SELECTED:-}" ]]
 }
 
 docker_egress_enabled() {
@@ -4062,6 +4095,10 @@ configure_firewall() {
     fi
     local tailscale_input="" tailscale_forward="" wireguard_rule="" tailscale_healthy_before=0 ssh_rule="" ssh_port_set=""
     local docker_forward="" api_input=""
+    if ! select_docker_egress; then
+        FIREWALL_STATUS="FAILED (Docker fragment selection rejected; live policy untouched)"
+        return 1
+    fi
     if docker_egress_requested; then
         # The root-owned fragment is nft syntax, never sourced as shell code.
         docker_forward="        include \"$(docker_egress_rules_file)\""
