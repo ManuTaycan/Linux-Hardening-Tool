@@ -366,8 +366,16 @@ run_streamed() {
 package_lock_contention_output() {
     local output="$1"
     grep -Eqi \
-        'Could not get lock|Unable to acquire the .* lock|Unable to lock (the )?directory|Waiting for cache lock|frontend lock.*locked by another process|lock.*held by process|another process.*(apt|dpkg).*lock|^[[:space:]]*(Lock could not be acquired \(another package manager running\?\)|Cache lock can not be acquired, exiting|upgrade result: False Lock could not be acquired)[[:space:]]*$' \
+        'Could not get lock|Unable to acquire the .* lock|Unable to lock (the )?directory|Waiting for cache lock|frontend lock.*locked by another process|lock.*held by process|another process.*(apt|dpkg).*lock|(^|[[:space:]])(Lock could not be acquired \(another package manager running\?\)|Cache lock can not be acquired, exiting|upgrade result: False Lock could not be acquired)[[:space:]]*$' \
         <<< "$output"
+}
+
+package_unattended_error_output() {
+    # Python logging prefixes the observed lock messages with date/severity.
+    # Remove only those lines; a second real error must outrank lock retry.
+    local output="$1"
+    grep -Ev '(Lock could not be acquired \(another package manager running\?\)|Cache lock can not be acquired, exiting|upgrade result: False Lock could not be acquired)[[:space:]]*$' <<< "$output" \
+        | grep -Eq '(^|[[:space:]])(ERROR|CRITICAL)(:|[[:space:]])|upgrade result: False'
 }
 
 package_lock_owner_summary() {
@@ -469,6 +477,14 @@ package_command_lock_aware() {
         PACKAGE_COMMAND_OUTPUT="$(<"$temporary")"
         rm -f -- "$temporary"
         PACKAGE_COMMAND_EXIT_STATUS="$status"
+        if [[ "${command_args[0]:-}" == unattended-upgrade ]] \
+            && package_unattended_error_output "$PACKAGE_COMMAND_OUTPUT"; then
+            PACKAGE_COMMAND_ERROR_CLASS="package-command-error"
+            [[ "$status" -ne 0 ]] || status=1
+            [[ "$output_mode" == streamed || -z "$PACKAGE_COMMAND_OUTPUT" ]] || emit_block <<< "$PACKAGE_COMMAND_OUTPUT"
+            log ERROR "${label} reported a non-lock unattended-upgrade error; refusing success or lock retry"
+            return "$status"
+        fi
         # unattended-upgrade can report a failed lock acquisition with exit 0.
         if [[ "$status" -eq 0 ]] && ! {
             [[ "${command_args[0]:-}" == unattended-upgrade ]] \

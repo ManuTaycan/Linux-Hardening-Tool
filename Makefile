@@ -17,6 +17,7 @@ static:
 	./scripts/ci-static-checks.sh
 
 regression:
+	./scripts/package-result-tests.sh
 	python3 scripts/firewall-helper-tests.py
 	./scripts/firewall-apply-tests.sh
 	./scripts/docker-egress-tests.sh
