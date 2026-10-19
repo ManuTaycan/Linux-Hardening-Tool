@@ -3891,6 +3891,7 @@ EOF
             RP_TEST_TAILSCALE_ACTIVE="$active" RP_TEST_DEFAULT_ROUTES="$routes" RP_TEST_RULES="$rules" \
             RP_TEST_HEALTH="$health" RP_TEST_COMMAND_LOG="$commands" bash -c '
                 source "$1/harden.sh"; trap - ERR EXIT
+                select_docker_egress() { DOCKER_EGRESS_SELECTED=""; }
                 sysctl_candidates() { printf "%s\\n" "net.ipv4.conf.all.rp_filter=1" "net.ipv4.conf.default.rp_filter=1"; }
                 MODE=apply; BACKUP_DIR="$2/backup"; CHANGE_LOG="$2/changes.tsv"; : > "$CHANGE_LOG"
                 transaction_copy() { :; }; transaction_restore() { :; }
@@ -3921,6 +3922,7 @@ EOF
         RP_TEST_DEFAULT_ROUTES='default via 192.0.2.1 dev eth0' RP_TEST_HEALTH=clear \
         RP_TEST_COMMAND_LOG="$case_root/active/commands.log" bash -c '
             source "$1/harden.sh"; trap - ERR EXIT
+                select_docker_egress() { DOCKER_EGRESS_SELECTED=""; }
             sysctl_candidates() { printf "%s\\n" "net.ipv4.conf.all.rp_filter=1" "net.ipv4.conf.default.rp_filter=1"; }
             MODE=apply; BACKUP_DIR="$2/backup"; CHANGE_LOG="$2/changes.tsv"; : > "$CHANGE_LOG"
             transaction_copy() { :; }; transaction_restore() { :; }
@@ -3938,6 +3940,7 @@ EOF
         RP_TEST_DEFAULT_ROUTES='default via 192.0.2.1 dev eth0' RP_TEST_HEALTH=clear \
         RP_TEST_COMMAND_LOG="$case_root/active/commands.log" bash -c '
             source "$1/harden.sh"; trap - ERR EXIT
+                select_docker_egress() { DOCKER_EGRESS_SELECTED=""; }
             sysctl_candidates() { printf "%s\\n" "net.ipv4.conf.all.rp_filter=1" "net.ipv4.conf.default.rp_filter=1"; }
             MODE=apply; BACKUP_DIR="$2/backup"; CHANGE_LOG="$2/changes.tsv"; : > "$CHANGE_LOG"
             transaction_copy() { :; }; transaction_restore() { :; }
@@ -3965,6 +3968,7 @@ EOF
         RP_TEST_TAILSCALE_ACTIVE=0 RP_TEST_DEFAULT_ROUTES='default via 192.0.2.1 dev eth0' \
         RP_TEST_RULES='100: from 198.51.100.0/24 lookup 100' RP_TEST_COMMAND_LOG="$uncertain/commands.log" bash -c '
             source "$1/harden.sh"; trap - ERR EXIT
+                select_docker_egress() { DOCKER_EGRESS_SELECTED=""; }
             sysctl_candidates() { printf "%s\\n" "net.ipv4.conf.all.rp_filter=1" "net.ipv4.conf.default.rp_filter=1"; }
             MODE=apply; BACKUP_DIR="$2/backup"; CHANGE_LOG="$2/changes.tsv"; : > "$CHANGE_LOG"
             transaction_copy() { :; }; transaction_restore() { :; }
@@ -3995,6 +3999,7 @@ EOF
         RP_TEST_TAILSCALE_ACTIVE=0 RP_TEST_DEFAULT_ROUTES='default via 192.0.2.1 dev eth0' \
         RP_TEST_RULES='100: from 198.51.100.0/24 lookup 100' RP_TEST_COMMAND_LOG="$uncertain/commands.log" bash -c '
             source "$1/harden.sh"; trap - ERR EXIT
+                select_docker_egress() { DOCKER_EGRESS_SELECTED=""; }
             sysctl_candidates() { printf "%s\\n" "net.ipv4.conf.all.rp_filter=1" "net.ipv4.conf.default.rp_filter=1"; }
             MODE=apply; BACKUP_DIR="$2/backup"; CHANGE_LOG="$2/changes.tsv"; : > "$CHANGE_LOG"
             transaction_copy() { :; }; transaction_restore() { :; }
@@ -4014,6 +4019,7 @@ EOF
         RP_TEST_TAILSCALE_ACTIVE=0 RP_TEST_DEFAULT_ROUTES=$'default via 192.0.2.1 dev eth0\ndefault via 198.51.100.1 dev eth1' \
         RP_TEST_COMMAND_LOG="$multipath/commands.log" bash -c '
             source "$1/harden.sh"; trap - ERR EXIT
+                select_docker_egress() { DOCKER_EGRESS_SELECTED=""; }
             sysctl_candidates() { printf "%s\\n" "net.ipv4.conf.all.rp_filter=1" "net.ipv4.conf.default.rp_filter=1"; }
             MODE=apply; BACKUP_DIR="$2/backup"; CHANGE_LOG="$2/changes.tsv"; : > "$CHANGE_LOG"
             transaction_copy() { :; }; transaction_restore() { :; }
@@ -4038,6 +4044,7 @@ EOF
         RP_TEST_TAILSCALE_ACTIVE=0 RP_TEST_DEFAULT_ROUTES='default via 192.0.2.1 dev eth0' \
         RP_TEST_RULES='100: from 198.51.100.0/24 lookup 100' RP_TEST_COMMAND_LOG="$unreadable/commands.log" bash -c '
             source "$1/harden.sh"; trap - ERR EXIT
+                select_docker_egress() { DOCKER_EGRESS_SELECTED=""; }
             sysctl_candidates() { printf "%s\\n" "net.ipv4.conf.all.rp_filter=1" "net.ipv4.conf.default.rp_filter=1"; }
             MODE=apply; BACKUP_DIR="$2/backup"; CHANGE_LOG="$2/changes.tsv"; : > "$CHANGE_LOG"
             transaction_copy() { :; }; transaction_restore() { :; }
@@ -4064,6 +4071,7 @@ EOF
         HARDEN_SYSCTL_CONFIG="$dry/99-security-hardening.conf" HARDEN_RP_FILTER_REPORT="$dry/rp-filter-report.txt" \
         RP_TEST_TAILSCALE_ACTIVE=1 RP_TEST_DEFAULT_ROUTES='default via 192.0.2.1 dev eth0' RP_TEST_COMMAND_LOG="$dry/commands.log" bash -c '
             source "$1/harden.sh"; trap - ERR EXIT
+                select_docker_egress() { DOCKER_EGRESS_SELECTED=""; }
             sysctl_candidates() { printf "%s\\n" "net.ipv4.conf.all.rp_filter=1" "net.ipv4.conf.default.rp_filter=1"; }
             MODE=dry-run; configure_sysctl
             grep -Fxq original "$HARDEN_SYSCTL_CONFIG"
