@@ -2,6 +2,7 @@
 """Unit tests; --namespace additionally requires root in a private net namespace."""
 import hashlib
 import os
+import socket
 from pathlib import Path
 import subprocess
 import sys
@@ -52,6 +53,7 @@ DOCKER = 'iifname "docker0" oifname "eth0" ip saddr 172.17.0.0/16 tcp dport { 53
 class UnitTests(unittest.TestCase):
     def test_scope_and_policy(self):
         self.assertIn("policy drop", loader.expand(POLICY))
+        self.assertIn('comment "table chain"', loader.expand(POLICY.replace('counter drop', 'counter drop comment "table chain"')))
         for bad in (POLICY + "flush ruleset\n", POLICY.replace("policy drop", "policy accept", 1),
                     POLICY.replace('        counter drop', '        }; delete table ip foreign; {', 1),
                     POLICY.replace('        counter drop', '        include "/tmp/rules"', 1),
@@ -128,6 +130,46 @@ class NamespaceTests(unittest.TestCase):
         if os.geteuid() != 0 or os.readlink("/proc/self/ns/net") == os.readlink("/proc/1/ns/net"):
             raise RuntimeError("refusing nft test outside a private root network namespace")
 
+    def check_source_boundary(self):
+        # Real TCP packets from a second disposable namespace. Never enter the
+        # host network namespace or touch a host interface.
+        peer = subprocess.Popen(["unshare", "--net", "sleep", "60"])
+        server = socket.socket()
+        try:
+            import time
+            for _ in range(100):
+                try:
+                    if os.readlink(f"/proc/{peer.pid}/ns/net") != os.readlink("/proc/self/ns/net"):
+                        break
+                except FileNotFoundError:
+                    pass
+                time.sleep(0.01)
+            else:
+                self.fail("peer network namespace did not start")
+            def ip(*args):
+                subprocess.run(["ip", *args], check=True, capture_output=True)
+            prefix = ["nsenter", "-t", str(peer.pid), "-n"]
+            ip("link", "add", "test-server", "type", "veth", "peer", "name", "test-client")
+            ip("link", "set", "test-client", "netns", str(peer.pid))
+            ip("addr", "add", "192.0.2.1/24", "dev", "test-server")
+            ip("link", "set", "test-server", "up")
+            for address in ("192.0.2.10/24", "192.0.2.11/24"):
+                subprocess.run(prefix + ["ip", "addr", "add", address, "dev", "test-client"], check=True)
+            subprocess.run(prefix + ["ip", "link", "set", "test-client", "up"], check=True)
+            server.bind(("192.0.2.1", 11434))
+            server.listen(8)
+            client = ('import socket,sys; s=socket.socket(); s.settimeout(1); '
+                      's.bind((sys.argv[1],0)); s.connect(("192.0.2.1",11434))')
+            allowed = subprocess.run(prefix + [sys.executable, "-c", client, "192.0.2.10"], capture_output=True)
+            denied = subprocess.run(prefix + [sys.executable, "-c", client, "192.0.2.11"], capture_output=True)
+            self.assertEqual(allowed.returncode, 0, allowed.stderr)
+            self.assertNotEqual(denied.returncode, 0, "unexpected API access from a different source")
+        finally:
+            server.close()
+            peer.terminate()
+            peer.wait(timeout=5)
+            subprocess.run(["ip", "link", "delete", "test-server"], capture_output=True)
+
     def test_real_transactions_trust_and_boot(self):
         with tempfile.TemporaryDirectory(prefix="hardening-nft-", dir="/run") as root:
             root = Path(root)
@@ -173,6 +215,7 @@ class NamespaceTests(unittest.TestCase):
                 live = loader.nft("-s", "list", "table", "inet", "hardening_filter").stdout
                 for expected in ("tailscale0", "wg0", "2222", "11434", "docker0", "policy drop"):
                     self.assertIn(expected, live)
+                self.check_source_boundary()
                 loader.activate(policy)
                 self.assertEqual(live, loader.nft("-s", "list", "table", "inet", "hardening_filter").stdout)
                 for bad in (policy.replace("ct state invalid drop", "invalid nft syntax"),

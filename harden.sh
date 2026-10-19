@@ -368,7 +368,7 @@ run_streamed() {
 package_lock_contention_output() {
     local output="$1"
     grep -Eqi \
-        'Could not get lock|Unable to acquire the .* lock|Unable to lock (the )?directory|Waiting for cache lock|frontend lock.*locked by another process|lock.*held by process|another process.*(apt|dpkg).*lock|(^|[[:space:]])(Lock could not be acquired \(another package manager running\?\)|Cache lock can not be acquired, exiting|upgrade result: False Lock could not be acquired)[[:space:]]*$' \
+        'Could not get lock|Unable to acquire the .* lock|Unable to lock (the )?directory|Waiting for cache lock|frontend lock.*locked by another process|lock.*held by process|another process.*(apt|dpkg).*lock|(^|[[:space:]])(Lock could not be acquired \(another package manager running\?\)|Lock file is already taken, exiting|Cache lock can not be acquired, exiting|upgrade result: False Lock could not be acquired)[[:space:]]*$' \
         <<< "$output"
 }
 
@@ -376,8 +376,8 @@ package_unattended_error_output() {
     # Python logging prefixes the observed lock messages with date/severity.
     # Remove only those lines; a second real error must outrank lock retry.
     local output="$1"
-    grep -Ev '(Lock could not be acquired \(another package manager running\?\)|Cache lock can not be acquired, exiting|upgrade result: False Lock could not be acquired)[[:space:]]*$' <<< "$output" \
-        | grep -Eq '(^|[[:space:]])(ERROR|CRITICAL)(:|[[:space:]])|upgrade result: False'
+    grep -Ev '(Lock could not be acquired \(another package manager running\?\)|Lock file is already taken, exiting|Cache lock can not be acquired, exiting|upgrade result: False Lock could not be acquired)[[:space:]]*$' <<< "$output" \
+        | grep -E '(^|[[:space:]])(ERROR|CRITICAL)(:|[[:space:]])|upgrade result: False' >/dev/null
 }
 
 package_lock_owner_summary() {
@@ -3956,7 +3956,8 @@ def expand(text):
             # Inline braces are limited to literal sets. No scope escape, include,
             # command separator, define, variable, wildcard or secondary file.
             plain = re.sub(r"\{ [A-Za-z0-9_, -]+ \}", "", line)
-            if any(c in plain for c in '{};\\$#') or re.search(r"\b(include|define|flush|delete|destroy|table|chain)\b", line):
+            plain = re.sub(r'"[^"\\]*"', '""', plain)
+            if any(c in plain for c in '{};\\$#') or re.search(r"\b(include|define|flush|delete|destroy|table|chain)\b", plain):
                 raise ValueError("unsupported rule or scope escape")
         result.append(raw)
     if not closed or chain or seen != {"input", "forward", "output"} or hooks != seen:
