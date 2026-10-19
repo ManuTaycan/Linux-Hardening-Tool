@@ -67,6 +67,7 @@ class UnitTests(unittest.TestCase):
         self.assertIn("ip6 saddr 2001:db8::10", loader.api_rule("2001:db8::10", "443"))
         for source, port in (("", "443"), ("192.0.2.1", ""), ("0.0.0.0/0", "443"),
                              ("0.0.0.0", "443"), ("::", "443"), ("ff02::1", "443"),
+                             ("fe80::1%lo", "443"), ("fe80::1%lo\naccept", "443"),
                              ("example.test", "443"), ("192.0.2.1", "65536"),
                              ("192.0.2.1; accept", "443"), ("192.0.2.1", "80; accept")):
             with self.subTest(source=source, port=port), self.assertRaises(ValueError):

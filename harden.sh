@@ -3730,6 +3730,8 @@ def api_rule(source, port):
     if not re.fullmatch(r"[0-9]+", port):
         raise ValueError("set both HARDEN_INPUT_TCP_SOURCE and HARDEN_INPUT_TCP_PORT")
     ports(port)
+    if not re.fullmatch(r"[0-9A-Fa-f:.]+", source):
+        raise ValueError("TCP source must be one IP literal without zone, CIDR or extra syntax")
     address = ipaddress.ip_address(source)
     if address.is_unspecified or address.is_multicast:
         raise ValueError("TCP source must be one unicast host address")
