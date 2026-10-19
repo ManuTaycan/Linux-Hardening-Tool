@@ -3965,7 +3965,8 @@ configure_firewall() {
             log ERROR "Recoverable SSH migration firewall apply cannot complete because nft is unavailable"
             return 1
         fi
-        return 0
+        log ERROR "Firewall cannot be activated without nft; install nftables and retry"
+        return 1
     fi
     local tailscale_input="" tailscale_forward="" wireguard_rule="" tailscale_healthy_before=0 ssh_rule="" ssh_port_set=""
     local docker_forward="" api_input=""
@@ -4091,8 +4092,8 @@ EOF
     # No previous policy means removing the new default-drop table would open
     # the host. Retain the validated policy and its recovery loader instead.
     if [[ -z "$own_before" ]]; then
-        FIREWALL_STATUS="FAILED (no previous table; validated protection retained)"
-        log ERROR "Initial firewall setup failed; retained validated protection. Inspect service and SSH/Tailscale health from console"
+        FIREWALL_STATUS="FAILED (no previous table; inspect runtime and retained candidate from console)"
+        log ERROR "Initial firewall setup failed; no table was removed. Verify runtime protection and service/SSH/Tailscale health from console"
         return 1
     fi
     restore_ok=1

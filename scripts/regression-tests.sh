@@ -2773,9 +2773,9 @@ EOF
     env HARDEN_SOURCE_ONLY=1 bash -c '
         source "$1/harden.sh"; trap - ERR EXIT
         MODE=apply; BACKUP_DIR="$2/recoverable-firewall-backup"; mkdir -p "$BACKUP_DIR"; died=0
-        nft() { return 1; }; run_streamed() { "$@"; }; die() { died=1; return 99; }; log() { :; }
+        nft() { return 1; }; firewall_helper_command() { [[ "$1" == --api-rule ]]; }; run_streamed() { "$@"; }; die() { died=1; return 99; }; log() { :; }
         ! configure_firewall --recoverable
-        [[ "$died" == 0 && "$FIREWALL_STATUS" == FAILED ]]
+        [[ "$died" == 0 && "$FIREWALL_STATUS" == FAILED* ]]
     ' _ "$repo_root" "$case_root" || fail "recoverable SSH-migration firewall validation still exited the process"
 
     env HARDEN_SOURCE_ONLY=1 bash -c '
@@ -2785,8 +2785,8 @@ EOF
         record_skip() { :; }; log() { :; }
         ! configure_firewall --recoverable
         [[ "$FIREWALL_STATUS" == FAILED ]]
-        configure_firewall
-    ' _ "$repo_root" "$case_root" || fail "recoverable SSH-migration firewall apply did not fail when nft was unavailable while generic Phase 07 behavior changed"
+        ! configure_firewall
+    ' _ "$repo_root" "$case_root" || fail "firewall apply did not fail explicitly when nft was unavailable"
 
     env HARDEN_SOURCE_ONLY=1 bash -c '
         source "$1/harden.sh"; trap - ERR EXIT
@@ -2808,7 +2808,7 @@ EOF
         install_managed_file() { local target="$1"; shift 2; cat > "$target"; MANAGED_FILE_CHANGED=1; }
         sshd() { if [[ "$1" == -t ]]; then return 0; fi; awk "\$1 == \"Port\" {print \"port \" \$2}" "$(ssh_migration_config_path)"; }; ssh_port_is_listening() { grep -Fxq "Port $1" "$(ssh_migration_config_path)"; }
         ssh_port_policy_healthy() { [[ "$1" == dual && "$2" == 22 && "$3" == 2222 ]] && grep -Fxq "Port 22" "$(ssh_migration_config_path)" && grep -Fxq "Port 2222" "$(ssh_migration_config_path)" && [[ "$(< "$test_dir/firewall")" == dual && "$(< "$test_dir/fail2ban")" == dual ]] && grep -Fxq "status=staged" "$HARDEN_SSH_PORT_STATE_FILE"; }
-        run_streamed() { return 0; }; systemctl() { return 0; }; configure_fail2ban() { printf new > "$test_dir/fail2ban"; FAIL2BAN_STATUS=OK; return 0; }; command() { [[ "$1" == -v && "${2:-}" == nft ]] && return 1; builtin command "$@"; }; record_skip() { :; }; write_ssh_port_migration_report() { :; }; log() { :; }
+        run_streamed() { return 0; }; firewall_apply_persisted() { return 0; }; systemctl() { return 0; }; configure_fail2ban() { printf new > "$test_dir/fail2ban"; FAIL2BAN_STATUS=OK; return 0; }; command() { [[ "$1" == -v && "${2:-}" == nft ]] && return 1; builtin command "$@"; }; record_skip() { :; }; write_ssh_port_migration_report() { :; }; log() { :; }
         ! retire_ssh_port_migration
         [[ "$SSH_PORT_MIGRATION_STATUS" == FAILED/ROLLED\ BACK* ]] && ! grep -Fxq "status=retired" "$HARDEN_SSH_PORT_STATE_FILE" && ssh_port_policy_healthy dual 22 2222
     ' _ "$repo_root" "$case_root" || fail "unavailable nft during final retire did not prove dual-port rollback or incorrectly wrote retired state"
