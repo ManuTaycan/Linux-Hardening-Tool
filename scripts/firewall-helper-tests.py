@@ -81,6 +81,18 @@ class UnitTests(unittest.TestCase):
             with self.subTest(bad=bad), patch.object(loader, "trusted_read", return_value=bad), self.assertRaises(ValueError):
                 loader.docker_rules("unused")
 
+    def test_persisted_docker_selection(self):
+        configured = POLICY.replace('        counter drop\n    }\n    chain output',
+                                    '        include "/etc/nftables.d/custom.rules"\n        counter drop\n    }\n    chain output')
+        with patch.object(loader.os.path, "lexists", return_value=True), \
+                patch.object(loader, "trusted_read", return_value=configured), \
+                patch.object(loader, "docker_rules", return_value=DOCKER):
+            self.assertEqual(loader.select_docker("", "0"), "/etc/nftables.d/custom.rules")
+            self.assertEqual(loader.select_docker("", "1"), "")
+            with patch.object(loader, "docker_rules", side_effect=FileNotFoundError("removed fragment")), self.assertRaises(OSError):
+                loader.select_docker("", "0")
+            with self.assertRaises(ValueError): loader.select_docker("/etc/nftables.d/custom.rules", "1")
+
     def test_transaction_failures_and_noop(self):
         live, state, calls = ["previous policy"], {}, []
         failure = [None]
@@ -216,6 +228,8 @@ class NamespaceTests(unittest.TestCase):
                     self.assertIn(expected, live)
                 self.check_source_boundary()
                 config.write_text(policy)
+                self.assertEqual(loader.select_docker("", "0"), str(fragment))
+                self.assertEqual(loader.select_docker("", "1"), "")
                 # Exercise the real persisted start/reload entry point as well
                 # as direct candidate application. Invalid includes must retain
                 # the active last-good policy and report the rejected reload.
@@ -229,6 +243,8 @@ class NamespaceTests(unittest.TestCase):
                         if mutation == "missing": fragment.unlink()
                         with self.subTest(reload=mutation), self.assertRaises((ValueError, OSError)):
                             loader.main()
+                        with self.subTest(apply_selection=mutation), self.assertRaises((ValueError, OSError)):
+                            loader.select_docker("", "0")
                         self.assertEqual(live, loader.nft("-s", "list", "table", "inet", "hardening_filter").stdout)
                     fragment.write_text(DOCKER)
                     os.chmod(fragment, 0o600)

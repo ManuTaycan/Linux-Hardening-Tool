@@ -39,7 +39,7 @@ for scenario in fresh existing converged install-failure unit-failure nft-failur
         firewall_helper_command() {
             printf "%s\n" "$*" >> "$TEST_ROOT/helper"
             case "$1" in
-                --api-rule|--path-check) return 0 ;;
+                --api-rule|--path-check|--docker-select) return 0 ;;
                 --check-stdin) cat > "$TEST_ROOT/candidate" ;;
                 --apply-stdin)
                     cat > "$TEST_ROOT/restored-runtime"
