@@ -20,6 +20,7 @@ ssh_firewall_ports() { printf '2222\n'; }
 # firewall-helper-tests.py and the separate Linux network namespace test.
 firewall_helper_command() {
     case "$1" in
+        --docker-select) [[ "$state" == absent ]] || printf '%s\n' "$HARDEN_DOCKER_EGRESS_RULES" ;;
         --api-rule) return 0 ;;
         --check-stdin) cat > "$test_root/candidate.nft"; return 1 ;;
         --docker-check) [[ -s "$2" && ! -L "$2" && "$state" != unsafe ]] ;;
