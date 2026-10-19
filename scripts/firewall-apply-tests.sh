@@ -4,7 +4,7 @@ set -Eeuo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 test_root="$(mktemp -d)"
 trap 'rm -rf -- "$test_root"' EXIT
-for scenario in fresh existing converged install-failure unit-failure snapshot-failure nft-failure enable-failure start-failure health-failure rollback-failure; do
+for scenario in fresh existing converged install-failure unit-failure snapshot-failure nft-failure enable-failure start-failure health-failure rollback-failure forwarding-failure forwarding-restore-failure; do
     env HARDEN_SOURCE_ONLY=1 TEST_CASE="$scenario" TEST_ROOT="$test_root/$scenario" bash -c '
         source "$1/harden.sh"; trap - ERR EXIT
         mkdir -p "$TEST_ROOT"; MODE=apply; BACKUP_DIR="$TEST_ROOT"; SSH_PORT=22
@@ -56,6 +56,10 @@ for scenario in fresh existing converged install-failure unit-failure snapshot-f
             [[ "$TEST_CASE" != nft-failure && "$TEST_CASE" != rollback-failure ]]
         }
         ssh_owned_firewall_allows_ports() { [[ "$TEST_CASE" != health-failure ]]; }
+        activate_deferred_docker_forwarding() {
+            [[ "$TEST_CASE" != forwarding-restore-failure ]] || { DOCKER_FORWARDING_RESTORE_FAILED=1; return 1; }
+            [[ "$TEST_CASE" != forwarding-failure ]]
+        }
         case "$TEST_CASE" in
             fresh|existing|converged)
                 configure_firewall
@@ -66,9 +70,12 @@ for scenario in fresh existing converged install-failure unit-failure snapshot-f
             *)
                 ! configure_firewall --recoverable
                 [[ "$FIREWALL_STATUS" == FAILED* ]]
-                if [[ "$TEST_CASE" != unit-failure && "$TEST_CASE" != snapshot-failure ]]; then
+                if [[ "$TEST_CASE" != unit-failure && "$TEST_CASE" != snapshot-failure && "$TEST_CASE" != forwarding-restore-failure ]]; then
                     grep -Fxq "previous snapshot" "$TEST_ROOT/restored-runtime"
                     grep -Fq firewall-service "$TEST_ROOT/restores"
+                fi
+                if [[ "$TEST_CASE" == forwarding-restore-failure ]]; then
+                    [[ "$FIREWALL_STATUS" == *firewall\ retained* && ! -e "$TEST_ROOT/restored-runtime" ]]
                 fi
                 if [[ "$TEST_CASE" == snapshot-failure ]]; then
                     [[ ! -e "$TEST_ROOT/99-security-hardening.nft" ]]

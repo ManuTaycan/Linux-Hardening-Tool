@@ -68,6 +68,8 @@ LYNIS_WARNINGS="unknown"
 LYNIS_SUGGESTIONS="unknown"
 LYNIS_PARSE_STATUS="NOT RUN"
 FIREWALL_STATUS="NOT RUN"
+DOCKER_FORWARDING_DEFERRED=0
+DOCKER_FORWARDING_RESTORE_FAILED=0
 SSH_STATUS="NOT RUN"
 PAM_STATUS="NOT RUN"
 FAILED_LOGIN_STATUS="NOT RUN"
@@ -2350,10 +2352,20 @@ configure_sysctl() {
     local sysctl_root="${HARDEN_PROC_SYS_ROOT:-/proc/sys}"
     local temporary key value proc_path interface desired_rp_filter="" config_changed=0 runtime_reload_needed=0 failed=0 ipv6_disable_snapshot=0 sysctl_backup_taken=0
     local docker_forwarding=0
+    DOCKER_FORWARDING_DEFERRED=0
     select_docker_egress || { log ERROR "Docker selection invalid; sysctl state left untouched"; return 1; }
     if docker_egress_requested; then
         docker_egress_enabled || { log ERROR "Unsafe or unavailable Docker opt-in; sysctl state left untouched"; return 1; }
         docker_forwarding=1
+        # Never introduce routing before the new default-drop forward policy is
+        # committed. Existing forwarding=1 is preserved for established roles.
+        local current_docker_forwarding
+        current_docker_forwarding="$(sysctl -n net.ipv4.conf.all.forwarding)" || return 1
+        case "$current_docker_forwarding" in
+            0) docker_forwarding=0; DOCKER_FORWARDING_DEFERRED=1 ;;
+            1) ;;
+            *) log ERROR "Cannot determine IPv4 forwarding safely; sysctl state left untouched"; return 1 ;;
+        esac
     fi
     detect_ipv6_policy "$config"
     if systemctl is-active --quiet tailscaled.service 2>/dev/null; then
@@ -4157,6 +4169,38 @@ docker_egress_enabled() {
     firewall_helper_command --docker-check "$(docker_egress_rules_file)"
 }
 
+activate_deferred_docker_forwarding() {
+    [[ "$DOCKER_FORWARDING_DEFERRED" -eq 1 ]] || return 0
+    local config="${HARDEN_SYSCTL_CONFIG:-/etc/sysctl.d/99-security-hardening.conf}" forward_policy="" candidate=""
+    DOCKER_FORWARDING_RESTORE_FAILED=0
+    forward_policy="$(nft list chain inet hardening_filter forward)" || return 1
+    grep -Eq 'type filter hook forward .*; policy drop;' <<< "$forward_policy" || return 1
+    docker_egress_enabled || return 1
+    candidate="$(mktemp)" || return 1
+    if ! awk '$1 == "net.ipv4.conf.all.forwarding" {$0="net.ipv4.conf.all.forwarding = 1"; found++} {print} END {if (found != 1) exit 1}' "$config" > "$candidate"; then
+        rm -f -- "$candidate"
+        log ERROR "Managed sysctl file must contain exactly one Docker forwarding setting"
+        return 1
+    fi
+    transaction_copy "$config" sysctl-docker-forwarding.conf || { rm -f -- "$candidate"; return 1; }
+    if install_managed_file "$config" 0644 < "$candidate" \
+        && run_streamed sysctl -w net.ipv4.conf.all.forwarding=1 \
+        && [[ "$(sysctl -n net.ipv4.conf.all.forwarding)" == 1 ]]; then
+        DOCKER_FORWARDING_DEFERRED=0
+        rm -f -- "$candidate"
+        record_change "Enabled explicit Docker IPv4 forwarding after committing the owned default-drop firewall"
+        return 0
+    fi
+    rm -f -- "$candidate"
+    transaction_restore "$config" sysctl-docker-forwarding.conf || DOCKER_FORWARDING_RESTORE_FAILED=1
+    if ! run_streamed sysctl -w net.ipv4.conf.all.forwarding=0 \
+        || [[ "$(sysctl -n net.ipv4.conf.all.forwarding)" != 0 ]]; then
+        DOCKER_FORWARDING_RESTORE_FAILED=1
+    fi
+    log ERROR "Docker forwarding activation failed; config/runtime restoration failure=${DOCKER_FORWARDING_RESTORE_FAILED}"
+    return 1
+}
+
 configure_firewall() {
     local recoverable=0
     [[ "${1:-}" != --recoverable ]] || recoverable=1
@@ -4305,11 +4349,17 @@ EOF
         && run_streamed systemctl enable server-hardening-firewall.service \
         && { systemctl is-active --quiet server-hardening-firewall.service || run_streamed systemctl start server-hardening-firewall.service; } \
         && ssh_owned_firewall_allows_ports; then
-        if [[ "$tailscale_healthy_before" -eq 0 ]] || tailscale status >/dev/null 2>&1; then
+        if { [[ "$tailscale_healthy_before" -eq 0 ]] || tailscale status >/dev/null 2>&1; } \
+            && activate_deferred_docker_forwarding; then
             FIREWALL_STATUS="OK (atomic owned table; other tables preserved)"
             [[ "$changed" -eq 0 ]] || record_change "Activated persistent owned dual-stack firewall; SSH ${ssh_ports[*]}/tcp preserved"
             return 0
         fi
+    fi
+    if [[ "$DOCKER_FORWARDING_RESTORE_FAILED" -eq 1 ]]; then
+        FIREWALL_STATUS="FAILED (Docker forwarding restoration uncertain; validated default-drop firewall retained)"
+        log ERROR "Retained protective firewall because IPv4 forwarding rollback could not be proven; console recovery is required"
+        return 1
     fi
     # No previous policy means removing the new default-drop table would open
     # the host. Retain the validated policy and its recovery loader instead.
