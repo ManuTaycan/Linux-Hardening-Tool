@@ -5,9 +5,7 @@ IFS=$'\n\t'
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-bash -n harden.sh
-bash -n install.sh
-bash -n scripts/*.sh
+for script in harden.sh install.sh scripts/*.sh; do bash -n "$script"; done
 sha256sum -c SHA256SUMS
 ./scripts/ci-static-checks.sh
 
