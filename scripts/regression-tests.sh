@@ -1268,7 +1268,7 @@ printf '%s\n' "$count" > "$UNATTENDED_TEST_COUNT"
 [[ "${LC_ALL:-}" == C ]] || exit 64
 case "${UNATTENDED_TEST_CASE:-converged}" in
     timer-race)
-        [[ -s "$UNATTENDED_TEST_SYSTEMCTL_LOG" ]] || exit 65
+        : # validation precedes new timer activation; contention can already exist
         if [[ "$count" -eq 1 ]]; then
             printf 'Lock could not be acquired (another package manager running?)\n' >&2
             exit 1
@@ -1318,6 +1318,10 @@ EOF
         HARDEN_APT_LOCK_MAX_ATTEMPTS=3 bash -c '
             source "$1/harden.sh"; trap - ERR EXIT
             MODE=apply
+            OS_ID=ubuntu
+            transaction_copy() { :; }; transaction_restore() { :; }
+            validate_unattended_policy() { return 0; }
+            updates_timer_state() { case "$1" in is-enabled) printf "disabled\n" ;; is-active) printf "inactive\n" ;; esac; }
             install_managed_file() { cat >/dev/null; }
             run() { "$@"; }
             log() { printf "%s\n" "$*" >> "$UNATTENDED_TEST_LOG"; }
@@ -1372,6 +1376,10 @@ EOF
         HARDEN_APT_LOCK_MAX_ATTEMPTS=2 bash -c '
             source "$1/harden.sh"; trap - ERR EXIT
             MODE=apply
+            OS_ID=ubuntu
+            transaction_copy() { :; }; transaction_restore() { :; }
+            validate_unattended_policy() { return 0; }
+            updates_timer_state() { case "$1" in is-enabled) printf "disabled\n" ;; is-active) printf "inactive\n" ;; esac; }
             install_managed_file() { cat >/dev/null; }
             run() { "$@"; }
             log() { :; }

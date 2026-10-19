@@ -934,41 +934,130 @@ EOF
     fi
 }
 
+unattended_security_origins() {
+    case "$OS_ID" in
+        ubuntu)
+            printf '%s\n' 'origin=Ubuntu,archive=${distro_codename}-security,label=Ubuntu' \
+                'origin=UbuntuESMApps,archive=${distro_codename}-apps-security' \
+                'origin=UbuntuESM,archive=${distro_codename}-infra-security'
+            ;;
+        debian) printf '%s\n' 'origin=Debian,codename=${distro_codename}-security,label=Debian-Security' ;;
+        *) return 1 ;;
+    esac
+}
+
+render_unattended_policy() {
+    local origin
+    # APT concatenates list settings unless they are explicitly cleared.
+    printf '#clear Unattended-Upgrade::Allowed-Origins;\n#clear Unattended-Upgrade::Origins-Pattern;\nUnattended-Upgrade::Origins-Pattern {\n'
+    while IFS= read -r origin; do printf '    "%s";\n' "$origin"; done < <(unattended_security_origins)
+    cat <<'EOF'
+};
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "false";
+Unattended-Upgrade::Remove-New-Unused-Dependencies "false";
+Unattended-Upgrade::Remove-Unused-Dependencies "false";
+Unattended-Upgrade::Automatic-Reboot "false";
+Unattended-Upgrade::Automatic-Reboot-WithUsers "false";
+Unattended-Upgrade::Allow-downgrade "false";
+Unattended-Upgrade::AutoFixInterruptedDpkg "false";
+Unattended-Upgrade::SyslogEnable "true";
+Unattended-Upgrade::SyslogFacility "daemon";
+EOF
+}
+
+validate_unattended_policy() {
+    local dump status=0 origins
+    origins="$(unattended_security_origins)" || return 1
+    dump="$(mktemp)" || return 1
+    if ! LC_ALL=C apt-config dump > "$dump"; then rm -f -- "$dump"; return 1; fi
+    python3 - "$dump" "$origins" <<'UPDATES_PYTHON' || status=$?
+import re
+import sys
+from pathlib import Path
+values = {}
+for line in Path(sys.argv[1]).read_text().splitlines():
+    match = re.fullmatch(r'([^ ]+) "([^"\\]*)";', line)
+    if match:
+        values.setdefault(match[1].lower(), []).append(match[2])
+expected = sys.argv[2].splitlines()
+if values.get('unattended-upgrade::origins-pattern::', []) != expected or values.get('unattended-upgrade::allowed-origins::', []):
+    sys.exit('Conflicting effective unattended origins; inspect apt-config dump and later APT fragments')
+for key in ('Remove-Unused-Kernel-Packages', 'Remove-New-Unused-Dependencies', 'Remove-Unused-Dependencies',
+            'Automatic-Reboot', 'Automatic-Reboot-WithUsers', 'Allow-downgrade', 'AutoFixInterruptedDpkg'):
+    if values.get('unattended-upgrade::' + key.lower()) != ['false']:
+        sys.exit('Unsafe effective unattended setting: ' + key)
+for key in ('Enable', 'Update-Package-Lists', 'Unattended-Upgrade'):
+    if values.get('apt::periodic::' + key.lower()) != ['1']:
+        sys.exit('Automatic updates not enabled by effective APT configuration: ' + key)
+UPDATES_PYTHON
+    rm -f -- "$dump"
+    return "$status"
+}
+
+updates_timer_state() {
+    systemctl "$1" "$2" 2>/dev/null || true
+}
+
 configure_updates() {
-    install_managed_file /etc/apt/apt.conf.d/20auto-upgrades 0644 <<'EOF'
+    local periodic="/etc/apt/apt.conf.d/20auto-upgrades" policy="/etc/apt/apt.conf.d/52unattended-hardening"
+    local timer reason="" rollback_ok=1
+    local -A timer_enabled=() timer_active=()
+    if [[ "$MODE" == apply ]]; then
+        for timer in apt-daily.timer apt-daily-upgrade.timer; do
+            timer_enabled[$timer]="$(updates_timer_state is-enabled "$timer")"
+            timer_active[$timer]="$(updates_timer_state is-active "$timer")"
+            if [[ "${timer_enabled[$timer]}" != enabled && "${timer_enabled[$timer]}" != enabled-runtime && "${timer_enabled[$timer]}" != disabled ]] \
+                || [[ "${timer_active[$timer]}" != active && "${timer_active[$timer]}" != inactive ]]; then
+                UPDATES_STATUS="FAILED (masked, unavailable or ambiguous APT timer: ${timer})"
+                record_skip "automatic updates" "$UPDATES_STATUS; inspect systemctl status and existing scheduler policy"
+                return 0
+            fi
+        done
+    fi
+    transaction_copy "$periodic" updates-periodic
+    transaction_copy "$policy" updates-policy
+    if ! install_managed_file "$periodic" 0644 <<'EOF'
 APT::Periodic::Enable "1";
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Download-Upgradeable-Packages "1";
 APT::Periodic::AutocleanInterval "7";
 APT::Periodic::Unattended-Upgrade "1";
 EOF
-
-    install_managed_file /etc/apt/apt.conf.d/52unattended-hardening 0644 <<'EOF'
-Unattended-Upgrade::Origins-Pattern {
-    "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
-    "origin=Ubuntu,codename=${distro_codename}-security,label=Ubuntu";
-};
-Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
-Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
-Unattended-Upgrade::Remove-Unused-Dependencies "true";
-Unattended-Upgrade::Automatic-Reboot "false";
-Unattended-Upgrade::SyslogEnable "true";
-Unattended-Upgrade::SyslogFacility "daemon";
-EOF
-
-    if command -v systemctl >/dev/null 2>&1; then
-        run systemctl enable --now apt-daily.timer apt-daily-upgrade.timer || true
+    then reason="periodic configuration installation"; fi
+    if [[ -z "$reason" ]] && ! render_unattended_policy | install_managed_file "$policy" 0644; then
+        reason="unattended policy installation"
     fi
-    if [[ "$MODE" == "apply" ]] && command -v unattended-upgrade >/dev/null 2>&1; then
-        if package_unattended_capture "unattended-upgrades configuration validation" --dry-run --debug; then
-            UPDATES_STATUS="OK"
-        else
-            UPDATES_STATUS="FAILED (unattended-upgrade validation: ${PACKAGE_COMMAND_ERROR_CLASS})"
-            record_skip "automatic updates" "unattended-upgrade dry-run validation failed (${PACKAGE_COMMAND_ERROR_CLASS})"
+    if [[ "$MODE" == dry-run ]]; then
+        UPDATES_STATUS="PLANNED (security origins only; no removal or reboot; validate before enabling distro timers)"
+        return 0
+    fi
+    if [[ -z "$reason" ]] && ! validate_unattended_policy; then reason="effective APT configuration conflict or parse failure"; fi
+    if [[ -z "$reason" ]]; then
+        if ! command -v unattended-upgrade >/dev/null 2>&1; then reason="unattended-upgrade binary unavailable"
+        elif ! package_unattended_capture "unattended-upgrades configuration validation" --dry-run --debug; then
+            reason="unattended-upgrade validation: ${PACKAGE_COMMAND_ERROR_CLASS}"
         fi
-    else
-        UPDATES_STATUS="PLANNED"
     fi
+    if [[ -z "$reason" ]]; then
+        if ! run systemctl enable --now apt-daily.timer apt-daily-upgrade.timer; then reason="APT timer activation"; fi
+        for timer in apt-daily.timer apt-daily-upgrade.timer; do
+            if ! systemctl is-enabled --quiet "$timer" || ! systemctl is-active --quiet "$timer"; then
+                reason="APT timer health: ${timer}"
+            fi
+        done
+    fi
+    if [[ -z "$reason" ]]; then UPDATES_STATUS="OK"; return 0; fi
+    # Restore only the timer state this operation changed. Never stop/kill APT,
+    # dpkg, PackageKit, unattended-upgrade or their service processes.
+    for timer in apt-daily.timer apt-daily-upgrade.timer; do
+        if [[ "${timer_active[$timer]}" == inactive ]]; then systemctl stop "$timer" || rollback_ok=0; fi
+        if [[ "${timer_enabled[$timer]}" == disabled ]]; then systemctl disable "$timer" || rollback_ok=0; fi
+    done
+    transaction_restore "$periodic" updates-periodic || rollback_ok=0
+    transaction_restore "$policy" updates-policy || rollback_ok=0
+    UPDATES_STATUS="FAILED (${reason})"
+    record_skip "automatic updates" "${UPDATES_STATUS}; previous configuration restored=${rollback_ok}. Inspect apt-config dump, systemctl status apt-daily*.timer and /var/log/unattended-upgrades/"
+    return 0
 }
 
 enable_needrestart_list_only() {
