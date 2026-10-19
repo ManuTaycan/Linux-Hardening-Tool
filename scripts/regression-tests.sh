@@ -730,7 +730,7 @@ EOF
                 > "$2/kernel-module-lockdown.service"
             render_kernel_module_preload_unit /proc/sys/kernel/modules_disabled "$2/kernel-module-lockdown" \
                 > "$2/kernel-module-netfilter-preload.service"
-            render_server_hardening_firewall_unit > "$2/server-hardening-firewall.service"
+            render_server_hardening_firewall_unit | sed "s@/usr/local/libexec/server-hardening-firewall@/bin/true@g" > "$2/server-hardening-firewall.service"
             render_tailscale_preload_dropin > "$2/tailscaled.service.d/99-netfilter-module-preload.conf"
         ' _ "$repo_root" "$verify_dir" || fail "could not render the generated lock helper/unit fixture"
         cat > "$verify_dir/tailscaled.service" <<'EOF'
@@ -2352,7 +2352,7 @@ EOF
     env HARDEN_SOURCE_ONLY=1 HARDEN_SSH_PORT_STATE_FILE="$case_root/rollback-state" HARDEN_SSH_PORT_REPORT="$case_root/rollback-report" bash -c '
         source "$1/harden.sh"; trap - ERR EXIT
         test_dir="$2"; MODE=apply; BACKUP_DIR="$test_dir/rollback-backup"; mkdir -p "$BACKUP_DIR"; SSH_PORT=22; SSH_SERVICE=ssh.service
-        transaction_restore() { printf "%s\n" "$1" >> "$test_dir/restored"; }; run_streamed() { "$@"; }; systemctl() { return 0; }; nft() { return 0; }
+        transaction_restore() { printf "%s\n" "$1" >> "$test_dir/restored"; }; run_streamed() { "$@"; }; systemctl() { return 0; }; nft() { return 0; }; firewall_apply_persisted() { run_streamed nft -f /etc/nftables.d/99-security-hardening.nft; }
         ssh_port_policy_healthy() { [[ "$1" == single && "$2" == 22 ]]; }; write_ssh_port_migration_report() { :; }
         rollback_ssh_port_migration stage 22 2222 "stage-test"
         grep -Fq "single-port" <<<"$SSH_PORT_MIGRATION_STATUS" && [[ ! -e "$HARDEN_SSH_PORT_STATE_FILE" ]]
@@ -2361,7 +2361,7 @@ EOF
     env HARDEN_SOURCE_ONLY=1 HARDEN_SSH_PORT_STATE_FILE="$case_root/rollback-dual-state" HARDEN_SSH_PORT_REPORT="$case_root/rollback-dual-report" bash -c '
         source "$1/harden.sh"; trap - ERR EXIT
         MODE=apply; BACKUP_DIR="$2/rollback-dual-backup"; mkdir -p "$BACKUP_DIR"; SSH_PORT=22; SSH_SERVICE=ssh.service
-        transaction_restore() { :; }; run_streamed() { "$@"; }; systemctl() { return 0; }; nft() { return 0; }
+        transaction_restore() { :; }; run_streamed() { "$@"; }; systemctl() { return 0; }; nft() { return 0; }; firewall_apply_persisted() { run_streamed nft -f /etc/nftables.d/99-security-hardening.nft; }
         ssh_port_policy_healthy() { [[ "$1" == dual && "$2" == 22 && "$3" == 2222 ]]; }; write_ssh_port_migration_report() { :; }
         rollback_ssh_port_migration retire 22 2222 "retire-test"
         grep -Fq "dual-port" <<<"$SSH_PORT_MIGRATION_STATUS" && [[ "$SSH_STAGED_OLD_PORT" == 22 && "$SSH_STAGED_NEW_PORT" == 2222 ]]
@@ -2370,7 +2370,7 @@ EOF
     env HARDEN_SOURCE_ONLY=1 HARDEN_SSH_PORT_STATE_FILE="$case_root/rollback-failure-state" HARDEN_SSH_PORT_REPORT="$case_root/rollback-failure-report" bash -c '
         source "$1/harden.sh"; trap - ERR EXIT
         MODE=apply; BACKUP_DIR="$2/rollback-failure-backup"; mkdir -p "$BACKUP_DIR"; SSH_PORT=22; SSH_SERVICE=ssh.service
-        transaction_restore() { return 1; }; run_streamed() { return 0; }; systemctl() { return 0; }; ssh_port_policy_healthy() { return 0; }; write_ssh_port_migration_report() { :; }
+        firewall_apply_persisted() { run_streamed nft -f /etc/nftables.d/99-security-hardening.nft; }; transaction_restore() { return 1; }; run_streamed() { return 0; }; systemctl() { return 0; }; ssh_port_policy_healthy() { return 0; }; write_ssh_port_migration_report() { :; }
         ! rollback_ssh_port_migration stage 22 2222 "restore-test"
         [[ "$SSH_PORT_MIGRATION_STATUS" == FAILED/ROLLBACK-FAILED* ]] || exit 1
         transaction_restore() { :; }
@@ -2468,7 +2468,7 @@ EOF
     env HARDEN_SOURCE_ONLY=1 HARDEN_SSH_PORT_STATE_FILE="$case_root/socket-rollback-state" HARDEN_SSH_PORT_REPORT="$case_root/socket-rollback-report" bash -c '
         source "$1/harden.sh"; trap - ERR EXIT
         test_dir="$2"; MODE=apply; BACKUP_DIR="$test_dir/socket-rollback-backup"; mkdir -p "$BACKUP_DIR" "$test_dir/socket-rollback-log"; SSH_PORT=22; SSH_SERVICE=ssh.service; SSH_LISTENER_MODE=socket; SSH_LISTENER_UNIT=ssh.socket; service_restart=0
-        transaction_restore() { :; }; nft() { return 0; }; run_streamed() { "$@"; }; systemctl() { printf "systemctl:%s:%s\n" "$1" "${2:-}" >> "$test_dir/socket-rollback-log/commands"; [[ "$1" != restart || "$2" != ssh.service ]] || { service_restart=1; return 1; }; return 0; }
+        transaction_restore() { :; }; nft() { return 0; }; firewall_apply_persisted() { run_streamed nft -f /etc/nftables.d/99-security-hardening.nft; }; run_streamed() { "$@"; }; systemctl() { printf "systemctl:%s:%s\n" "$1" "${2:-}" >> "$test_dir/socket-rollback-log/commands"; [[ "$1" != restart || "$2" != ssh.service ]] || { service_restart=1; return 1; }; return 0; }
         ssh_port_policy_healthy() { [[ "$1" == single && "$2" == 22 ]] || [[ "$1" == dual && "$2" == 22 && "$3" == 2222 ]]; }; write_ssh_port_migration_report() { :; }
         rollback_ssh_port_migration stage 22 2222 "socket-stage" && rollback_ssh_port_migration retire 22 2222 "socket-retire"
         [[ "$(grep -Fc "systemctl:daemon-reload:" "$test_dir/socket-rollback-log/commands")" == 2 && "$(grep -Fc "systemctl:restart:ssh.socket" "$test_dir/socket-rollback-log/commands")" == 2 && "$service_restart" == 0 ]]

@@ -16,11 +16,15 @@ systemctl() { return 1; }
 ip() { return 1; }
 nft() { return 1; }
 ssh_firewall_ports() { printf '2222\n'; }
-# Capture the actual rendered nft candidate at its validation boundary.
-# Reject validation deliberately so configure_firewall cannot install anything.
-run_streamed() {
-    if [[ "$1" == nft ]]; then cp "$4" "$test_root/candidate.nft"; return 1; fi
-    "$@"
+# Mock only the privileged helper boundary; real trust/grammar checks run in
+# firewall-helper-tests.py and the separate Linux network namespace test.
+firewall_helper_command() {
+    case "$1" in
+        --api-rule) return 0 ;;
+        --check-stdin) cat > "$test_root/candidate.nft"; return 1 ;;
+        --docker-check) [[ -s "$2" && ! -L "$2" && "$state" != unsafe ]] ;;
+        *) return 1 ;;
+    esac
 }
 detect_ipv6_policy() { IPV6_POLICY=NOT_APPLICABLE; }
 detect_rp_filter_routing_situation() { RP_FILTER_ROUTING_SITUATION=unknown; RP_FILTER_REASON=test; }
@@ -42,14 +46,23 @@ write_ipv6_report() { :; }
 export HARDEN_PROC_SYS_ROOT="$test_root/proc/sys" HARDEN_SYSCTL_CONFIG="$test_root/sysctl.conf"
 mkdir -p "$HARDEN_PROC_SYS_ROOT/net/ipv4/conf/all"
 touch "$HARDEN_PROC_SYS_ROOT/net/ipv4/conf/all/forwarding"
-for state in absent empty enabled; do
+for state in absent empty enabled unsafe missing; do
+    export HARDEN_DOCKER_EGRESS_RULES="$test_root/egress.rules"
     rm -f "$HARDEN_DOCKER_EGRESS_RULES" "$HARDEN_SYSCTL_CONFIG"
     case "$state" in
         empty) touch "$HARDEN_DOCKER_EGRESS_RULES" ;;
-        enabled) printf 'iifname "docker0" oifname "eth0" ip saddr 172.17.0.0/16 tcp dport 443 counter accept\n' > "$HARDEN_DOCKER_EGRESS_RULES" ;;
+        enabled|unsafe) printf 'iifname "docker0" oifname "eth0" ip saddr 172.17.0.0/16 tcp dport 443 counter accept\n' > "$HARDEN_DOCKER_EGRESS_RULES" ;;
     esac
+    [[ ! -e "$HARDEN_DOCKER_EGRESS_RULES" ]] || chmod 600 "$HARDEN_DOCKER_EGRESS_RULES"
+    [[ "$state" != unsafe ]] || chmod 666 "$HARDEN_DOCKER_EGRESS_RULES"
+    [[ "$state" != absent ]] || unset HARDEN_DOCKER_EGRESS_RULES
     if configure_firewall --recoverable; then
         printf 'Unexpected firewall apply success\n' >&2; exit 1
+    fi
+    if [[ "$state" == empty || "$state" == unsafe || "$state" == missing ]]; then
+        ! configure_sysctl
+        [[ ! -e "$HARDEN_SYSCTL_CONFIG" ]]
+        continue
     fi
     configure_sysctl
     if [[ "$state" == enabled ]]; then

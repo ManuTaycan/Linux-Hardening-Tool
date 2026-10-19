@@ -24,6 +24,8 @@ jobs:
         run: ./scripts/ci-whitespace-check.sh
       - name: Run safe local checks
         run: make check
+      - name: Exercise real nft transactions in an isolated network namespace
+        run: sudo unshare --net --fork python3 scripts/firewall-helper-tests.py --namespace
       - name: Verify help path
         run: ./harden.sh --help
       - name: Verify executable mode and checksum
