@@ -221,7 +221,7 @@ class NamespaceTests(unittest.TestCase):
                 os.chmod(fragment, 0o600)
                 policy = POLICY.replace('        counter drop\n    }\n    chain output',
                                         f'        include "{fragment}"\n        counter drop\n    }}\n    chain output')
-                loader.nft("-f", "-", text="table ip foreign { chain sentinel { counter } }\n")
+                loader.nft("-f", "-", text="table ip foreign {\n chain sentinel {\n  counter\n }\n}\n")
                 foreign = loader.nft("-s", "list", "table", "ip", "foreign").stdout
                 loader.activate(policy)
                 live = loader.nft("-s", "list", "table", "inet", "hardening_filter").stdout
