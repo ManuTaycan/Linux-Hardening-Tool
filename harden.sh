@@ -3906,6 +3906,8 @@ def select_docker(override, disabled):
         raise ValueError("Docker opt-out requires HARDEN_DOCKER_EGRESS_DISABLE=1 and no path override")
     if disabled == "1":
         return ""
+    if not override and not os.path.lexists(CONFIG) and os.path.lexists(LAST_GOOD):
+        raise ValueError("managed policy is missing after last-good recovery; restore it or explicitly select/disable Docker egress")
     selected = override
     if not selected and os.path.lexists(CONFIG):
         persisted = trusted_read(CONFIG, directory=None)
@@ -4157,6 +4159,17 @@ activate_deferred_docker_forwarding() {
     return 1
 }
 
+wireguard_transport_rule() {
+    # Preserve the measured listener, including non-default ports. Never guess
+    # 51820: an unqueryable existing wg0 must not lose its transport on Apply.
+    local listen_port=""
+    command -v wg >/dev/null 2>&1 || return 1
+    listen_port="$(wg show wg0 listen-port)" || return 1
+    [[ "$listen_port" =~ ^[0-9]{1,5}$ ]] || return 1
+    ((10#$listen_port >= 1 && 10#$listen_port <= 65535)) || return 1
+    printf '        udp dport %d accept comment "preserve WireGuard UDP transport wg0"\n' "$((10#$listen_port))"
+}
+
 configure_firewall() {
     local recoverable=0
     [[ "${1:-}" != --recoverable ]] || recoverable=1
@@ -4180,7 +4193,7 @@ configure_firewall() {
         log ERROR "Firewall cannot be activated without nft; install nftables and retry"
         return 1
     fi
-    local tailscale_input="" tailscale_forward="" wireguard_rule="" tailscale_healthy_before=0 ssh_rule="" ssh_port_set=""
+    local tailscale_input="" tailscale_forward="" wireguard_rule="" wireguard_transport="" tailscale_healthy_before=0 ssh_rule="" ssh_port_set=""
     local docker_forward="" api_input=""
     if ! select_docker_egress; then
         FIREWALL_STATUS="FAILED (Docker fragment selection rejected; live policy untouched)"
@@ -4211,6 +4224,16 @@ configure_firewall() {
         fi
     fi
     if ip link show wg0 >/dev/null 2>&1; then
+        if ! wireguard_transport="$(wireguard_transport_rule)"; then
+            if [[ "$MODE" == dry-run ]]; then
+                FIREWALL_STATUS="REVIEW REQUIRED (wg0 UDP listener needs privileged wireguard-tools inspection)"
+                record_skip "firewall WireGuard" "cannot query a valid wg0 listen port; run a privileged dry-run after configuring WireGuard"
+                return 0
+            fi
+            FIREWALL_STATUS="FAILED (wg0 UDP listener unavailable; live policy untouched)"
+            log ERROR "Cannot preserve wg0 transport: wireguard-tools must report a configured listen port in 1..65535; retaining the live firewall"
+            return 1
+        fi
         wireguard_rule=$'        iifname "wg0" accept comment "preserve WireGuard administration"'
     fi
 
@@ -4233,6 +4256,7 @@ table inet hardening_filter {
 ${api_input}
         ct state established,related accept
 ${tailscale_input}
+${wireguard_transport}
 ${wireguard_rule}
         ip protocol icmp icmp type { destination-unreachable, time-exceeded, parameter-problem, echo-request, echo-reply } limit rate 20/second burst 40 packets accept
         ip6 nexthdr ipv6-icmp icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem, nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert, echo-request, echo-reply } limit rate 50/second burst 100 packets accept
