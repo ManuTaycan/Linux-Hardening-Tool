@@ -25,13 +25,14 @@ POLICY = '''table inet hardening_filter {
     chain input {
         type filter hook input priority filter; policy drop;
         ct state invalid drop
-        ct state established,related accept
         iifname "lo" accept
+API_BOUNDARY
+        ct state established,related accept
+        meta l4proto ipv6-icmp accept
         iifname "tailscale0" accept comment "preserve Tailscale administration"
         udp dport 41641 accept
         iifname "wg0" accept
         tcp dport { 22, 2222 } ct state new accept
-        ip saddr 192.0.2.10 tcp dport 11434 ct state new counter accept
         counter drop
     }
     chain forward {
@@ -46,7 +47,7 @@ POLICY = '''table inet hardening_filter {
         type filter hook output priority filter; policy accept;
     }
 }
-'''
+'''.replace('API_BOUNDARY', loader.api_rule('192.0.2.10', '11434'))
 DOCKER = 'iifname "docker0" oifname "eth0" ip saddr 172.17.0.0/16 tcp dport { 53, 80, 443 } counter accept\n'
 
 
@@ -65,13 +66,42 @@ class UnitTests(unittest.TestCase):
         self.assertEqual(loader.api_rule("", ""), "")
         self.assertIn("ip saddr 192.0.2.10 tcp dport 11434", loader.api_rule("192.0.2.10", "11434"))
         self.assertIn("ip6 saddr 2001:db8::10", loader.api_rule("2001:db8::10", "443"))
-        for source, port in (("", "443"), ("192.0.2.1", ""), ("0.0.0.0/0", "443"),
+        self.assertIn('tcp dport 11434 counter drop', loader.api_rule("192.0.2.10", "11434"))
+        shell = source[source.index("configure_firewall() {"):]
+        self.assertLess(shell.index('${api_input}'), shell.index('ct state established,related accept'))
+        self.assertLess(shell.index('${api_input}'), shell.index('${tailscale_input}'))
+        self.assertLess(shell.index('iifname "lo" accept'), shell.index('${api_input}'))
+        for address, port in (("", "443"), ("192.0.2.1", ""), ("0.0.0.0/0", "443"),
                              ("0.0.0.0", "443"), ("::", "443"), ("ff02::1", "443"),
                              ("fe80::1%lo", "443"), ("fe80::1%lo\naccept", "443"),
                              ("example.test", "443"), ("192.0.2.1", "65536"),
                              ("192.0.2.1; accept", "443"), ("192.0.2.1", "80; accept")):
-            with self.subTest(source=source, port=port), self.assertRaises(ValueError):
-                loader.api_rule(source, port)
+            with self.subTest(source=address, port=port), self.assertRaises(ValueError):
+                loader.api_rule(address, port)
+
+    def test_persisted_api_selection(self):
+        for source_ip in ("192.0.2.10", "2001:db8::10"):
+            rules = loader.api_rule(source_ip, "11434")
+            saved = POLICY.replace(loader.api_rule("192.0.2.10", "11434"), rules)
+            with patch.object(loader.os.path, "lexists", return_value=True), patch.object(loader, "trusted_read", return_value=saved):
+                self.assertEqual(loader.select_api("", "", "0", "22", "2222"), rules)
+                self.assertEqual(loader.select_api("", "", "1", "22"), "")
+                self.assertEqual(loader.select_api("192.0.2.20", "8443", "0", "22"), loader.api_rule("192.0.2.20", "8443"))
+                for args in (("", "", "0", "11434"), ("", "443", "0"), ("192.0.2.1", "", "0"),
+                             ("192.0.2.1", "443", "1"), ("", "", "2")):
+                    with self.subTest(args=args), self.assertRaises(ValueError):
+                        loader.select_api(*args)
+            for bad in (saved.replace('source='+source_ip, 'source=invalid'),
+                        saved.replace('counter drop comment "operator TCP source boundary"', 'counter accept'),
+                        saved + rules):
+                with patch.object(loader.os.path, "lexists", return_value=True), patch.object(loader, "trusted_read", return_value=bad), self.assertRaises(ValueError):
+                    loader.select_api("", "", "0")
+        with patch.object(loader.os.path, "lexists", return_value=False):
+            self.assertEqual(loader.select_api("", "", "0", "22"), "")
+        legacy = POLICY.replace(loader.api_rule("192.0.2.10", "11434"),
+                                'ip saddr 192.0.2.10 tcp dport 11434 ct state new counter accept comment "operator TCP source exception"')
+        with patch.object(loader.os.path, "lexists", return_value=True), patch.object(loader, "trusted_read", return_value=legacy):
+            self.assertEqual(loader.select_api("", "", "0", "22"), loader.api_rule("192.0.2.10", "11434"))
 
     def test_docker_grammar(self):
         with patch.object(loader, "trusted_read", return_value=DOCKER):
@@ -142,11 +172,12 @@ class NamespaceTests(unittest.TestCase):
         if os.geteuid() != 0 or os.readlink("/proc/self/ns/net") == os.readlink("/proc/1/ns/net"):
             raise RuntimeError("refusing nft test outside a private root network namespace")
 
-    def check_source_boundary(self):
-        # Real TCP packets from a second disposable namespace. Never enter the
-        # host network namespace or touch a host interface.
-        peer = subprocess.Popen(["unshare", "--net", "sleep", "60"])
-        server = socket.socket()
+    def check_source_boundary(self, policy):
+        # Real TCP over disposable veths, including ingress named tailscale0
+        # and wg0. This proves nft policy, not authenticated overlay services.
+        peer = subprocess.Popen(["unshare", "--net", "sleep", "120"])
+        servers = []
+        current_name = "test-server"
         try:
             import time
             for _ in range(100):
@@ -161,26 +192,69 @@ class NamespaceTests(unittest.TestCase):
             def ip(*args):
                 subprocess.run(["ip", *args], check=True, capture_output=True)
             prefix = ["nsenter", "-t", str(peer.pid), "-n"]
-            ip("link", "add", "test-server", "type", "veth", "peer", "name", "test-client")
+            ip("link", "add", current_name, "type", "veth", "peer", "name", "test-client")
             ip("link", "set", "test-client", "netns", str(peer.pid))
-            ip("addr", "add", "192.0.2.1/24", "dev", "test-server")
-            ip("link", "set", "test-server", "up")
-            for address in ("192.0.2.10/24", "192.0.2.11/24"):
-                subprocess.run(prefix + ["ip", "addr", "add", address, "dev", "test-client"], check=True)
+            ip("addr", "add", "192.0.2.1/24", "dev", current_name)
+            ip("addr", "add", "2001:db8::1/64", "dev", current_name, "nodad")
+            ip("link", "set", current_name, "up")
+            for address in ("192.0.2.10/24", "192.0.2.11/24", "2001:db8::10/64", "2001:db8::11/64"):
+                args = ["ip", "addr", "add", address, "dev", "test-client"]
+                if ":" in address: args += ["nodad"]
+                subprocess.run(prefix + args, check=True)
             subprocess.run(prefix + ["ip", "link", "set", "test-client", "up"], check=True)
-            server.bind(("192.0.2.1", 11434))
-            server.listen(8)
-            client = ('import socket,sys; s=socket.socket(); s.settimeout(1); '
-                      's.bind((sys.argv[1],0)); s.connect(("192.0.2.1",11434))')
-            allowed = subprocess.run(prefix + [sys.executable, "-c", client, "192.0.2.10"], capture_output=True)
-            denied = subprocess.run(prefix + [sys.executable, "-c", client, "192.0.2.11"], capture_output=True)
-            self.assertEqual(allowed.returncode, 0, allowed.stderr)
-            self.assertNotEqual(denied.returncode, 0, "unexpected API access from a different source")
+            for family, address in ((socket.AF_INET, "192.0.2.1"), (socket.AF_INET6, "2001:db8::1")):
+                for port in (11434, 2222):
+                    server = socket.socket(family)
+                    if family == socket.AF_INET6: server.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                    server.bind((address, port))
+                    server.listen(128)
+                    servers.append(server)
+            client = ('import socket,sys; s=socket.socket(socket.AF_INET6 if ":" in sys.argv[1] else socket.AF_INET); '
+                      's.settimeout(0.5); s.bind((sys.argv[1],0)); s.connect((sys.argv[2],int(sys.argv[3])))')
+            def connect(src, port=11434):
+                dest = "2001:db8::1" if ":" in src else "192.0.2.1"
+                return subprocess.run(prefix + [sys.executable, "-c", client, src, dest, str(port)], capture_output=True)
+            for name in ("test-server", "tailscale0", "wg0"):
+                if name != current_name:
+                    ip("link", "set", current_name, "name", name)
+                    current_name = name
+                for trusted in ("192.0.2.10", "2001:db8::10"):
+                    candidate = policy.replace(loader.api_rule("192.0.2.10", "11434"), loader.api_rule(trusted, "11434"))
+                    loader.activate(candidate)
+                    for src in ("192.0.2.10", "192.0.2.11", "2001:db8::10", "2001:db8::11"):
+                        result = connect(src)
+                        with self.subTest(interface=name, trusted=trusted, source=src):
+                            self.assertEqual(result.returncode == 0, src == trusted, result.stderr)
+                    for src in ("192.0.2.11", "2001:db8::11"):
+                        self.assertEqual(connect(src, 2222).returncode, 0, "administrative SSH port blocked")
+            # Unauthorized flow is established under general overlay access,
+            # then denied even though conntrack still regards it as established.
+            loader.activate(policy.replace(loader.api_rule("192.0.2.10", "11434"), ""))
+            persistent = client + '; print("ready",flush=True); sys.stdin.readline(); s.sendall(b"forbidden"); sys.stdin.readline()'
+            holder = subprocess.Popen(prefix + [sys.executable, "-c", persistent, "192.0.2.11", "192.0.2.1", "11434"],
+                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                self.assertEqual(holder.stdout.readline().strip(), "ready")
+                # Drain earlier successful connections from the listener queue.
+                servers[0].settimeout(0.2)
+                accepted = []
+                while True:
+                    try: accepted.append(servers[0].accept()[0])
+                    except socket.timeout: break
+                loader.activate(policy)
+                holder.stdin.write("send\n"); holder.stdin.flush()
+                for conn in accepted:
+                    conn.settimeout(0.5)
+                    try: self.assertNotEqual(conn.recv(32), b"forbidden")
+                    except socket.timeout: pass
+                    finally: conn.close()
+            finally:
+                holder.terminate(); holder.communicate(timeout=5)
         finally:
-            server.close()
-            peer.terminate()
-            peer.wait(timeout=5)
-            subprocess.run(["ip", "link", "delete", "test-server"], capture_output=True)
+            for server in servers: server.close()
+            peer.terminate(); peer.wait(timeout=5)
+            subprocess.run(["ip", "link", "delete", current_name], capture_output=True)
+            loader.activate(policy)
 
     def test_real_transactions_trust_and_boot(self):
         with tempfile.TemporaryDirectory(prefix="hardening-nft-", dir="/run") as root:
@@ -227,7 +301,7 @@ class NamespaceTests(unittest.TestCase):
                 live = loader.nft("-s", "list", "table", "inet", "hardening_filter").stdout
                 for expected in ("tailscale0", "wg0", "2222", "11434", "docker0", "policy drop"):
                     self.assertIn(expected, live)
-                self.check_source_boundary()
+                self.check_source_boundary(policy)
                 config.write_text(policy)
                 self.assertEqual(loader.select_docker("", "0"), str(fragment))
                 self.assertEqual(loader.select_docker("", "1"), "")
