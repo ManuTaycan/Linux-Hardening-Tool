@@ -332,6 +332,12 @@ must be queryable as a valid port; Apply refuses before changing the live policy
 when it cannot preserve that transport. An unprivileged dry-run reports review
 required rather than inventing a port. Use a fixed WireGuard ListenPort for boot
 persistence and reapply after changing it. No default UDP/51820 opening is assumed.
+The validated port is stored in the managed nft policy, so the firewall service
+can restore it before `wg0` starts at boot; reload does not need a running `wg`.
+For the first Apply, bring up the intended `wg0` and verify its ListenPort first.
+If it was absent at Apply, starting it later does not add a transport exception:
+use console access to bring it up and reapply. Do not expose a guessed port as
+a workaround. Keep the existing managed policy/last-good snapshot for recovery.
 Other interface names, routing/NAT roles and real peer configurations still need
 their own assessed target tests; this is not a blanket WireGuard support claim.
 The namespace regression uses a real peer-initiated handshake on a nondefault
