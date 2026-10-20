@@ -98,6 +98,10 @@ class UnitTests(unittest.TestCase):
                     loader.select_api("", "", "0")
         with patch.object(loader.os.path, "lexists", return_value=False):
             self.assertEqual(loader.select_api("", "", "0", "22"), "")
+        # A parameterless render after explicit removal must stay disabled.
+        disabled = POLICY.replace(loader.api_rule("192.0.2.10", "11434"), "")
+        with patch.object(loader.os.path, "lexists", return_value=True), patch.object(loader, "trusted_read", return_value=disabled):
+            self.assertEqual(loader.select_api("", "", "0", "22"), "")
         legacy = POLICY.replace(loader.api_rule("192.0.2.10", "11434"),
                                 'ip saddr 192.0.2.10 tcp dport 11434 ct state new counter accept comment "operator TCP source exception"')
         with patch.object(loader.os.path, "lexists", return_value=True), patch.object(loader, "trusted_read", return_value=legacy):
@@ -303,6 +307,8 @@ class NamespaceTests(unittest.TestCase):
                     self.assertIn(expected, live)
                 self.check_source_boundary(policy)
                 config.write_text(policy)
+                self.assertEqual(loader.select_api("", "", "0", "22", "2222"), loader.api_rule("192.0.2.10", "11434"))
+                self.assertEqual(loader.select_api("", "", "1", "22"), "")
                 self.assertEqual(loader.select_docker("", "0"), str(fragment))
                 self.assertEqual(loader.select_docker("", "1"), "")
                 # Exercise the real persisted start/reload entry point as well
