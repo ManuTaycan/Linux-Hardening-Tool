@@ -98,6 +98,11 @@ class UnitTests(unittest.TestCase):
                     loader.select_api("", "", "0")
         with patch.object(loader.os.path, "lexists", return_value=False):
             self.assertEqual(loader.select_api("", "", "0", "22"), "")
+        with patch.object(loader.os.path, "lexists", side_effect=lambda path: path == loader.LAST_GOOD):
+            with self.assertRaises(ValueError):
+                loader.select_api("", "", "0", "22")
+            self.assertEqual(loader.select_api("", "", "1", "22"), "")
+            self.assertEqual(loader.select_api("192.0.2.10", "11434", "0", "22"), loader.api_rule("192.0.2.10", "11434"))
         # A parameterless render after explicit removal must stay disabled.
         disabled = POLICY.replace(loader.api_rule("192.0.2.10", "11434"), "")
         with patch.object(loader.os.path, "lexists", return_value=True), patch.object(loader, "trusted_read", return_value=disabled):
