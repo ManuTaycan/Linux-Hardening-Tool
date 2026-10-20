@@ -22,6 +22,7 @@ regression:
 	./scripts/updates-policy-tests.sh
 	./scripts/package-result-tests.sh
 	python3 scripts/firewall-helper-tests.py
+	./scripts/wireguard-transport-tests.sh
 	./scripts/firewall-apply-tests.sh
 	./scripts/docker-egress-tests.sh
 	./scripts/regression-tests.sh
