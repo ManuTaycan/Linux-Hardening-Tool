@@ -3939,6 +3939,8 @@ def select_api(source, port, disabled, *ssh_ports):
         raise ValueError("TCP opt-out requires HARDEN_INPUT_TCP_DISABLE=1 and no source/port overrides")
     if disabled == "1":
         return ""
+    if not source and not port and not os.path.lexists(CONFIG) and os.path.lexists(LAST_GOOD):
+        raise ValueError("managed policy is missing after last-good recovery; restore it or explicitly select/disable the TCP boundary")
     if not source and not port and os.path.lexists(CONFIG):
         persisted = trusted_read(CONFIG, directory=None)
         expand(persisted)
