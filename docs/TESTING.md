@@ -338,6 +338,10 @@ override, partial overrides, malformed saved selections and overlap with any
 current/staged SSH port are rejected before changing the live policy. To change
 the selection, supply both new values. Older managed additive TCP exceptions
 are retained and upgraded to the exclusive boundary on the next Apply.
+If the managed policy file is missing but a last-good recovery exists,
+parameterless Apply refuses to guess the lost selection. Restore the original
+managed configuration or supply an explicit selection/opt-out; the recovered
+live firewall remains active on this error path.
 
 For the selected host INPUT TCP port, only the selected source is permitted
 from network interfaces, including Tailscale and WireGuard. A per-port drop
