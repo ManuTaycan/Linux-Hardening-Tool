@@ -314,6 +314,11 @@ run. To opt out deliberately, unset the path override and run
 `sudo env HARDEN_DOCKER_EGRESS_DISABLE=1 ./harden.sh --apply`; the fragment can
 then be removed. Simply deleting a selected fragment is a rejected
 configuration and leaves both forwarding sysctls and the live policy untouched.
+If the managed config itself is missing while last-good recovery exists, Apply
+also refuses to guess the Docker selection before changing forwarding sysctls.
+Restore the original managed config, or explicitly reconstruct its Docker
+fragment/opt-out and TCP source/opt-out choices. Recovery must not silently
+disable a previously selected custom fragment.
 New Docker forwarding is enabled only after the owned default-drop firewall
 has committed and passed its health checks. Phase 05 defers a transition from
 forwarding=0 until that point; an already enabled routing role is preserved.
@@ -352,8 +357,8 @@ the selection, supply both new values. Older managed additive TCP exceptions
 are retained and upgraded to the exclusive boundary on the next Apply.
 If the managed policy file is missing but a last-good recovery exists,
 parameterless Apply refuses to guess the lost selection. Restore the original
-managed configuration or supply an explicit selection/opt-out; the recovered
-live firewall remains active on this error path.
+managed configuration or explicitly reconstruct both Docker and TCP choices;
+the recovered live firewall remains active on this error path.
 
 For the selected host INPUT TCP port, only the selected source is permitted
 from network interfaces, including Tailscale and WireGuard. A per-port drop

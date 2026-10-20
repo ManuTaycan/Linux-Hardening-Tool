@@ -3797,6 +3797,8 @@ def select_docker(override, disabled):
         raise ValueError("Docker opt-out requires HARDEN_DOCKER_EGRESS_DISABLE=1 and no path override")
     if disabled == "1":
         return ""
+    if not override and not os.path.lexists(CONFIG) and os.path.lexists(LAST_GOOD):
+        raise ValueError("managed policy is missing after last-good recovery; restore it or explicitly select/disable Docker egress")
     selected = override
     if not selected and os.path.lexists(CONFIG):
         persisted = trusted_read(CONFIG, directory=None)

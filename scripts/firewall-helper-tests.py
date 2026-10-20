@@ -141,6 +141,14 @@ class UnitTests(unittest.TestCase):
                 loader.select_docker("", "0")
             with self.assertRaises(ValueError): loader.select_docker("/etc/nftables.d/custom.rules", "1")
 
+    def test_missing_config_docker_recovery(self):
+        with patch.object(loader.os.path, "lexists", side_effect=lambda path: path == loader.LAST_GOOD):
+            with self.assertRaisesRegex(ValueError, "managed policy is missing"):
+                loader.select_docker("", "0")
+            self.assertEqual(loader.select_docker("", "1"), "")
+            with patch.object(loader, "trusted_read", return_value=DOCKER):
+                self.assertEqual(loader.select_docker("/etc/nftables.d/custom.rules", "0"), "/etc/nftables.d/custom.rules")
+
     def test_transaction_failures_and_noop(self):
         live, state, calls = ["previous policy"], {}, []
         failure = [None]
@@ -426,6 +434,12 @@ class NamespaceTests(unittest.TestCase):
                 loader.activate(live)
                 self.assertEqual(live, loader.nft("-s", "list", "table", "inet", "hardening_filter").stdout)
                 config.unlink()
+                # Physical missing CONFIG plus real last-good must not forget
+                # persisted selections during Apply, before sysctl changes.
+                with self.assertRaisesRegex(ValueError, "managed policy is missing"):
+                    loader.select_docker("", "0")
+                with self.assertRaisesRegex(ValueError, "managed policy is missing"):
+                    loader.select_api("", "", "0", "22")
                 with patch.object(sys, "argv", ["helper"]), self.assertRaises(OSError):
                     loader.main()
                 self.assertEqual(live, loader.nft("-s", "list", "table", "inet", "hardening_filter").stdout)
