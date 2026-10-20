@@ -330,12 +330,25 @@ your own values, for example:
 sudo env HARDEN_INPUT_TCP_SOURCE=YOUR_TRUSTED_SOURCE_IP HARDEN_INPUT_TCP_PORT=YOUR_API_TCP_PORT ./harden.sh --apply
 ~~~
 
-The generated source/port rule persists across reload and reboot. Neither
-variable enables an exception by default. Omit both on a subsequent Apply to
-remove it. Existing SSH/Tailscale rules and established-connection handling
-still apply; this is an additional path for a trusted source, not API
-authentication or revocation of existing overlay access. Published Docker
-ports traverse forwarding and need their own reviewed Docker policy.
+The feature is disabled on first installation unless both values are supplied.
+The managed source/port selection persists across parameterless Apply, reload,
+restart and reboot. To remove it explicitly, unset both overrides and run
+`sudo env HARDEN_INPUT_TCP_DISABLE=1 ./harden.sh --apply`. Disable plus either
+override, partial overrides, malformed saved selections and overlap with any
+current/staged SSH port are rejected before changing the live policy. To change
+the selection, supply both new values. Older managed additive TCP exceptions
+are retained and upgraded to the exclusive boundary on the next Apply.
+
+For the selected host INPUT TCP port, only the selected source is permitted
+from network interfaces, including Tailscale and WireGuard. A per-port drop
+precedes established/related and general overlay accepts; existing connections
+from other sources are also denied. A source in one IP family does not open
+the port to the other family. Loopback access remains available for local
+processes. Other ports, SSH administration and UDP overlay transport retain
+their existing policy. This is a firewall boundary, not API authentication;
+source spoofing protection and the security of the trusted client still matter.
+Published Docker ports traverse forwarding and need their own reviewed Docker
+policy; this INPUT feature does not restrict a DNAT-published container API.
 
 `make check` includes unit/mocked failures and rendering tests. Linux CI also
 runs `sudo unshare --net --fork python3 scripts/firewall-helper-tests.py --namespace`
@@ -348,6 +361,9 @@ fresh Apply and unchanged second Apply; reload/restart/boot with valid, invalid,
 missing and permission-invalid fragment; forced nft failure; failed SSH stage
 and retire rollback; IPv4/IPv6 SSH and Tailscale/WireGuard connectivity; Docker
 DNS/web/BuildKit egress and denied unsolicited forwarding. For the API exception,
-verify an allowed source succeeds and a different non-overlay source fails,
-including after reload/reboot. Never run these service/reboot tests on a
+verify allowed/denied sources on both ordinary and overlay ingress, IPv4/IPv6
+cross-family denial, already established unauthorized flows, and unrelated SSH
+access, including after reload/restart/reboot and parameterless Apply. Check
+explicit opt-out and that invalid/partial/SSH-overlapping selections retain
+the previous policy. Never run these service/reboot tests on a
 production server without explicit approval.
