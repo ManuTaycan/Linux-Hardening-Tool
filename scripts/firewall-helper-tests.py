@@ -112,6 +112,14 @@ class UnitTests(unittest.TestCase):
         with patch.object(loader.os.path, "lexists", return_value=True), patch.object(loader, "trusted_read", return_value=legacy):
             self.assertEqual(loader.select_api("", "", "0", "22"), loader.api_rule("192.0.2.10", "11434"))
 
+    def test_wireguard_transport_placement(self):
+        shell = source[source.index("configure_firewall() {"):]
+        input_chain = shell.split("chain input {", 1)[1].split("chain forward {", 1)[0]
+        forward_chain = shell.split("chain forward {", 1)[1].split("chain output {", 1)[0]
+        self.assertIn("${wireguard_transport}", input_chain)
+        self.assertNotIn("${wireguard_transport}", forward_chain)
+        self.assertLess(input_chain.index("${api_input}"), input_chain.index("${wireguard_transport}"))
+
     def test_docker_grammar(self):
         with patch.object(loader, "trusted_read", return_value=DOCKER):
             self.assertIn('dport { 53, 80, 443 }', loader.docker_rules("unused"))
@@ -264,6 +272,78 @@ class NamespaceTests(unittest.TestCase):
             peer.terminate(); peer.wait(timeout=5)
             subprocess.run(["ip", "link", "delete", current_name], capture_output=True)
             loader.activate(policy)
+
+    def test_wireguard_peer_initiated_handshake(self):
+        # Real kernel tunnel and TCP payload. Server has no peer endpoint;
+        # established outbound UDP cannot hide a missing INPUT transport rule.
+        peer = subprocess.Popen(["unshare", "--net", "sleep", "120"])
+        tcp_server = socket.socket()
+        udp_control = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        key_parent = Path("/etc/wireguard")
+        parent_created = not key_parent.exists()
+        try:
+            import time
+            for _ in range(100):
+                if os.readlink(f"/proc/{peer.pid}/ns/net") != os.readlink("/proc/self/ns/net"): break
+                time.sleep(.01)
+            else: self.fail("WireGuard peer namespace did not start")
+            def run(*args, **kwargs):
+                return subprocess.run(args, check=True, capture_output=True, text=True, **kwargs).stdout.strip()
+            prefix = ["nsenter", "-t", str(peer.pid), "-n"]
+            run("ip", "link", "add", "wg-test-server", "type", "veth", "peer", "name", "wg-test-client")
+            run("ip", "link", "set", "wg-test-client", "netns", str(peer.pid))
+            run("ip", "addr", "add", "198.51.100.1/24", "dev", "wg-test-server")
+            run("ip", "link", "set", "wg-test-server", "up")
+            run(*prefix, "ip", "addr", "add", "198.51.100.2/24", "dev", "wg-test-client")
+            run(*prefix, "ip", "link", "set", "wg-test-client", "up")
+            run("ip", "link", "add", "wg0", "type", "wireguard")
+            run(*prefix, "ip", "link", "add", "wg0", "type", "wireguard")
+            # Honor the vendor AppArmor wg profile; do not disable confinement
+            # to read temporary keys under /run. No existing key is read/changed.
+            key_parent.mkdir(mode=0o700, exist_ok=True)
+            with tempfile.TemporaryDirectory(dir=key_parent, prefix="hardening-test-") as directory:
+                keys, pubs = [], []
+                for index in range(2):
+                    key = run("wg", "genkey")
+                    path = Path(directory) / str(index)
+                    path.write_text(key + "\n"); path.chmod(0o600); keys.append(str(path))
+                    pubs.append(run("wg", "pubkey", input=key))
+                run("wg", "set", "wg0", "listen-port", "51829", "private-key", keys[0],
+                    "peer", pubs[1], "allowed-ips", "10.111.0.2/32")
+                run(*prefix, "wg", "set", "wg0", "listen-port", "51830", "private-key", keys[1],
+                    "peer", pubs[0], "allowed-ips", "10.111.0.1/32", "endpoint", "198.51.100.1:51829")
+                run("ip", "addr", "add", "10.111.0.1/24", "dev", "wg0"); run("ip", "link", "set", "wg0", "up")
+                run(*prefix, "ip", "addr", "add", "10.111.0.2/24", "dev", "wg0")
+                run(*prefix, "ip", "link", "set", "wg0", "up")
+                tcp_server.bind(("10.111.0.1", 2222)); tcp_server.listen(8); tcp_server.settimeout(2)
+                udp_control.bind(("198.51.100.1", 51830)); udp_control.settimeout(.5)
+                client = ('import socket; s=socket.create_connection(("10.111.0.1",2222),timeout=8); '
+                          's.sendall(b"wg-regression"); s.close()')
+                with patch.object(loader, "STATE", str(Path(directory) / "state")), \
+                        patch.object(loader, "LAST_GOOD", str(Path(directory) / "good.nft")):
+                    loader.activate(POLICY)
+                    denied = subprocess.run(prefix + [sys.executable, "-c", client.replace("timeout=8", "timeout=1")], capture_output=True)
+                    self.assertNotEqual(denied.returncode, 0)
+                    self.assertEqual(int(run("wg", "show", "wg0", "latest-handshakes").split()[-1]), 0)
+                    transport = run("env", "HARDEN_SOURCE_ONLY=1", "bash", "-c",
+                                    'source "$1"; trap - ERR EXIT; wireguard_transport_rule', "_",
+                                    str(Path(__file__).resolve().parent.parent / "harden.sh"))
+                    self.assertIn("udp dport 51829 accept", transport)
+                    loader.activate(POLICY.replace('        iifname "wg0" accept', transport + '\n        iifname "wg0" accept', 1))
+                    run(*prefix, sys.executable, "-c", client)
+                    connection, _ = tcp_server.accept()
+                    with connection: self.assertEqual(connection.recv(32), b"wg-regression")
+                    self.assertGreater(int(run("wg", "show", "wg0", "latest-handshakes").split()[-1]), 0)
+                    run(*prefix, sys.executable, "-c", 'import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.sendto(b"denied",("198.51.100.1",51830))')
+                    with self.assertRaises(socket.timeout): udp_control.recvfrom(32)
+        finally:
+            tcp_server.close(); udp_control.close()
+            peer.terminate(); peer.wait(timeout=5)
+            subprocess.run(["ip", "link", "delete", "wg0"], capture_output=True)
+            subprocess.run(["ip", "link", "delete", "wg-test-server"], capture_output=True)
+            if parent_created:
+                try: key_parent.rmdir()
+                except OSError: pass  # Never remove a pre-existing or nonempty directory.
 
     def test_real_transactions_trust_and_boot(self):
         with tempfile.TemporaryDirectory(prefix="hardening-nft-", dir="/run") as root:

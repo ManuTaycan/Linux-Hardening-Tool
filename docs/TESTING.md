@@ -321,6 +321,18 @@ Failed forwarding activation restores the prior sysctl file/value. If runtime
 restoration cannot be proven, the validated protective firewall stays active
 and Apply fails with a console-recovery diagnostic.
 
+For an existing `wg0`, Apply preserves its measured UDP listen port as well as
+decrypted interface traffic. `wireguard-tools` must be installed and the listener
+must be queryable as a valid port; Apply refuses before changing the live policy
+when it cannot preserve that transport. An unprivileged dry-run reports review
+required rather than inventing a port. Use a fixed WireGuard ListenPort for boot
+persistence and reapply after changing it. No default UDP/51820 opening is assumed.
+Other interface names, routing/NAT roles and real peer configurations still need
+their own assessed target tests; this is not a blanket WireGuard support claim.
+The namespace regression uses a real peer-initiated handshake on a nondefault
+port, a TCP payload, and a denied adjacent UDP port. Test keys use the vendor
+AppArmor-supported `/etc/wireguard` location; confinement stays enabled.
+
 An optional host TCP exception for Ollama/n8n or another API requires both
 `HARDEN_INPUT_TCP_SOURCE` (one IPv4/IPv6 host literal, no CIDR/hostname) and
 `HARDEN_INPUT_TCP_PORT` (1..65535). Supply both to the same Apply command using
