@@ -3857,7 +3857,46 @@ def api_rule(source, port):
     if address.is_unspecified or address.is_multicast:
         raise ValueError("TCP source must be one unicast host address")
     family = "ip" if address.version == 4 else "ip6"
-    return f'        {family} saddr {address} tcp dport {int(port)} ct state new counter accept comment "operator TCP source exception"'
+    return (f'        # hardening-input-tcp-v1 source={address} port={int(port)}\n'
+            f'        {family} saddr {address} tcp dport {int(port)} counter accept comment "operator TCP source exception"\n'
+            f'        tcp dport {int(port)} counter drop comment "operator TCP source boundary"')
+
+
+def select_api(source, port, disabled, *ssh_ports):
+    if disabled not in ("0", "1") or (disabled == "1" and (source or port)):
+        raise ValueError("TCP opt-out requires HARDEN_INPUT_TCP_DISABLE=1 and no source/port overrides")
+    if disabled == "1":
+        return ""
+    if not source and not port and os.path.lexists(CONFIG):
+        persisted = trusted_read(CONFIG, directory=None)
+        expand(persisted)
+        markers = [line.strip() for line in persisted.splitlines()
+                   if "hardening-input-tcp-v1" in line]
+        legacy = [line.strip() for line in persisted.splitlines()
+                  if 'comment "operator TCP source exception"' in line]
+        if markers:
+            if len(markers) != 1:
+                raise ValueError("ambiguous persisted TCP source boundary")
+            match = re.fullmatch(r"# hardening-input-tcp-v1 source=([0-9A-Fa-f:.]+) port=([0-9]+)", markers[0])
+            if not match:
+                raise ValueError("invalid persisted TCP source boundary")
+            source, port = match.groups()
+            expected = api_rule(source, port).splitlines()
+            if any(line.strip() not in {raw.strip() for raw in persisted.splitlines()} for line in expected):
+                raise ValueError("persisted TCP source boundary is incomplete")
+        elif legacy:
+            # Upgrade the previously shipped additive rule to the explicit
+            # boundary; never silently discard it on parameterless Apply.
+            if len(legacy) != 1:
+                raise ValueError("ambiguous legacy TCP source exception")
+            match = re.fullmatch(r'(ip6?) saddr ([0-9A-Fa-f:.]+) tcp dport ([0-9]+) ct state new counter accept comment "operator TCP source exception"', legacy[0])
+            if not match:
+                raise ValueError("invalid legacy TCP source exception")
+            source, port = match[2], match[3]
+    rules = api_rule(source, port)
+    if rules and int(port) in {int(value) for value in ssh_ports}:
+        raise ValueError("TCP source boundary must not overlap an administrative SSH port")
+    return rules
 
 
 def select_docker(override, disabled):
@@ -3987,7 +4026,7 @@ def save_atomic(path, text):
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "--apply"
     if mode == "--api-rule":
-        print(api_rule(*sys.argv[2:]))
+        print(select_api(*sys.argv[2:]))
         return None
     if mode == "--docker-select":
         print(select_docker(*sys.argv[2:]))
@@ -4149,12 +4188,12 @@ configure_firewall() {
         # The root-owned fragment is nft syntax, never sourced as shell code.
         docker_forward="        include \"$(docker_egress_rules_file)\""
     fi
-    if ! api_input="$(firewall_helper_command --api-rule "${HARDEN_INPUT_TCP_SOURCE:-}" "${HARDEN_INPUT_TCP_PORT:-}")"; then
-        FIREWALL_STATUS="FAILED (invalid TCP source exception)"
-        return 1
-    fi
     local -a ssh_ports=()
     mapfile -t ssh_ports < <(ssh_firewall_ports)
+    if ! api_input="$(firewall_helper_command --api-rule "${HARDEN_INPUT_TCP_SOURCE:-}" "${HARDEN_INPUT_TCP_PORT:-}" "${HARDEN_INPUT_TCP_DISABLE:-0}" "${ssh_ports[@]}")"; then
+        FIREWALL_STATUS="FAILED (invalid or conflicting TCP source boundary; live policy untouched)"
+        return 1
+    fi
     if ((${#ssh_ports[@]} == 1)); then
         ssh_rule="        tcp dport ${ssh_ports[0]} ct state new limit rate 30/minute burst 20 packets accept comment \"administrative SSH\""
     else
@@ -4188,14 +4227,14 @@ table inet hardening_filter {
     chain input {
         type filter hook input priority filter; policy drop;
         ct state invalid drop
-        ct state established,related accept
         iifname "lo" accept
+${api_input}
+        ct state established,related accept
 ${tailscale_input}
 ${wireguard_rule}
         ip protocol icmp icmp type { destination-unreachable, time-exceeded, parameter-problem, echo-request, echo-reply } limit rate 20/second burst 40 packets accept
         ip6 nexthdr ipv6-icmp icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem, nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert, echo-request, echo-reply } limit rate 50/second burst 100 packets accept
 ${ssh_rule}
-${api_input}
         counter drop
     }
 
