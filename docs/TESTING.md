@@ -314,12 +314,29 @@ run. To opt out deliberately, unset the path override and run
 `sudo env HARDEN_DOCKER_EGRESS_DISABLE=1 ./harden.sh --apply`; the fragment can
 then be removed. Simply deleting a selected fragment is a rejected
 configuration and leaves both forwarding sysctls and the live policy untouched.
+If the managed config itself is missing while last-good recovery exists, Apply
+also refuses to guess the Docker selection before changing forwarding sysctls.
+Restore the original managed config, or explicitly reconstruct its Docker
+fragment/opt-out and TCP source/opt-out choices. Recovery must not silently
+disable a previously selected custom fragment.
 New Docker forwarding is enabled only after the owned default-drop firewall
 has committed and passed its health checks. Phase 05 defers a transition from
 forwarding=0 until that point; an already enabled routing role is preserved.
 Failed forwarding activation restores the prior sysctl file/value. If runtime
 restoration cannot be proven, the validated protective firewall stays active
 and Apply fails with a console-recovery diagnostic.
+
+For an existing `wg0`, Apply preserves its measured UDP listen port as well as
+decrypted interface traffic. `wireguard-tools` must be installed and the listener
+must be queryable as a valid port; Apply refuses before changing the live policy
+when it cannot preserve that transport. An unprivileged dry-run reports review
+required rather than inventing a port. Use a fixed WireGuard ListenPort for boot
+persistence and reapply after changing it. No default UDP/51820 opening is assumed.
+Other interface names, routing/NAT roles and real peer configurations still need
+their own assessed target tests; this is not a blanket WireGuard support claim.
+The namespace regression uses a real peer-initiated handshake on a nondefault
+port, a TCP payload, and a denied adjacent UDP port. Test keys use the vendor
+AppArmor-supported `/etc/wireguard` location; confinement stays enabled.
 
 An optional host TCP exception for Ollama/n8n or another API requires both
 `HARDEN_INPUT_TCP_SOURCE` (one IPv4/IPv6 host literal, no CIDR/hostname) and
@@ -340,8 +357,8 @@ the selection, supply both new values. Older managed additive TCP exceptions
 are retained and upgraded to the exclusive boundary on the next Apply.
 If the managed policy file is missing but a last-good recovery exists,
 parameterless Apply refuses to guess the lost selection. Restore the original
-managed configuration or supply an explicit selection/opt-out; the recovered
-live firewall remains active on this error path.
+managed configuration or explicitly reconstruct both Docker and TCP choices;
+the recovered live firewall remains active on this error path.
 
 For the selected host INPUT TCP port, only the selected source is permitted
 from network interfaces, including Tailscale and WireGuard. A per-port drop
