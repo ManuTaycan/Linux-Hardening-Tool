@@ -3383,6 +3383,7 @@ EOF
         HARDEN_SYSCTL_CONFIG="$ipv6_dry/99-security-hardening.conf" HARDEN_IPV6_REPORT="$ipv6_dry/ipv6-report.txt" bash -c '
             source "$1/harden.sh"; trap - ERR EXIT
             MODE=dry-run; AGGRESSIVE=1; DISABLE_IPV6=1; log() { :; }
+            select_docker_egress() { DOCKER_EGRESS_SELECTED=""; }
             configure_sysctl
             [[ "$IPV6_POLICY" == disabled-explicit-opt-in ]]
             [[ "$IPV6_PERSISTENCE_STATUS" == PLANNED* ]]
@@ -3397,6 +3398,7 @@ EOF
             HARDEN_RP_FILTER_REPORT="$root/rp-filter-report.txt" IPV6_TEST_FAIL_SYSCTL_AFTER="$fail_after" IPV6_TEST_FAIL_SYSCTL_KEY="$fail_key" IPV6_TEST_EXPECT_FAILURE="$([[ "$fail_after" -gt 0 || -n "$fail_key" ]] && printf 1 || printf 0)" bash -c '
                 source "$1/harden.sh"; trap - ERR EXIT
                 MODE=apply; AGGRESSIVE=1; DISABLE_IPV6="$3"; BACKUP_DIR="$2/backup"; CHANGE_LOG="$2/changes.tsv"
+                select_docker_egress() { DOCKER_EGRESS_SELECTED=""; }
                 mkdir -p "$BACKUP_DIR"; : > "$CHANGE_LOG"
                 log() { :; }; record_change() { :; }; record_skip() { :; }
                 run_streamed() { "$@"; }
