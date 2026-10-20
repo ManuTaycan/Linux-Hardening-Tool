@@ -349,6 +349,9 @@ their existing policy. This is a firewall boundary, not API authentication;
 source spoofing protection and the security of the trusted client still matter.
 Published Docker ports traverse forwarding and need their own reviewed Docker
 policy; this INPUT feature does not restrict a DNAT-published container API.
+Opt-out removes both the API allow and its per-port boundary and restores the
+ordinary host policy, including its general overlay allowance. Stop or rebind
+the listener first if the service must become unreachable over overlays too.
 
 `make check` includes unit/mocked failures and rendering tests. Linux CI also
 runs `sudo unshare --net --fork python3 scripts/firewall-helper-tests.py --namespace`
