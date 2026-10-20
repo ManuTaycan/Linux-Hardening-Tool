@@ -25,7 +25,10 @@ ssh_firewall_ports() { printf '2222\n'; }
 # firewall-helper-tests.py and the separate Linux network namespace test.
 firewall_helper_command() {
     case "$1" in
-        --docker-select) [[ "$state" == absent ]] || printf '%s\n' "$HARDEN_DOCKER_EGRESS_RULES" ;;
+        --docker-select)
+            [[ "$state" != recovery-missing ]] || return 1
+            [[ "$state" == absent ]] || printf '%s\n' "$HARDEN_DOCKER_EGRESS_RULES"
+            ;;
         --api-rule) return 0 ;;
         --check-stdin) cat > "$test_root/candidate.nft"; return 1 ;;
         --docker-check) [[ -s "$2" && ! -L "$2" && "$state" != unsafe ]] ;;
@@ -99,4 +102,16 @@ for state in absent empty enabled unsafe missing; do
     grep -Fq 'tcp dport 2222' "$test_root/candidate.nft"
     grep -Fq 'type filter hook forward priority filter; policy drop;' "$test_root/candidate.nft"
 done
+# Selection failure after last-good recovery must precede all sysctl writes.
+# The real missing-CONFIG selector is covered by Python unit/namespace tests.
+state=recovery-missing
+printf 'net.ipv4.conf.all.forwarding = 1\n' > "$HARDEN_SYSCTL_CONFIG"
+cp "$HARDEN_SYSCTL_CONFIG" "$test_root/before-recovery.conf"
+printf '1\n' > "$test_root/runtime"
+! configure_sysctl
+cmp "$test_root/before-recovery.conf" "$HARDEN_SYSCTL_CONFIG"
+[[ "$(sysctl -n net.ipv4.conf.all.forwarding)" == 1 ]]
+! configure_firewall --recoverable
+cmp "$test_root/before-recovery.conf" "$HARDEN_SYSCTL_CONFIG"
+[[ "$(sysctl -n net.ipv4.conf.all.forwarding)" == 1 ]]
 printf 'Docker egress opt-in rendering and persistent forwarding: PASS\n'
