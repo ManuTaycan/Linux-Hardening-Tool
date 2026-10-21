@@ -271,28 +271,129 @@ tokens, hostnames, addresses, and production-sensitive logs. Create one bounded
 issue per verified finding with the exact commit, command, phase, sanitized
 evidence, rollback state, and acceptance criteria.
 
-## Explicit Docker bridge egress opt-in
 
-The generator includes a nonempty operator-owned
-`/etc/nftables.d/90-docker-egress.rules` fragment inside its forward chain.
-The file must be root-owned and not writable by unprivileged users. It is nft
-syntax, never shell code. No Docker exception is enabled when the file is absent
-or empty. With this IPv4 opt-in, the managed IPv4 all.forwarding value is 1,
-including when Docker has not yet started.
+## Atomic firewall loader and recovery (#53, #54, #52)
 
-Use explicit input/output interfaces, IPv4 source subnet and required ports.
-For example, a default bridge on a host with uplink ens18 can allow TCP
-53/80/443 and UDP 53 from docker0, source 172.17.0.0/16, to ens18. This does not
-enable other bridges, inbound published ports, or IPv6 forwarding. Docker's
-separate firewall chains continue to apply.
+Apply, systemd start/reload and SSH rollback use the embedded Python 3 loader,
+installed at `/usr/local/libexec/server-hardening-firewall`. It checks a complete
+batch then submits the same immutable bytes in one nft transaction. Only
+`inet hardening_filter` is replaced; there is no separate live deletion or
+ruleset flush. A converged runtime fingerprint avoids redundant nft commits.
+The unit has no firewall-removing stop action. Do not disable the vendor
+nftables service or restart Docker, networking, SSH or Tailscale to apply this.
 
-Run `scripts/docker-egress-tests.sh` for mocked generator/sysctl checks.
-For deployment, back up the owned nft table and sysctl file, syntax-check a
-batch containing deletion and recreation of only the owned table, then load
-that batch in one nft transaction. Avoid the service's current delete-then-load
-ExecReload path because it creates an intermediate gap. Do not restart Docker,
-SSH or Tailscale. Verify DNS and web egress on the bridge and in BuildKit.
+Docker fragments are optional, but an explicitly selected missing file, an
+existing empty file, unsafe permissions, or malformed rules now fail visibly.
+The default path is `/etc/nftables.d/90-docker-egress.rules`; an override must
+also be a canonical path beneath `/etc/nftables.d`. Every directory and file
+must be root-owned, with no group/other write access and no symlinks. Suggested
+modes: directories 0755, fragments 0600. The loader reads through directory FDs
+with O_NOFOLLOW and validates a snapshot before nft sees it, including on boot.
 
-Removing the opt-in requires first removing its include from the persistent
-table and atomically reloading the table. Preserve IPv4 forwarding if another
-routing service still requires it.
+The supported fragment grammar is one rule per line: explicit distinct
+`iifname` and `oifname`, an IPv4 source CIDR (never /0), `tcp` or `udp`, explicit
+`dport` or a literal port set, optional `counter`, `accept`, and an optional
+simple comment. Nested includes, commands, wildcard interfaces and bare
+accepts are rejected. Comments and empty lines are allowed around real rules.
+For example (replace the interfaces and subnet with your assessed bridge):
+
+~~~nft
+iifname "docker0" oifname "eth0" ip saddr 172.17.0.0/16 tcp dport { 80, 443 } counter accept
+~~~
+
+If a reload fails, the current policy stays active. A self-contained,
+root-owned `/etc/nftables.d/.hardening-last-good.nft` snapshot provides boot
+recovery if the configured file/fragment later disappears or becomes invalid;
+the unit still reports failure and requires operator attention. A first setup
+with no previous policy never rolls back by removing an already committed
+protective table. File installation, service activation or recovery failures
+are errors, and console recovery may be required. The snapshot does not depend
+on Docker's startup order. Apply retains the persisted fragment selection,
+including a custom path, when its environment override is omitted on a later
+run. To opt out deliberately, unset the path override and run
+`sudo env HARDEN_DOCKER_EGRESS_DISABLE=1 ./harden.sh --apply`; the fragment can
+then be removed. Simply deleting a selected fragment is a rejected
+configuration and leaves both forwarding sysctls and the live policy untouched.
+If the managed config itself is missing while last-good recovery exists, Apply
+also refuses to guess the Docker selection before changing forwarding sysctls.
+Restore the original managed config, or explicitly reconstruct its Docker
+fragment/opt-out and TCP source/opt-out choices. Recovery must not silently
+disable a previously selected custom fragment.
+New Docker forwarding is enabled only after the owned default-drop firewall
+has committed and passed its health checks. Phase 05 defers a transition from
+forwarding=0 until that point; an already enabled routing role is preserved.
+Failed forwarding activation restores the prior sysctl file/value. If runtime
+restoration cannot be proven, the validated protective firewall stays active
+and Apply fails with a console-recovery diagnostic.
+
+For an existing `wg0`, Apply preserves its measured UDP listen port as well as
+decrypted interface traffic. `wireguard-tools` must be installed and the listener
+must be queryable as a valid port; Apply refuses before changing the live policy
+when it cannot preserve that transport. An unprivileged dry-run reports review
+required rather than inventing a port. Use a fixed WireGuard ListenPort for boot
+persistence and reapply after changing it. No default UDP/51820 opening is assumed.
+The validated port is stored in the managed nft policy, so the firewall service
+can restore it before `wg0` starts at boot; reload does not need a running `wg`.
+For the first Apply, bring up the intended `wg0` and verify its ListenPort first.
+If it was absent at Apply, starting it later does not add a transport exception:
+use console access to bring it up and reapply. Do not expose a guessed port as
+a workaround. Keep the existing managed policy/last-good snapshot for recovery.
+Other interface names, routing/NAT roles and real peer configurations still need
+their own assessed target tests; this is not a blanket WireGuard support claim.
+The namespace regression uses a real peer-initiated handshake on a nondefault
+port, a TCP payload, and a denied adjacent UDP port. Test keys use the vendor
+AppArmor-supported `/etc/wireguard` location; confinement stays enabled.
+
+An optional host TCP exception for Ollama/n8n or another API requires both
+`HARDEN_INPUT_TCP_SOURCE` (one IPv4/IPv6 host literal, no CIDR/hostname) and
+`HARDEN_INPUT_TCP_PORT` (1..65535). Supply both to the same Apply command using
+your own values, for example:
+
+~~~bash
+sudo env HARDEN_INPUT_TCP_SOURCE=YOUR_TRUSTED_SOURCE_IP HARDEN_INPUT_TCP_PORT=YOUR_API_TCP_PORT ./harden.sh --apply
+~~~
+
+The feature is disabled on first installation unless both values are supplied.
+The managed source/port selection persists across parameterless Apply, reload,
+restart and reboot. To remove it explicitly, unset both overrides and run
+`sudo env HARDEN_INPUT_TCP_DISABLE=1 ./harden.sh --apply`. Disable plus either
+override, partial overrides, malformed saved selections and overlap with any
+current/staged SSH port are rejected before changing the live policy. To change
+the selection, supply both new values. Older managed additive TCP exceptions
+are retained and upgraded to the exclusive boundary on the next Apply.
+If the managed policy file is missing but a last-good recovery exists,
+parameterless Apply refuses to guess the lost selection. Restore the original
+managed configuration or explicitly reconstruct both Docker and TCP choices;
+the recovered live firewall remains active on this error path.
+
+For the selected host INPUT TCP port, only the selected source is permitted
+from network interfaces, including Tailscale and WireGuard. A per-port drop
+precedes established/related and general overlay accepts; existing connections
+from other sources are also denied. A source in one IP family does not open
+the port to the other family. Loopback access remains available for local
+processes. Other ports, SSH administration and UDP overlay transport retain
+their existing policy. This is a firewall boundary, not API authentication;
+source spoofing protection and the security of the trusted client still matter.
+Published Docker ports traverse forwarding and need their own reviewed Docker
+policy; this INPUT feature does not restrict a DNAT-published container API.
+Opt-out removes both the API allow and its per-port boundary and restores the
+ordinary host policy, including its general overlay allowance. Stop or rebind
+the listener first if the service must become unreachable over overlays too.
+
+`make check` includes unit/mocked failures and rendering tests. Linux CI also
+runs `sudo unshare --net --fork python3 scripts/firewall-helper-tests.py --namespace`
+with real nft for fresh/replacement/no-op transactions, invalid/missing includes,
+permissions, scope rejection, snapshot rollback, boot recovery and preservation
+of a foreign table. This is not a full Ubuntu target deployment test.
+
+Before merging, use a disposable Ubuntu VM with console recovery to test:
+fresh Apply and unchanged second Apply; reload/restart/boot with valid, invalid,
+missing and permission-invalid fragment; forced nft failure; failed SSH stage
+and retire rollback; IPv4/IPv6 SSH and Tailscale/WireGuard connectivity; Docker
+DNS/web/BuildKit egress and denied unsolicited forwarding. For the API exception,
+verify allowed/denied sources on both ordinary and overlay ingress, IPv4/IPv6
+cross-family denial, already established unauthorized flows, and unrelated SSH
+access, including after reload/restart/reboot and parameterless Apply. Check
+explicit opt-out and that invalid/partial/SSH-overlapping selections retain
+the previous policy. Never run these service/reboot tests on a
+production server without explicit approval.

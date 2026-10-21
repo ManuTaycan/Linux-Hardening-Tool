@@ -66,6 +66,8 @@ LYNIS_WARNINGS="unknown"
 LYNIS_SUGGESTIONS="unknown"
 LYNIS_PARSE_STATUS="NOT RUN"
 FIREWALL_STATUS="NOT RUN"
+DOCKER_FORWARDING_DEFERRED=0
+DOCKER_FORWARDING_RESTORE_FAILED=0
 SSH_STATUS="NOT RUN"
 PAM_STATUS="NOT RUN"
 FAILED_LOGIN_STATUS="NOT RUN"
@@ -2155,6 +2157,22 @@ configure_sysctl() {
     local config="${HARDEN_SYSCTL_CONFIG:-/etc/sysctl.d/99-security-hardening.conf}"
     local sysctl_root="${HARDEN_PROC_SYS_ROOT:-/proc/sys}"
     local temporary key value proc_path interface desired_rp_filter="" config_changed=0 runtime_reload_needed=0 failed=0 ipv6_disable_snapshot=0 sysctl_backup_taken=0
+    local docker_forwarding=0
+    DOCKER_FORWARDING_DEFERRED=0
+    select_docker_egress || { log ERROR "Docker selection invalid; sysctl state left untouched"; return 1; }
+    if docker_egress_requested; then
+        docker_egress_enabled || { log ERROR "Unsafe or unavailable Docker opt-in; sysctl state left untouched"; return 1; }
+        docker_forwarding=1
+        # Never introduce routing before the new default-drop forward policy is
+        # committed. Existing forwarding=1 is preserved for established roles.
+        local current_docker_forwarding
+        current_docker_forwarding="$(sysctl -n net.ipv4.conf.all.forwarding)" || return 1
+        case "$current_docker_forwarding" in
+            0) docker_forwarding=0; DOCKER_FORWARDING_DEFERRED=1 ;;
+            1) ;;
+            *) log ERROR "Cannot determine IPv4 forwarding safely; sysctl state left untouched"; return 1 ;;
+        esac
+    fi
     detect_ipv6_policy "$config"
     if systemctl is-active --quiet tailscaled.service 2>/dev/null; then
         RP_FILTER_TAILSCALE_STATE=active
@@ -2206,7 +2224,7 @@ configure_sysctl() {
                 [[ -n "$desired_rp_filter" ]] || continue
                 value="$desired_rp_filter"
             fi
-            if [[ "$key" == net.ipv4.conf.all.forwarding ]] && docker_egress_enabled; then
+            if [[ "$key" == net.ipv4.conf.all.forwarding && "$docker_forwarding" -eq 1 ]]; then
                 value=1
             fi
             if [[ "$RP_FILTER_TAILSCALE_STATE" == active && "$key" == *'.forwarding' ]] \
@@ -3617,33 +3635,430 @@ supported_ssh_list() {
     printf '%s' "$output"
 }
 
+render_firewall_helper() {
+    cat <<'FIREWALL_PYTHON'
+#!/usr/bin/python3
+"""Owned-table loader. Never executes operator text as shell or nft commands."""
+import fcntl
+import hashlib
+import ipaddress
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+
+NFT = "/usr/sbin/nft"
+CONFIG = "/etc/nftables.d/99-security-hardening.nft"
+STATE = "/run/server-hardening-firewall.state"
+LOCK = "/run/server-hardening-firewall.lock"
+LAST_GOOD = "/etc/nftables.d/.hardening-last-good.nft"
+
+
+def trusted_read(path, directory="/etc/nftables.d"):
+    """Walk from / using directory FDs: reject symlinks and writable parents."""
+    if not re.fullmatch(r"/[A-Za-z0-9_./-]+", path):
+        raise ValueError("unsafe path: " + path)
+    parts = path.split("/")[1:]
+    if any(p in ("", ".", "..") for p in parts):
+        raise ValueError("path must be canonical: " + path)
+    if directory and not path.startswith(directory + "/"):
+        raise ValueError("fragment must be beneath " + directory)
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for index, part in enumerate(parts):
+            parent = os.fstat(fd)
+            if parent.st_uid != 0 or parent.st_mode & 0o022:
+                raise ValueError("non-root-owned or writable parent of " + path)
+            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+            if index < len(parts) - 1:
+                flags |= os.O_DIRECTORY
+            child = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise ValueError("require root-owned regular file without group/other write: " + path)
+        if info.st_size > 131072:
+            raise ValueError("file too large: " + path)
+        with os.fdopen(os.dup(fd), encoding="utf-8") as stream:
+            data = stream.read(131073)
+        if len(data) > 131072 or not data.strip():
+            raise ValueError("empty or oversized policy: " + path)
+        return data
+    finally:
+        os.close(fd)
+
+
+def trusted_destination(path):
+    current = Path("/")
+    for part in Path(path).parts[1:]:
+        current /= part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            return None
+        if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise ValueError("unsafe installation path: " + str(current))
+        if current == Path(path) and not stat.S_ISREG(info.st_mode):
+            raise ValueError("installation destination must be a regular file: " + path)
+
+
+def ports(value):
+    values = re.findall(r"[0-9]+", value)
+    if not values or any(not 1 <= int(p) <= 65535 for p in values):
+        raise ValueError("TCP/UDP ports must be 1..65535")
+
+
+def docker_rules(path):
+    text = trusted_read(path)
+    result = []
+    pattern = (r'iifname "([A-Za-z0-9_.:-]{1,15})" oifname "([A-Za-z0-9_.:-]{1,15})" '
+               r'ip saddr ([0-9.]+/[0-9]+) (tcp|udp) dport '
+               r'([0-9]+|\{ [0-9]+(?:, [0-9]+)* \}) (?:counter )?accept'
+               r'(?: comment "[A-Za-z0-9 ._:-]{1,80}")?')
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = re.fullmatch(pattern, line)
+        if not match or match[1] == match[2]:
+            raise ValueError("Docker fragment requires explicit distinct interfaces, IPv4 subnet and destination ports: " + path)
+        network = ipaddress.IPv4Network(match[3], strict=True)
+        if network.prefixlen == 0 or network.is_multicast or network.is_unspecified:
+            raise ValueError("Docker source subnet is too broad or invalid")
+        ports(match[5])
+        result.append(line)
+    if not result:
+        raise ValueError("Docker fragment contains no allowed egress rules: " + path)
+    return "\n".join(result)
+
+
+def api_rule(source, port):
+    if not source and not port:
+        return ""
+    if not re.fullmatch(r"[0-9]+", port):
+        raise ValueError("set both HARDEN_INPUT_TCP_SOURCE and HARDEN_INPUT_TCP_PORT")
+    ports(port)
+    if not re.fullmatch(r"[0-9A-Fa-f:.]+", source):
+        raise ValueError("TCP source must be one IP literal without zone, CIDR or extra syntax")
+    address = ipaddress.ip_address(source)
+    if address.is_unspecified or address.is_multicast:
+        raise ValueError("TCP source must be one unicast host address")
+    family = "ip" if address.version == 4 else "ip6"
+    return (f'        # hardening-input-tcp-v1 source={address} port={int(port)}\n'
+            f'        {family} saddr {address} tcp dport {int(port)} counter accept comment "operator TCP source exception"\n'
+            f'        tcp dport {int(port)} counter drop comment "operator TCP source boundary"')
+
+
+def select_api(source, port, disabled, *ssh_ports):
+    if disabled not in ("0", "1") or (disabled == "1" and (source or port)):
+        raise ValueError("TCP opt-out requires HARDEN_INPUT_TCP_DISABLE=1 and no source/port overrides")
+    if disabled == "1":
+        return ""
+    if not source and not port and not os.path.lexists(CONFIG) and os.path.lexists(LAST_GOOD):
+        raise ValueError("managed policy is missing after last-good recovery; restore it or explicitly select/disable the TCP boundary")
+    if not source and not port and os.path.lexists(CONFIG):
+        persisted = trusted_read(CONFIG, directory=None)
+        expand(persisted)
+        markers = [line.strip() for line in persisted.splitlines()
+                   if "hardening-input-tcp-v1" in line]
+        legacy = [line.strip() for line in persisted.splitlines()
+                  if 'comment "operator TCP source exception"' in line]
+        if markers:
+            if len(markers) != 1:
+                raise ValueError("ambiguous persisted TCP source boundary")
+            match = re.fullmatch(r"# hardening-input-tcp-v1 source=([0-9A-Fa-f:.]+) port=([0-9]+)", markers[0])
+            if not match:
+                raise ValueError("invalid persisted TCP source boundary")
+            source, port = match.groups()
+            expected = api_rule(source, port).splitlines()
+            if any(line.strip() not in {raw.strip() for raw in persisted.splitlines()} for line in expected):
+                raise ValueError("persisted TCP source boundary is incomplete")
+        elif legacy:
+            # Upgrade the previously shipped additive rule to the explicit
+            # boundary; never silently discard it on parameterless Apply.
+            if len(legacy) != 1:
+                raise ValueError("ambiguous legacy TCP source exception")
+            match = re.fullmatch(r'(ip6?) saddr ([0-9A-Fa-f:.]+) tcp dport ([0-9]+) ct state new counter accept comment "operator TCP source exception"', legacy[0])
+            if not match:
+                raise ValueError("invalid legacy TCP source exception")
+            source, port = match[2], match[3]
+    rules = api_rule(source, port)
+    if rules and int(port) in {int(value) for value in ssh_ports}:
+        raise ValueError("TCP source boundary must not overlap an administrative SSH port")
+    return rules
+
+
+def select_docker(override, disabled):
+    if disabled not in ("0", "1") or (disabled == "1" and override):
+        raise ValueError("Docker opt-out requires HARDEN_DOCKER_EGRESS_DISABLE=1 and no path override")
+    if disabled == "1":
+        return ""
+    if not override and not os.path.lexists(CONFIG) and os.path.lexists(LAST_GOOD):
+        raise ValueError("managed policy is missing after last-good recovery; restore it or explicitly select/disable Docker egress")
+    selected = override
+    if not selected and os.path.lexists(CONFIG):
+        persisted = trusted_read(CONFIG, directory=None)
+        # A previously selected fragment is part of the persisted policy. Its
+        # removal is an error, not permission to turn off bridge forwarding.
+        expand(persisted)
+        includes = re.findall(r'^\s*include "([^"]+)"\s*$', persisted, re.M)
+        if len(includes) > 1:
+            raise ValueError("only one Docker fragment can be selected")
+        if includes:
+            selected = includes[0]
+    if not selected:
+        default = "/etc/nftables.d/90-docker-egress.rules"
+        if os.path.lexists(default):
+            selected = default
+    if selected:
+        docker_rules(selected)
+    return selected
+
+
+def expand(text):
+    """Accept one owned table with three chains; no includes outside forward."""
+    result, chain, seen, hooks, opened, closed = [], None, set(), set(), False, False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if closed:
+            raise ValueError("commands outside owned table are forbidden")
+        if not opened:
+            if line != "table inet hardening_filter {":
+                raise ValueError("expected only table inet hardening_filter")
+            opened = True
+        elif line == "}":
+            if chain:
+                chain = None
+            else:
+                closed = True
+        elif chain is None:
+            match = re.fullmatch(r"chain (input|forward|output) \{", line)
+            if not match or match[1] in seen:
+                raise ValueError("invalid or duplicate owned chain")
+            chain = match[1]
+            seen.add(chain)
+        elif line.startswith("include "):
+            match = re.fullmatch(r'include "([^"]+)"', line)
+            if chain != "forward" or not match:
+                raise ValueError("only a Docker forward fragment is supported")
+            result.extend("        " + rule for rule in docker_rules(match[1]).splitlines())
+            continue
+        elif line.startswith("type "):
+            policy = "accept" if chain == "output" else "drop"
+            if line != f"type filter hook {chain} priority filter; policy {policy};":
+                raise ValueError("owned chain hooks and policies must be preserved")
+            if chain in hooks:
+                raise ValueError("duplicate base-chain hook")
+            hooks.add(chain)
+        else:
+            # Inline braces are limited to literal sets. No scope escape, include,
+            # command separator, define, variable, wildcard or secondary file.
+            plain = re.sub(r"\{ [A-Za-z0-9_, -]+ \}", "", line)
+            plain = re.sub(r'"[^"\\]*"', '""', plain)
+            if any(c in plain for c in '{};\\$#') or re.search(r"\b(include|define|flush|delete|destroy|table|chain)\b", plain):
+                raise ValueError("unsupported rule or scope escape")
+        result.append(raw)
+    if not closed or chain or seen != {"input", "forward", "output"} or hooks != seen:
+        raise ValueError("incomplete owned policy")
+    return "\n".join(result) + "\n"
+
+
+def nft(*args, text=None, check=True):
+    run = subprocess.run([NFT, *args], input=text, text=True, capture_output=True)
+    if check and run.returncode:
+        raise ValueError("nft " + " ".join(args) + ": " + run.stderr.strip())
+    return run
+
+
+def activate(text, check_only=False):
+    expanded = expand(text)
+    # add is idempotent; creation, deletion and replacement commit together.
+    # Works on fresh boots and existing tables without a list/delete race.
+    batch = "add table inet hardening_filter\ndelete table inet hardening_filter\n" + expanded
+    nft("-c", "-f", "-", text=batch)
+    if check_only:
+        return None
+    current = nft("-s", "list", "table", "inet", "hardening_filter", check=False)
+    desired = hashlib.sha256(expanded.encode()).hexdigest()
+    signature = desired + "\n" + hashlib.sha256(current.stdout.encode()).hexdigest() + "\n"
+    try:
+        old_signature = trusted_read(STATE, directory=None)
+    except (OSError, ValueError):
+        old_signature = ""
+    if current.returncode == 0 and signature == old_signature:
+        print("Owned firewall already current")
+        return None
+    nft("-f", "-", text=batch)
+    current = nft("-s", "list", "table", "inet", "hardening_filter")
+    # Self-contained boot recovery: a removed/unsafe include cannot disable the
+    # previous policy after reboot. This file has no external includes.
+    save_atomic(LAST_GOOD, expanded)
+    # State is only a no-op hint; always compare live policy as well.
+    signature = desired + "\n" + hashlib.sha256(current.stdout.encode()).hexdigest() + "\n"
+    save_atomic(STATE, signature)
+    print("Owned firewall committed atomically")
+
+
+def save_atomic(path, text):
+    fd, temporary = tempfile.mkstemp(prefix=".hardening-firewall-", dir=str(Path(path).parent))
+    try:
+        with os.fdopen(fd, "w") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else "--apply"
+    if mode == "--api-rule":
+        print(select_api(*sys.argv[2:]))
+        return None
+    if mode == "--docker-select":
+        print(select_docker(*sys.argv[2:]))
+        return None
+    if mode == "--docker-check":
+        docker_rules(sys.argv[2])
+        return None
+    if mode == "--path-check":
+        for path in sys.argv[2:]:
+            trusted_destination(path)
+        return None
+    if mode not in ("--apply", "--check-stdin", "--apply-stdin"):
+        raise ValueError("unknown loader mode")
+    if mode == "--check-stdin":
+        activate(sys.stdin.read(131073), check_only=True)
+        return None
+    # Do not truncate a pre-existing lock; reject substitution before flock.
+    fd = os.open(LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    with os.fdopen(fd, "r+") as lock:
+        info = os.fstat(lock.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise ValueError("unsafe firewall lock file")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            text = trusted_read(CONFIG, directory=None) if mode == "--apply" else sys.stdin.read(131073)
+            activate(text)
+        except (OSError, ValueError):
+            if mode == "--apply" and nft("list", "table", "inet", "hardening_filter", check=False).returncode:
+                # Boot only: retain a valid current table on every reload failure.
+                activate(trusted_read(LAST_GOOD, directory=None))
+                print("Restored last-known-good boot policy; candidate still rejected", file=sys.stderr)
+            raise
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError) as error:
+        sys.exit("Firewall refused; existing policy retained unless a validated transaction already committed. "
+                 "Check root ownership, parent permissions, rule syntax and nft diagnostics: " + str(error))
+FIREWALL_PYTHON
+}
+
+firewall_helper_command() {
+    # The installer distributes one checksum-pinned script. Execute the exact
+    # embedded helper for pre-install validation and recovery as well.
+    local helper status=0
+    helper="$(mktemp)" || return 1
+    render_firewall_helper > "$helper"
+    python3 "$helper" "$@" || status=$?
+    rm -f -- "$helper"
+    return "$status"
+}
+
+firewall_apply_persisted() {
+    firewall_helper_command --apply
+}
+
 render_server_hardening_firewall_unit() {
     cat <<'EOF'
 [Unit]
 Description=Server hardening owned nftables table
+DefaultDependencies=no
 Wants=network-pre.target
 Before=network-pre.target
-After=nftables.service
+After=local-fs.target nftables.service
 
 [Service]
 Type=oneshot
-ExecStartPre=-/usr/sbin/nft delete table inet hardening_filter
-ExecStart=/usr/sbin/nft -f /etc/nftables.d/99-security-hardening.nft
-ExecReload=/bin/sh -c '/usr/sbin/nft delete table inet hardening_filter 2>/dev/null || true; exec /usr/sbin/nft -f /etc/nftables.d/99-security-hardening.nft'
+ExecStart=/usr/local/libexec/server-hardening-firewall
+ExecReload=/usr/local/libexec/server-hardening-firewall
 RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
+RequiredBy=network-pre.target
 EOF
 }
 
-# Explicit operator-owned IPv4 bridge egress opt-in. No wildcard bridge rules.
 docker_egress_rules_file() {
-    printf '%s' "${HARDEN_DOCKER_EGRESS_RULES:-/etc/nftables.d/90-docker-egress.rules}"
+    printf '%s' "${DOCKER_EGRESS_SELECTED:-${HARDEN_DOCKER_EGRESS_RULES:-/etc/nftables.d/90-docker-egress.rules}}"
+}
+
+select_docker_egress() {
+    DOCKER_EGRESS_SELECTED="$(firewall_helper_command --docker-select "${HARDEN_DOCKER_EGRESS_RULES:-}" "${HARDEN_DOCKER_EGRESS_DISABLE:-0}")"
+}
+
+docker_egress_requested() {
+    [[ -n "${DOCKER_EGRESS_SELECTED:-}" ]]
 }
 
 docker_egress_enabled() {
-    [[ -s "$(docker_egress_rules_file)" ]]
+    docker_egress_requested || return 1
+    firewall_helper_command --docker-check "$(docker_egress_rules_file)"
+}
+
+activate_deferred_docker_forwarding() {
+    [[ "$DOCKER_FORWARDING_DEFERRED" -eq 1 ]] || return 0
+    local config="${HARDEN_SYSCTL_CONFIG:-/etc/sysctl.d/99-security-hardening.conf}" forward_policy="" candidate=""
+    DOCKER_FORWARDING_RESTORE_FAILED=0
+    forward_policy="$(nft list chain inet hardening_filter forward)" || return 1
+    grep -Eq 'type filter hook forward .*; policy drop;' <<< "$forward_policy" || return 1
+    docker_egress_enabled || return 1
+    candidate="$(mktemp)" || return 1
+    if ! awk '$1 == "net.ipv4.conf.all.forwarding" {$0="net.ipv4.conf.all.forwarding = 1"; found++} {print} END {if (found != 1) exit 1}' "$config" > "$candidate"; then
+        rm -f -- "$candidate"
+        log ERROR "Managed sysctl file must contain exactly one Docker forwarding setting"
+        return 1
+    fi
+    transaction_copy "$config" sysctl-docker-forwarding.conf || { rm -f -- "$candidate"; return 1; }
+    if install_managed_file "$config" 0644 < "$candidate" \
+        && run_streamed sysctl -w net.ipv4.conf.all.forwarding=1 \
+        && [[ "$(sysctl -n net.ipv4.conf.all.forwarding)" == 1 ]]; then
+        DOCKER_FORWARDING_DEFERRED=0
+        rm -f -- "$candidate"
+        record_change "Enabled explicit Docker IPv4 forwarding after committing the owned default-drop firewall"
+        return 0
+    fi
+    rm -f -- "$candidate"
+    transaction_restore "$config" sysctl-docker-forwarding.conf || DOCKER_FORWARDING_RESTORE_FAILED=1
+    if ! run_streamed sysctl -w net.ipv4.conf.all.forwarding=0 \
+        || [[ "$(sysctl -n net.ipv4.conf.all.forwarding)" != 0 ]]; then
+        DOCKER_FORWARDING_RESTORE_FAILED=1
+    fi
+    log ERROR "Docker forwarding activation failed; config/runtime restoration failure=${DOCKER_FORWARDING_RESTORE_FAILED}"
+    return 1
+}
+
+wireguard_transport_rule() {
+    # Preserve the measured listener, including non-default ports. Never guess
+    # 51820: an unqueryable existing wg0 must not lose its transport on Apply.
+    local listen_port=""
+    command -v wg >/dev/null 2>&1 || return 1
+    listen_port="$(wg show wg0 listen-port)" || return 1
+    [[ "$listen_port" =~ ^[0-9]{1,5}$ ]] || return 1
+    ((10#$listen_port >= 1 && 10#$listen_port <= 65535)) || return 1
+    printf '        udp dport %d accept comment "preserve WireGuard UDP transport wg0"\n' "$((10#$listen_port))"
 }
 
 configure_firewall() {
@@ -3666,16 +4081,25 @@ configure_firewall() {
             log ERROR "Recoverable SSH migration firewall apply cannot complete because nft is unavailable"
             return 1
         fi
-        return 0
+        log ERROR "Firewall cannot be activated without nft; install nftables and retry"
+        return 1
     fi
-    local tailscale_input="" tailscale_forward="" wireguard_rule="" tailscale_healthy_before=0 ssh_rule="" ssh_port_set=""
-    local docker_forward=""
-    if docker_egress_enabled; then
+    local tailscale_input="" tailscale_forward="" wireguard_rule="" wireguard_transport="" tailscale_healthy_before=0 ssh_rule="" ssh_port_set=""
+    local docker_forward="" api_input=""
+    if ! select_docker_egress; then
+        FIREWALL_STATUS="FAILED (Docker fragment selection rejected; live policy untouched)"
+        return 1
+    fi
+    if docker_egress_requested; then
         # The root-owned fragment is nft syntax, never sourced as shell code.
         docker_forward="        include \"$(docker_egress_rules_file)\""
     fi
     local -a ssh_ports=()
     mapfile -t ssh_ports < <(ssh_firewall_ports)
+    if ! api_input="$(firewall_helper_command --api-rule "${HARDEN_INPUT_TCP_SOURCE:-}" "${HARDEN_INPUT_TCP_PORT:-}" "${HARDEN_INPUT_TCP_DISABLE:-0}" "${ssh_ports[@]}")"; then
+        FIREWALL_STATUS="FAILED (invalid or conflicting TCP source boundary; live policy untouched)"
+        return 1
+    fi
     if ((${#ssh_ports[@]} == 1)); then
         ssh_rule="        tcp dport ${ssh_ports[0]} ct state new limit rate 30/minute burst 20 packets accept comment \"administrative SSH\""
     else
@@ -3691,6 +4115,16 @@ configure_firewall() {
         fi
     fi
     if ip link show wg0 >/dev/null 2>&1; then
+        if ! wireguard_transport="$(wireguard_transport_rule)"; then
+            if [[ "$MODE" == dry-run ]]; then
+                FIREWALL_STATUS="REVIEW REQUIRED (wg0 UDP listener needs privileged wireguard-tools inspection)"
+                record_skip "firewall WireGuard" "cannot query a valid wg0 listen port; run a privileged dry-run after configuring WireGuard"
+                return 0
+            fi
+            FIREWALL_STATUS="FAILED (wg0 UDP listener unavailable; live policy untouched)"
+            log ERROR "Cannot preserve wg0 transport: wireguard-tools must report a configured listen port in 1..65535; retaining the live firewall"
+            return 1
+        fi
         wireguard_rule=$'        iifname "wg0" accept comment "preserve WireGuard administration"'
     fi
 
@@ -3701,18 +4135,19 @@ configure_firewall() {
         return 0
     fi
 
-    local candidate check_candidate unit_candidate own_before="" unit_ready=0
+    local candidate unit_candidate helper_candidate own_before="" changed=0 restore_ok=1
     candidate="$(mktemp)"
-    check_candidate="$(mktemp)"
     cat > "$candidate" <<EOF
 #!/usr/sbin/nft -f
 table inet hardening_filter {
     chain input {
         type filter hook input priority filter; policy drop;
         ct state invalid drop
-        ct state established,related accept
         iifname "lo" accept
+${api_input}
+        ct state established,related accept
 ${tailscale_input}
+${wireguard_transport}
 ${wireguard_rule}
         ip protocol icmp icmp type { destination-unreachable, time-exceeded, parameter-problem, echo-request, echo-reply } limit rate 20/second burst 40 packets accept
         ip6 nexthdr ipv6-icmp icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem, nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert, echo-request, echo-reply } limit rate 50/second burst 100 packets accept
@@ -3735,80 +4170,85 @@ ${docker_forward}
     }
 }
 EOF
-    sed "s/hardening_filter/hardening_filter_validate_$$/g" "$candidate" > "$check_candidate"
-    if ! run_streamed nft -c -f "$check_candidate"; then
-        rm -f "$candidate" "$check_candidate"
-        FIREWALL_STATUS="FAILED"
-        if [[ "$recoverable" -eq 1 ]]; then
-            log ERROR "Candidate owned nftables table failed validation during recoverable SSH migration firewall apply"
-            return 1
-        fi
-        die "Candidate owned nftables table failed validation; all live firewall tables are untouched"
+    if ! firewall_helper_command --check-stdin < "$candidate"; then
+        rm -f -- "$candidate"
+        FIREWALL_STATUS="FAILED (candidate rejected; live policy untouched)"
+        log ERROR "Firewall validation failed; repair permissions, fragment path or syntax before retrying"
+        return 1
     fi
-    rm -f "$check_candidate"
-
     unit_candidate="$(mktemp --suffix=.service)"
-    render_server_hardening_firewall_unit > "$unit_candidate"
+    helper_candidate="$(mktemp)"
+    render_firewall_helper > "$helper_candidate"
+    chmod 0700 "$helper_candidate"
+    render_server_hardening_firewall_unit | sed "s@/usr/local/libexec/server-hardening-firewall@${helper_candidate}@g" > "$unit_candidate"
     if ! systemd_verify_unit "$unit_candidate"; then
-        rm -f -- "$candidate" "$unit_candidate"
-        FIREWALL_STATUS="FAILED"
-        if [[ "$recoverable" -eq 1 ]]; then
-            log ERROR "Candidate firewall unit failed validation during recoverable SSH migration firewall apply"
-            return 1
-        fi
-        die "Candidate server-hardening-firewall.service failed systemd-analyze verify; live firewall state is untouched"
+        rm -f -- "$candidate" "$unit_candidate" "$helper_candidate"
+        FIREWALL_STATUS="FAILED (unit rejected; live policy untouched)"
+        return 1
     fi
-
+    if ! firewall_helper_command --path-check /etc/nftables.d/99-security-hardening.nft \
+        /usr/local/libexec/server-hardening-firewall /etc/systemd/system/server-hardening-firewall.service; then
+        rm -f -- "$candidate" "$unit_candidate" "$helper_candidate"
+        log ERROR "Unsafe firewall installation path; refusing installation"
+        return 1
+    fi
+    render_server_hardening_firewall_unit > "$unit_candidate"
     transaction_copy /etc/nftables.d/99-security-hardening.nft nftables-hardening-table.nft
     transaction_copy /etc/systemd/system/server-hardening-firewall.service firewall-service
-    if nft list table inet hardening_filter > "$BACKUP_DIR/nftables-hardening-table-before.nft" 2>/dev/null; then
+    transaction_copy /usr/local/libexec/server-hardening-firewall firewall-helper
+    if nft -s list table inet hardening_filter > "$BACKUP_DIR/nftables-hardening-table-before.nft" 2>/dev/null; then
         own_before="$BACKUP_DIR/nftables-hardening-table-before.nft"
+        if ! firewall_helper_command --check-stdin < "$own_before"; then
+            rm -f -- "$candidate" "$unit_candidate" "$helper_candidate"
+            FIREWALL_STATUS="FAILED (previous owned policy is not safely restorable)"
+            log ERROR "Existing owned table cannot pass atomic restore validation; no candidate was installed. Review custom chains/sets from console"
+            return 1
+        fi
     fi
-    install -d -o root -g root -m 0755 /etc/nftables.d
-    install -o root -g root -m 0600 "$candidate" /etc/nftables.d/99-security-hardening.nft
-    rm -f "$candidate"
-    if ! install_managed_file /etc/systemd/system/server-hardening-firewall.service 0644 < "$unit_candidate"; then
-        rm -f -- "$unit_candidate"
-        log ERROR "Could not install the verified server-hardening-firewall.service"
-    elif ! systemd_verify_unit /etc/systemd/system/server-hardening-firewall.service; then
-        rm -f -- "$unit_candidate"
-        log ERROR "Installed server-hardening-firewall.service failed systemd-analyze verify"
-    elif run_streamed systemctl daemon-reload; then
-        rm -f -- "$unit_candidate"
-        nft delete table inet hardening_filter 2>/dev/null || true
-        unit_ready=1
-    else
-        rm -f -- "$unit_candidate"
-        log ERROR "systemd daemon-reload failed after firewall service installation"
-    fi
-    if [[ "$unit_ready" -eq 1 ]] \
-        && run_streamed nft -f /etc/nftables.d/99-security-hardening.nft \
-        && nft list chain inet hardening_filter input >/dev/null 2>&1 \
+    if install_managed_file /etc/nftables.d/99-security-hardening.nft 0600 < "$candidate"; then
+        changed=$((changed + MANAGED_FILE_CHANGED))
+    else restore_ok=0; fi
+    if install_managed_file /usr/local/libexec/server-hardening-firewall 0700 < "$helper_candidate"; then
+        changed=$((changed + MANAGED_FILE_CHANGED))
+    else restore_ok=0; fi
+    if install_managed_file /etc/systemd/system/server-hardening-firewall.service 0644 < "$unit_candidate"; then
+        changed=$((changed + MANAGED_FILE_CHANGED))
+    else restore_ok=0; fi
+    rm -f -- "$candidate" "$unit_candidate" "$helper_candidate"
+    if [[ "$restore_ok" -eq 1 ]] && { [[ "$changed" -eq 0 ]] || run_streamed systemctl daemon-reload; } \
+        && firewall_apply_persisted \
         && run_streamed systemctl enable server-hardening-firewall.service \
-        && run_streamed systemctl restart server-hardening-firewall.service; then
-        if [[ "$tailscale_healthy_before" -eq 1 ]] && ! tailscale status >/dev/null 2>&1; then
-            log ERROR "Tailscale health check failed after loading the owned table"
-        else
-            FIREWALL_STATUS="OK (owned table; other tables preserved)"
-            record_change "Activated persistent owned dual-stack nftables table; SSH ${ssh_ports[*]}/tcp and Tailscale paths remain allowed"
+        && { systemctl is-active --quiet server-hardening-firewall.service || run_streamed systemctl start server-hardening-firewall.service; } \
+        && ssh_owned_firewall_allows_ports; then
+        if { [[ "$tailscale_healthy_before" -eq 0 ]] || tailscale status >/dev/null 2>&1; } \
+            && activate_deferred_docker_forwarding; then
+            FIREWALL_STATUS="OK (atomic owned table; other tables preserved)"
+            [[ "$changed" -eq 0 ]] || record_change "Activated persistent owned dual-stack firewall; SSH ${ssh_ports[*]}/tcp preserved"
             return 0
         fi
     fi
-
-    nft delete table inet hardening_filter 2>/dev/null || true
-    [[ -n "$own_before" ]] && nft -f "$own_before" || true
-    if [[ -e "$BACKUP_DIR/transactions/firewall-service.absent" ]]; then
-        systemctl disable server-hardening-firewall.service >/dev/null 2>&1 || true
-    fi
-    transaction_restore /etc/nftables.d/99-security-hardening.nft nftables-hardening-table.nft
-    transaction_restore /etc/systemd/system/server-hardening-firewall.service firewall-service
-    run_streamed systemctl daemon-reload
-    FIREWALL_STATUS="FAILED/OWNED TABLE ROLLED BACK"
-    if [[ "$recoverable" -eq 1 ]]; then
-        log ERROR "Owned firewall activation failed during recoverable SSH migration firewall apply; previous owned table restoration was attempted"
+    if [[ "$DOCKER_FORWARDING_RESTORE_FAILED" -eq 1 ]]; then
+        FIREWALL_STATUS="FAILED (Docker forwarding restoration uncertain; validated default-drop firewall retained)"
+        log ERROR "Retained protective firewall because IPv4 forwarding rollback could not be proven; console recovery is required"
         return 1
     fi
-    die "Owned nftables table failed activation or health validation; unrelated tables were never modified"
+    # No previous policy means removing the new default-drop table would open
+    # the host. Retain the validated policy and its recovery loader instead.
+    if [[ -z "$own_before" ]]; then
+        FIREWALL_STATUS="FAILED (no previous table; inspect runtime and retained candidate from console)"
+        log ERROR "Initial firewall setup failed; no table was removed. Verify runtime protection and service/SSH/Tailscale health from console"
+        return 1
+    fi
+    restore_ok=1
+    firewall_helper_command --apply-stdin < "$own_before" || restore_ok=0
+    transaction_restore /etc/nftables.d/99-security-hardening.nft nftables-hardening-table.nft || restore_ok=0
+    transaction_restore /etc/systemd/system/server-hardening-firewall.service firewall-service || restore_ok=0
+    transaction_restore /usr/local/libexec/server-hardening-firewall firewall-helper || restore_ok=0
+    run_streamed systemctl daemon-reload || restore_ok=0
+    nft list chain inet hardening_filter input >/dev/null 2>&1 || restore_ok=0
+    FIREWALL_STATUS="FAILED (previous policy restored=${restore_ok})"
+    log ERROR "Firewall activation failed; atomic rollback verified=${restore_ok}. Foreign tables were untouched; inspect console diagnostics before retry"
+    return 1
 }
 
 inspect_firewall_rule_hygiene() {
@@ -3961,7 +4401,7 @@ rollback_ssh_port_migration() {
         transaction_restore "$(ssh_socket_migration_config_path)" ssh-port-socket.conf || restore_ok=0
     fi
     if ! run_streamed systemctl daemon-reload \
-        || ! run_streamed nft -f /etc/nftables.d/99-security-hardening.nft \
+        || ! firewall_apply_persisted \
         || ! ssh_listener_restore_after_daemon_reload \
         || ! run_streamed systemctl restart fail2ban.service; then
         restore_ok=0

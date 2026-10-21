@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# Integration of Apply orchestration with explicit mocked host boundaries.
+set -Eeuo pipefail
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+test_root="$(mktemp -d)"
+trap 'rm -rf -- "$test_root"' EXIT
+for scenario in fresh existing converged wireguard wireguard-invalid wireguard-unavailable wireguard-dry install-failure unit-failure snapshot-failure nft-failure enable-failure start-failure health-failure rollback-failure forwarding-failure forwarding-restore-failure; do
+    env HARDEN_SOURCE_ONLY=1 TEST_CASE="$scenario" TEST_ROOT="$test_root/$scenario" bash -c '
+        source "$1/harden.sh"; trap - ERR EXIT
+        mkdir -p "$TEST_ROOT"; MODE=apply; BACKUP_DIR="$TEST_ROOT"; SSH_PORT=22
+        log() { printf "%s\n" "$*" >> "$TEST_ROOT/log"; }
+        record_change() { :; }; record_skip() { :; }
+        [[ "$TEST_CASE" != wireguard-dry ]] || MODE=dry-run
+        ip() { [[ "$TEST_CASE" == wireguard* && "$*" == *wg0* ]]; }
+        wg() {
+            [[ "$TEST_CASE" != wireguard-unavailable && "$TEST_CASE" != wireguard-dry ]] || return 1
+            if [[ "$TEST_CASE" == wireguard-invalid ]]; then printf "0\n"; else printf "51829\n"; fi
+        }
+        ssh_firewall_ports() { printf "22\n"; }
+        docker_egress_requested() { return 1; }
+        run_streamed() { "$@"; }
+        systemd_verify_unit() { [[ "$TEST_CASE" != unit-failure ]]; }
+        systemctl() {
+            printf "%s\n" "$*" >> "$TEST_ROOT/systemctl"
+            case "$1:$TEST_CASE" in
+                is-active:fresh|is-active:start-failure|enable:enable-failure|start:start-failure) return 1 ;;
+                *) return 0 ;;
+            esac
+        }
+        nft() {
+            printf "%s\n" "$*" >> "$TEST_ROOT/nft"
+            if [[ "$1" == -s ]]; then
+                [[ "$TEST_CASE" != fresh ]] || return 1
+                printf "previous snapshot\n"
+            fi
+        }
+        transaction_copy() { printf "%s\n" "$*" >> "$TEST_ROOT/copies"; }
+        transaction_restore() { printf "%s\n" "$*" >> "$TEST_ROOT/restores"; }
+        install_managed_file() {
+            cat > "$TEST_ROOT/${1##*/}"
+            [[ "$TEST_CASE" != install-failure ]] || return 1
+            MANAGED_FILE_CHANGED=1
+            [[ "$TEST_CASE" != converged ]] || MANAGED_FILE_CHANGED=0
+        }
+        firewall_helper_command() {
+            printf "%s\n" "$*" >> "$TEST_ROOT/helper"
+            case "$1" in
+                --api-rule|--path-check|--docker-select) return 0 ;;
+                --check-stdin)
+                    cat > "$TEST_ROOT/candidate"
+                    [[ "$TEST_CASE" != snapshot-failure ]] || ! grep -Fxq "previous snapshot" "$TEST_ROOT/candidate"
+                    ;;
+                --apply-stdin)
+                    cat > "$TEST_ROOT/restored-runtime"
+                    [[ "$TEST_CASE" != rollback-failure ]]
+                    ;;
+                *) return 1 ;;
+            esac
+        }
+        firewall_apply_persisted() {
+            printf "apply\n" >> "$TEST_ROOT/helper"
+            [[ "$TEST_CASE" != nft-failure && "$TEST_CASE" != rollback-failure ]]
+        }
+        ssh_owned_firewall_allows_ports() { [[ "$TEST_CASE" != health-failure ]]; }
+        activate_deferred_docker_forwarding() {
+            [[ "$TEST_CASE" != forwarding-restore-failure ]] || { DOCKER_FORWARDING_RESTORE_FAILED=1; return 1; }
+            [[ "$TEST_CASE" != forwarding-failure ]]
+        }
+        case "$TEST_CASE" in
+            wireguard-dry)
+                configure_firewall
+                [[ "$FIREWALL_STATUS" == REVIEW* && ! -e "$TEST_ROOT/99-security-hardening.nft" ]]
+                ! grep -Fxq apply "$TEST_ROOT/helper"
+                ;;
+            fresh|existing|converged|wireguard)
+                configure_firewall
+                [[ "$FIREWALL_STATUS" == OK* ]]
+                ! grep -Eq "restart|reload server" "$TEST_ROOT/systemctl"
+                if [[ "$TEST_CASE" == converged ]]; then ! grep -Fq daemon-reload "$TEST_ROOT/systemctl"; fi
+                if [[ "$TEST_CASE" == wireguard ]]; then
+                    grep -Fq "udp dport 51829 accept" "$TEST_ROOT/99-security-hardening.nft"
+                    grep -Fq "tcp dport 22" "$TEST_ROOT/99-security-hardening.nft"
+                fi
+                ;;
+            *)
+                ! configure_firewall --recoverable
+                [[ "$FIREWALL_STATUS" == FAILED* ]]
+                if [[ "$TEST_CASE" != unit-failure && "$TEST_CASE" != snapshot-failure && "$TEST_CASE" != forwarding-restore-failure && "$TEST_CASE" != wireguard-invalid && "$TEST_CASE" != wireguard-unavailable ]]; then
+                    grep -Fxq "previous snapshot" "$TEST_ROOT/restored-runtime"
+                    grep -Fq firewall-service "$TEST_ROOT/restores"
+                fi
+                if [[ "$TEST_CASE" == forwarding-restore-failure ]]; then
+                    [[ "$FIREWALL_STATUS" == *firewall\ retained* && ! -e "$TEST_ROOT/restored-runtime" ]]
+                fi
+                if [[ "$TEST_CASE" == wireguard-invalid || "$TEST_CASE" == wireguard-unavailable ]]; then
+                    [[ ! -e "$TEST_ROOT/99-security-hardening.nft" && ! -e "$TEST_ROOT/restored-runtime" ]]
+                    ! grep -Fxq apply "$TEST_ROOT/helper"
+                fi
+                if [[ "$TEST_CASE" == snapshot-failure ]]; then
+                    [[ ! -e "$TEST_ROOT/99-security-hardening.nft" ]]
+                    ! grep -Fxq apply "$TEST_ROOT/helper"
+                fi
+                if [[ "$TEST_CASE" == rollback-failure ]]; then [[ "$FIREWALL_STATUS" == *restored=0* ]]; fi
+                ;;
+        esac
+        [[ ! -f "$TEST_ROOT/nft" ]] || ! grep -Eq "^delete|flush" "$TEST_ROOT/nft"
+    ' _ "$repo_root"
+done
+printf 'Firewall Apply orchestration, rollback and converged no-restart: PASS\n'

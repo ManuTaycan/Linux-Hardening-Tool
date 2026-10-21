@@ -730,7 +730,7 @@ EOF
                 > "$2/kernel-module-lockdown.service"
             render_kernel_module_preload_unit /proc/sys/kernel/modules_disabled "$2/kernel-module-lockdown" \
                 > "$2/kernel-module-netfilter-preload.service"
-            render_server_hardening_firewall_unit > "$2/server-hardening-firewall.service"
+            render_server_hardening_firewall_unit | sed "s@/usr/local/libexec/server-hardening-firewall@/bin/true@g" > "$2/server-hardening-firewall.service"
             render_tailscale_preload_dropin > "$2/tailscaled.service.d/99-netfilter-module-preload.conf"
         ' _ "$repo_root" "$verify_dir" || fail "could not render the generated lock helper/unit fixture"
         cat > "$verify_dir/tailscaled.service" <<'EOF'
@@ -2352,7 +2352,7 @@ EOF
     env HARDEN_SOURCE_ONLY=1 HARDEN_SSH_PORT_STATE_FILE="$case_root/rollback-state" HARDEN_SSH_PORT_REPORT="$case_root/rollback-report" bash -c '
         source "$1/harden.sh"; trap - ERR EXIT
         test_dir="$2"; MODE=apply; BACKUP_DIR="$test_dir/rollback-backup"; mkdir -p "$BACKUP_DIR"; SSH_PORT=22; SSH_SERVICE=ssh.service
-        transaction_restore() { printf "%s\n" "$1" >> "$test_dir/restored"; }; run_streamed() { "$@"; }; systemctl() { return 0; }; nft() { return 0; }
+        transaction_restore() { printf "%s\n" "$1" >> "$test_dir/restored"; }; run_streamed() { "$@"; }; systemctl() { return 0; }; nft() { return 0; }; firewall_apply_persisted() { run_streamed nft -f /etc/nftables.d/99-security-hardening.nft; }
         ssh_port_policy_healthy() { [[ "$1" == single && "$2" == 22 ]]; }; write_ssh_port_migration_report() { :; }
         rollback_ssh_port_migration stage 22 2222 "stage-test"
         grep -Fq "single-port" <<<"$SSH_PORT_MIGRATION_STATUS" && [[ ! -e "$HARDEN_SSH_PORT_STATE_FILE" ]]
@@ -2361,7 +2361,7 @@ EOF
     env HARDEN_SOURCE_ONLY=1 HARDEN_SSH_PORT_STATE_FILE="$case_root/rollback-dual-state" HARDEN_SSH_PORT_REPORT="$case_root/rollback-dual-report" bash -c '
         source "$1/harden.sh"; trap - ERR EXIT
         MODE=apply; BACKUP_DIR="$2/rollback-dual-backup"; mkdir -p "$BACKUP_DIR"; SSH_PORT=22; SSH_SERVICE=ssh.service
-        transaction_restore() { :; }; run_streamed() { "$@"; }; systemctl() { return 0; }; nft() { return 0; }
+        transaction_restore() { :; }; run_streamed() { "$@"; }; systemctl() { return 0; }; nft() { return 0; }; firewall_apply_persisted() { run_streamed nft -f /etc/nftables.d/99-security-hardening.nft; }
         ssh_port_policy_healthy() { [[ "$1" == dual && "$2" == 22 && "$3" == 2222 ]]; }; write_ssh_port_migration_report() { :; }
         rollback_ssh_port_migration retire 22 2222 "retire-test"
         grep -Fq "dual-port" <<<"$SSH_PORT_MIGRATION_STATUS" && [[ "$SSH_STAGED_OLD_PORT" == 22 && "$SSH_STAGED_NEW_PORT" == 2222 ]]
@@ -2370,7 +2370,7 @@ EOF
     env HARDEN_SOURCE_ONLY=1 HARDEN_SSH_PORT_STATE_FILE="$case_root/rollback-failure-state" HARDEN_SSH_PORT_REPORT="$case_root/rollback-failure-report" bash -c '
         source "$1/harden.sh"; trap - ERR EXIT
         MODE=apply; BACKUP_DIR="$2/rollback-failure-backup"; mkdir -p "$BACKUP_DIR"; SSH_PORT=22; SSH_SERVICE=ssh.service
-        transaction_restore() { return 1; }; run_streamed() { return 0; }; systemctl() { return 0; }; ssh_port_policy_healthy() { return 0; }; write_ssh_port_migration_report() { :; }
+        firewall_apply_persisted() { run_streamed nft -f /etc/nftables.d/99-security-hardening.nft; }; transaction_restore() { return 1; }; run_streamed() { return 0; }; systemctl() { return 0; }; ssh_port_policy_healthy() { return 0; }; write_ssh_port_migration_report() { :; }
         ! rollback_ssh_port_migration stage 22 2222 "restore-test"
         [[ "$SSH_PORT_MIGRATION_STATUS" == FAILED/ROLLBACK-FAILED* ]] || exit 1
         transaction_restore() { :; }
@@ -2468,7 +2468,7 @@ EOF
     env HARDEN_SOURCE_ONLY=1 HARDEN_SSH_PORT_STATE_FILE="$case_root/socket-rollback-state" HARDEN_SSH_PORT_REPORT="$case_root/socket-rollback-report" bash -c '
         source "$1/harden.sh"; trap - ERR EXIT
         test_dir="$2"; MODE=apply; BACKUP_DIR="$test_dir/socket-rollback-backup"; mkdir -p "$BACKUP_DIR" "$test_dir/socket-rollback-log"; SSH_PORT=22; SSH_SERVICE=ssh.service; SSH_LISTENER_MODE=socket; SSH_LISTENER_UNIT=ssh.socket; service_restart=0
-        transaction_restore() { :; }; nft() { return 0; }; run_streamed() { "$@"; }; systemctl() { printf "systemctl:%s:%s\n" "$1" "${2:-}" >> "$test_dir/socket-rollback-log/commands"; [[ "$1" != restart || "$2" != ssh.service ]] || { service_restart=1; return 1; }; return 0; }
+        transaction_restore() { :; }; nft() { return 0; }; firewall_apply_persisted() { run_streamed nft -f /etc/nftables.d/99-security-hardening.nft; }; run_streamed() { "$@"; }; systemctl() { printf "systemctl:%s:%s\n" "$1" "${2:-}" >> "$test_dir/socket-rollback-log/commands"; [[ "$1" != restart || "$2" != ssh.service ]] || { service_restart=1; return 1; }; return 0; }
         ssh_port_policy_healthy() { [[ "$1" == single && "$2" == 22 ]] || [[ "$1" == dual && "$2" == 22 && "$3" == 2222 ]]; }; write_ssh_port_migration_report() { :; }
         rollback_ssh_port_migration stage 22 2222 "socket-stage" && rollback_ssh_port_migration retire 22 2222 "socket-retire"
         [[ "$(grep -Fc "systemctl:daemon-reload:" "$test_dir/socket-rollback-log/commands")" == 2 && "$(grep -Fc "systemctl:restart:ssh.socket" "$test_dir/socket-rollback-log/commands")" == 2 && "$service_restart" == 0 ]]
@@ -2595,9 +2595,9 @@ EOF
     env HARDEN_SOURCE_ONLY=1 bash -c '
         source "$1/harden.sh"; trap - ERR EXIT
         MODE=apply; BACKUP_DIR="$2/recoverable-firewall-backup"; mkdir -p "$BACKUP_DIR"; died=0
-        nft() { return 1; }; run_streamed() { "$@"; }; die() { died=1; return 99; }; log() { :; }
+        nft() { return 1; }; firewall_helper_command() { [[ "$1" == --api-rule ]]; }; run_streamed() { "$@"; }; die() { died=1; return 99; }; log() { :; }
         ! configure_firewall --recoverable
-        [[ "$died" == 0 && "$FIREWALL_STATUS" == FAILED ]]
+        [[ "$died" == 0 && "$FIREWALL_STATUS" == FAILED* ]]
     ' _ "$repo_root" "$case_root" || fail "recoverable SSH-migration firewall validation still exited the process"
 
     env HARDEN_SOURCE_ONLY=1 bash -c '
@@ -2607,8 +2607,8 @@ EOF
         record_skip() { :; }; log() { :; }
         ! configure_firewall --recoverable
         [[ "$FIREWALL_STATUS" == FAILED ]]
-        configure_firewall
-    ' _ "$repo_root" "$case_root" || fail "recoverable SSH-migration firewall apply did not fail when nft was unavailable while generic Phase 07 behavior changed"
+        ! configure_firewall
+    ' _ "$repo_root" "$case_root" || fail "firewall apply did not fail explicitly when nft was unavailable"
 
     env HARDEN_SOURCE_ONLY=1 bash -c '
         source "$1/harden.sh"; trap - ERR EXIT
@@ -2630,7 +2630,7 @@ EOF
         install_managed_file() { local target="$1"; shift 2; cat > "$target"; MANAGED_FILE_CHANGED=1; }
         sshd() { if [[ "$1" == -t ]]; then return 0; fi; awk "\$1 == \"Port\" {print \"port \" \$2}" "$(ssh_migration_config_path)"; }; ssh_port_is_listening() { grep -Fxq "Port $1" "$(ssh_migration_config_path)"; }
         ssh_port_policy_healthy() { [[ "$1" == dual && "$2" == 22 && "$3" == 2222 ]] && grep -Fxq "Port 22" "$(ssh_migration_config_path)" && grep -Fxq "Port 2222" "$(ssh_migration_config_path)" && [[ "$(< "$test_dir/firewall")" == dual && "$(< "$test_dir/fail2ban")" == dual ]] && grep -Fxq "status=staged" "$HARDEN_SSH_PORT_STATE_FILE"; }
-        run_streamed() { return 0; }; systemctl() { return 0; }; configure_fail2ban() { printf new > "$test_dir/fail2ban"; FAIL2BAN_STATUS=OK; return 0; }; command() { [[ "$1" == -v && "${2:-}" == nft ]] && return 1; builtin command "$@"; }; record_skip() { :; }; write_ssh_port_migration_report() { :; }; log() { :; }
+        run_streamed() { return 0; }; firewall_apply_persisted() { return 0; }; systemctl() { return 0; }; configure_fail2ban() { printf new > "$test_dir/fail2ban"; FAIL2BAN_STATUS=OK; return 0; }; command() { [[ "$1" == -v && "${2:-}" == nft ]] && return 1; builtin command "$@"; }; record_skip() { :; }; write_ssh_port_migration_report() { :; }; log() { :; }
         ! retire_ssh_port_migration
         [[ "$SSH_PORT_MIGRATION_STATUS" == FAILED/ROLLED\ BACK* ]] && ! grep -Fxq "status=retired" "$HARDEN_SSH_PORT_STATE_FILE" && ssh_port_policy_healthy dual 22 2222
     ' _ "$repo_root" "$case_root" || fail "unavailable nft during final retire did not prove dual-port rollback or incorrectly wrote retired state"
@@ -3205,6 +3205,7 @@ EOF
         HARDEN_SYSCTL_CONFIG="$ipv6_dry/99-security-hardening.conf" HARDEN_IPV6_REPORT="$ipv6_dry/ipv6-report.txt" bash -c '
             source "$1/harden.sh"; trap - ERR EXIT
             MODE=dry-run; AGGRESSIVE=1; DISABLE_IPV6=1; log() { :; }
+            select_docker_egress() { DOCKER_EGRESS_SELECTED=""; }
             configure_sysctl
             [[ "$IPV6_POLICY" == disabled-explicit-opt-in ]]
             [[ "$IPV6_PERSISTENCE_STATUS" == PLANNED* ]]
@@ -3219,6 +3220,7 @@ EOF
             HARDEN_RP_FILTER_REPORT="$root/rp-filter-report.txt" IPV6_TEST_FAIL_SYSCTL_AFTER="$fail_after" IPV6_TEST_FAIL_SYSCTL_KEY="$fail_key" IPV6_TEST_EXPECT_FAILURE="$([[ "$fail_after" -gt 0 || -n "$fail_key" ]] && printf 1 || printf 0)" bash -c '
                 source "$1/harden.sh"; trap - ERR EXIT
                 MODE=apply; AGGRESSIVE=1; DISABLE_IPV6="$3"; BACKUP_DIR="$2/backup"; CHANGE_LOG="$2/changes.tsv"
+                select_docker_egress() { DOCKER_EGRESS_SELECTED=""; }
                 mkdir -p "$BACKUP_DIR"; : > "$CHANGE_LOG"
                 log() { :; }; record_change() { :; }; record_skip() { :; }
                 run_streamed() { "$@"; }
@@ -3705,6 +3707,7 @@ EOF
             RP_TEST_TAILSCALE_ACTIVE="$active" RP_TEST_DEFAULT_ROUTES="$routes" RP_TEST_RULES="$rules" \
             RP_TEST_HEALTH="$health" RP_TEST_COMMAND_LOG="$commands" bash -c '
                 source "$1/harden.sh"; trap - ERR EXIT
+                select_docker_egress() { DOCKER_EGRESS_SELECTED=""; }
                 sysctl_candidates() { printf "%s\\n" "net.ipv4.conf.all.rp_filter=1" "net.ipv4.conf.default.rp_filter=1"; }
                 MODE=apply; BACKUP_DIR="$2/backup"; CHANGE_LOG="$2/changes.tsv"; : > "$CHANGE_LOG"
                 transaction_copy() { :; }; transaction_restore() { :; }
@@ -3735,6 +3738,7 @@ EOF
         RP_TEST_DEFAULT_ROUTES='default via 192.0.2.1 dev eth0' RP_TEST_HEALTH=clear \
         RP_TEST_COMMAND_LOG="$case_root/active/commands.log" bash -c '
             source "$1/harden.sh"; trap - ERR EXIT
+                select_docker_egress() { DOCKER_EGRESS_SELECTED=""; }
             sysctl_candidates() { printf "%s\\n" "net.ipv4.conf.all.rp_filter=1" "net.ipv4.conf.default.rp_filter=1"; }
             MODE=apply; BACKUP_DIR="$2/backup"; CHANGE_LOG="$2/changes.tsv"; : > "$CHANGE_LOG"
             transaction_copy() { :; }; transaction_restore() { :; }
@@ -3752,6 +3756,7 @@ EOF
         RP_TEST_DEFAULT_ROUTES='default via 192.0.2.1 dev eth0' RP_TEST_HEALTH=clear \
         RP_TEST_COMMAND_LOG="$case_root/active/commands.log" bash -c '
             source "$1/harden.sh"; trap - ERR EXIT
+                select_docker_egress() { DOCKER_EGRESS_SELECTED=""; }
             sysctl_candidates() { printf "%s\\n" "net.ipv4.conf.all.rp_filter=1" "net.ipv4.conf.default.rp_filter=1"; }
             MODE=apply; BACKUP_DIR="$2/backup"; CHANGE_LOG="$2/changes.tsv"; : > "$CHANGE_LOG"
             transaction_copy() { :; }; transaction_restore() { :; }
@@ -3779,6 +3784,7 @@ EOF
         RP_TEST_TAILSCALE_ACTIVE=0 RP_TEST_DEFAULT_ROUTES='default via 192.0.2.1 dev eth0' \
         RP_TEST_RULES='100: from 198.51.100.0/24 lookup 100' RP_TEST_COMMAND_LOG="$uncertain/commands.log" bash -c '
             source "$1/harden.sh"; trap - ERR EXIT
+                select_docker_egress() { DOCKER_EGRESS_SELECTED=""; }
             sysctl_candidates() { printf "%s\\n" "net.ipv4.conf.all.rp_filter=1" "net.ipv4.conf.default.rp_filter=1"; }
             MODE=apply; BACKUP_DIR="$2/backup"; CHANGE_LOG="$2/changes.tsv"; : > "$CHANGE_LOG"
             transaction_copy() { :; }; transaction_restore() { :; }
@@ -3809,6 +3815,7 @@ EOF
         RP_TEST_TAILSCALE_ACTIVE=0 RP_TEST_DEFAULT_ROUTES='default via 192.0.2.1 dev eth0' \
         RP_TEST_RULES='100: from 198.51.100.0/24 lookup 100' RP_TEST_COMMAND_LOG="$uncertain/commands.log" bash -c '
             source "$1/harden.sh"; trap - ERR EXIT
+                select_docker_egress() { DOCKER_EGRESS_SELECTED=""; }
             sysctl_candidates() { printf "%s\\n" "net.ipv4.conf.all.rp_filter=1" "net.ipv4.conf.default.rp_filter=1"; }
             MODE=apply; BACKUP_DIR="$2/backup"; CHANGE_LOG="$2/changes.tsv"; : > "$CHANGE_LOG"
             transaction_copy() { :; }; transaction_restore() { :; }
@@ -3828,6 +3835,7 @@ EOF
         RP_TEST_TAILSCALE_ACTIVE=0 RP_TEST_DEFAULT_ROUTES=$'default via 192.0.2.1 dev eth0\ndefault via 198.51.100.1 dev eth1' \
         RP_TEST_COMMAND_LOG="$multipath/commands.log" bash -c '
             source "$1/harden.sh"; trap - ERR EXIT
+                select_docker_egress() { DOCKER_EGRESS_SELECTED=""; }
             sysctl_candidates() { printf "%s\\n" "net.ipv4.conf.all.rp_filter=1" "net.ipv4.conf.default.rp_filter=1"; }
             MODE=apply; BACKUP_DIR="$2/backup"; CHANGE_LOG="$2/changes.tsv"; : > "$CHANGE_LOG"
             transaction_copy() { :; }; transaction_restore() { :; }
@@ -3852,6 +3860,7 @@ EOF
         RP_TEST_TAILSCALE_ACTIVE=0 RP_TEST_DEFAULT_ROUTES='default via 192.0.2.1 dev eth0' \
         RP_TEST_RULES='100: from 198.51.100.0/24 lookup 100' RP_TEST_COMMAND_LOG="$unreadable/commands.log" bash -c '
             source "$1/harden.sh"; trap - ERR EXIT
+                select_docker_egress() { DOCKER_EGRESS_SELECTED=""; }
             sysctl_candidates() { printf "%s\\n" "net.ipv4.conf.all.rp_filter=1" "net.ipv4.conf.default.rp_filter=1"; }
             MODE=apply; BACKUP_DIR="$2/backup"; CHANGE_LOG="$2/changes.tsv"; : > "$CHANGE_LOG"
             transaction_copy() { :; }; transaction_restore() { :; }
@@ -3878,6 +3887,7 @@ EOF
         HARDEN_SYSCTL_CONFIG="$dry/99-security-hardening.conf" HARDEN_RP_FILTER_REPORT="$dry/rp-filter-report.txt" \
         RP_TEST_TAILSCALE_ACTIVE=1 RP_TEST_DEFAULT_ROUTES='default via 192.0.2.1 dev eth0' RP_TEST_COMMAND_LOG="$dry/commands.log" bash -c '
             source "$1/harden.sh"; trap - ERR EXIT
+                select_docker_egress() { DOCKER_EGRESS_SELECTED=""; }
             sysctl_candidates() { printf "%s\\n" "net.ipv4.conf.all.rp_filter=1" "net.ipv4.conf.default.rp_filter=1"; }
             MODE=dry-run; configure_sysctl
             grep -Fxq original "$HARDEN_SYSCTL_CONFIG"
