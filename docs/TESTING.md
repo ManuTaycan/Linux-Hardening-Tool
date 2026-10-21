@@ -397,3 +397,47 @@ access, including after reload/restart/reboot and parameterless Apply. Check
 explicit opt-out and that invalid/partial/SSH-overlapping selections retain
 the previous policy. Never run these service/reboot tests on a
 production server without explicit approval.
+
+## Conservative automatic security updates (#50)
+
+The managed policy uses the distribution's `apt-daily.timer` and
+`apt-daily-upgrade.timer`; it adds no cron job or second scheduler. Security
+origins are explicit: Ubuntu's security archive and optional Ubuntu Pro ESM
+security archives, or Debian's release-specific Debian-Security codename.
+Ubuntu security pockets have the base release codename and a `-security`
+archive, so matching `codename=RELEASE-security` would miss normal Ubuntu
+security updates. No third-party, updates, proposed, backports or release
+upgrade origin is enabled. Missing ESM repositories are not added/enabled.
+
+APT combines Allowed-Origins and Origins-Pattern lists. The managed fragment
+clears both before defining the security list; a later override is detected
+from `apt-config dump`. All three automatic unused-package/kernel/dependency
+removal settings, automatic reboots (including with users), downgrades and
+automatic interrupted-dpkg repair are disabled. Autoclean only clears cached
+package archives; it does not uninstall packages. Existing blacklists remain.
+No implementation can guarantee every upstream security update is compatible
+with every workload; operators still need snapshots, monitoring and staging.
+
+Effective policy and `unattended-upgrade --dry-run --debug` are validated before
+new timers are enabled. Existing timers can already hold APT locks; command
+retries remain bounded and preserve their owner. Missing tools, masked or
+ambiguous timers, later policy conflicts, parse errors, failed validation and
+failed timer activation produce FAILED in the final summary and exit status.
+Configuration is restored on failure, along with newly changed timer state;
+running package services/processes are never stopped to obtain a lock.
+Dry-run only plans these changes and never runs unattended-upgrade or enables
+timers. The timer rollback stops/disables only timers that were previously
+inactive/disabled; it never stops an in-progress package operation.
+
+The fixture tests exercise failure and rollback boundaries. Linux CI also
+uses real `apt-config` with an isolated APT configuration directory to test
+list-clearing, both distribution policies and later conflicting overrides.
+This does not prove a successful upgrade on Ubuntu. On a disposable Ubuntu VM,
+inspect `apt-cache policy`, `apt-config dump`, `systemctl list-timers apt-daily*`,
+the unattended-upgrades logs and a real unattended dry-run; exercise live
+apt-daily contention, a broken dependency/configuration case and a converged
+second Apply. Confirm no package removal or automatic reboot is proposed.
+
+Policy reference: the upstream [Ubuntu configuration](https://github.com/mvo5/unattended-upgrades/blob/master/data/50unattended-upgrades.Ubuntu),
+[Debian configuration](https://github.com/mvo5/unattended-upgrades/blob/master/data/50unattended-upgrades.Debian)
+and [origin-list handling](https://github.com/mvo5/unattended-upgrades/blob/master/unattended-upgrade).
