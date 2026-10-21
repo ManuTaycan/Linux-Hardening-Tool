@@ -17,6 +17,7 @@ static:
 	./scripts/ci-static-checks.sh
 
 regression:
+	./scripts/transaction-tests.sh
 	./scripts/container-tests.sh
 	./scripts/updates-policy-tests.sh
 	./scripts/package-result-tests.sh

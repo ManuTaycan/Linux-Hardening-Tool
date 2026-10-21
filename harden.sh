@@ -808,11 +808,24 @@ backup_config() {
 transaction_copy() {
     local source="$1" label="$2"
     [[ "$MODE" == "apply" ]] || return 0
-    local target="$BACKUP_DIR/transactions/${label}"
-    install -d -m 0700 "$(dirname "$target")"
-    if [[ -e "$source" ]]; then
-        cp -a -- "$source" "$target"
+    local target="$BACKUP_DIR/transactions/${label}" staging=""
+    install -d -m 0700 "$(dirname "$target")" || return 1
+    if [[ -e "$source" || -L "$source" ]]; then
+        staging="$(mktemp -d "$BACKUP_DIR/transactions/.snapshot.XXXXXX")" || return 1
+        if ! cp -a -- "$source" "$staging/content"; then
+            rm -rf -- "$staging"
+            return 1
+        fi
+        # Reused labels mean the current phase's baseline, not a stale absent
+        # marker or a directory nested into an earlier snapshot.
+        if ! rm -rf -- "$target" || ! mv -- "$staging/content" "$target"; then
+            rm -rf -- "$staging"
+            return 1
+        fi
+        rm -f -- "${target}.absent" || return 1
+        rmdir -- "$staging" || return 1
     else
+        rm -rf -- "$target" || return 1
         : > "${target}.absent"
     fi
 }
@@ -823,7 +836,7 @@ transaction_restore() {
     local saved="$BACKUP_DIR/transactions/${label}"
     if [[ -e "${saved}.absent" ]]; then
         rm -rf -- "$destination"
-    elif [[ -e "$saved" ]]; then
+    elif [[ -e "$saved" || -L "$saved" ]]; then
         rm -rf -- "$destination"
         cp -a -- "$saved" "$destination"
     fi
