@@ -49,7 +49,7 @@ EOF
     grep -Eq 'exec[[:space:]]+[34]|LOG_CAPTURE_ACTIVE|exec[[:space:]]*>[[:space:]]*>\(' "$repo_root/harden.sh" \
         && fail "legacy asynchronous logging or persistent FD 3/4 remains"
 
-    env HARDEN_SOURCE_ONLY=1 HARDEN_LOG_FILE="$log_file" \
+    env SHELL="$(command -v bash)" HARDEN_SOURCE_ONLY=1 HARDEN_LOG_FILE="$log_file" \
         HARDEN_BACKUP_ROOT="$test_root/logging/backups" \
         script -qec "source '$repo_root/harden.sh'; trap - ERR EXIT; [[ \"\$USE_COLOR\" -eq 1 ]]; MODE=apply; init_logging; log OK color-render-test" /dev/null \
         > "$terminal_output"
@@ -58,7 +58,7 @@ EOF
         fail "persistent log contains ANSI escapes"
     fi
 
-    env HARDEN_SOURCE_ONLY=1 NO_COLOR=1 HARDEN_LOG_FILE="$test_root/logging/no-color.log" \
+    env SHELL="$(command -v bash)" HARDEN_SOURCE_ONLY=1 NO_COLOR=1 HARDEN_LOG_FILE="$test_root/logging/no-color.log" \
         HARDEN_BACKUP_ROOT="$test_root/logging/backups" \
         script -qec "source '$repo_root/harden.sh'; trap - ERR EXIT; MODE=apply; init_logging; log OK no-color-test" /dev/null \
         > "$no_color_output"
@@ -66,7 +66,7 @@ EOF
         fail "NO_COLOR did not suppress interactive ANSI color"
     fi
 
-    env HARDEN_SOURCE_ONLY=1 HARDEN_LOG_FILE="$test_root/logging/cli-no-color.log" \
+    env SHELL="$(command -v bash)" HARDEN_SOURCE_ONLY=1 HARDEN_LOG_FILE="$test_root/logging/cli-no-color.log" \
         HARDEN_BACKUP_ROOT="$test_root/logging/backups" \
         script -qec "source '$repo_root/harden.sh'; trap - ERR EXIT; [[ \"\$USE_COLOR\" -eq 1 ]]; parse_args --apply --no-color; [[ \"\$USE_COLOR\" -eq 0 ]]; init_logging; log OK cli-no-color-test" /dev/null \
         > "$cli_no_color_output"
