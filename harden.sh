@@ -26,6 +26,8 @@ AGGRESSIVE=0
 AUTO_REBOOT=0
 DISABLE_IPV6=0
 NON_INTERACTIVE=0
+EXECUTION_ENVIRONMENT="not assessed"
+EXECUTION_ENVIRONMENT_REASON="not assessed"
 OS_ID=""
 OS_VERSION=""
 OS_CODENAME=""
@@ -664,6 +666,76 @@ check_root() {
         die "--apply must run as root (for example: sudo ./harden.sh --apply)"
     fi
 }
+
+execution_file_exists() { [[ -e "$1" || -L "$1" ]]; }
+execution_read_file() { cat -- "$1"; }
+
+detect_execution_environment() {
+    local detected="" status=0 marker cgroup cgroup_text=""
+    EXECUTION_ENVIRONMENT="unknown"
+    EXECUTION_ENVIRONMENT_REASON="container detection unavailable or inconclusive"
+    if [[ -n "${container:-}" ]]; then
+        EXECUTION_ENVIRONMENT=container
+        EXECUTION_ENVIRONMENT_REASON="container environment marker"
+        return 0
+    fi
+    for marker in /.dockerenv /run/.containerenv /run/systemd/container; do
+        if execution_file_exists "$marker"; then
+            EXECUTION_ENVIRONMENT=container
+            EXECUTION_ENVIRONMENT_REASON="container filesystem marker ${marker}"
+            return 0
+        fi
+    done
+    for cgroup in /proc/1/cgroup /proc/self/cgroup; do
+        if cgroup_text="$(execution_read_file "$cgroup" 2>/dev/null)" && grep -Eq '(^|[/:-])(docker|containerd|libpod|kubepods|lxc)([/_.:-]|$)' <<< "$cgroup_text"; then
+            EXECUTION_ENVIRONMENT=container
+            EXECUTION_ENVIRONMENT_REASON="container cgroup evidence"
+            return 0
+        fi
+    done
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        if detected="$(systemd-detect-virt --container 2>/dev/null)"; then status=0; else status=$?; fi
+        if [[ "$status" -eq 0 && -n "$detected" && "$detected" != none ]]; then
+            EXECUTION_ENVIRONMENT=container
+            EXECUTION_ENVIRONMENT_REASON="systemd-detect-virt --container: ${detected}"
+            return 0
+        fi
+        if systemd-detect-virt --chroot >/dev/null 2>&1; then
+            EXECUTION_ENVIRONMENT=container
+            EXECUTION_ENVIRONMENT_REASON="chroot environment"
+            return 0
+        fi
+        if systemd-detect-virt --private-users >/dev/null 2>&1; then
+            EXECUTION_ENVIRONMENT=container
+            EXECUTION_ENVIRONMENT_REASON="private user namespace"
+            return 0
+        fi
+        if [[ "$status" -eq 1 && "$detected" == none ]]; then
+            EXECUTION_ENVIRONMENT=host
+            EXECUTION_ENVIRONMENT_REASON="no detected container; host systemd prerequisite still required"
+        fi
+    fi
+    return 0
+}
+
+check_execution_environment() {
+    detect_execution_environment
+    if [[ "$MODE" == apply ]]; then
+        if [[ "$EXECUTION_ENVIRONMENT" != host ]]; then
+            die "Apply refused before logging, backups or host changes: ${EXECUTION_ENVIRONMENT_REASON}. Container/chroot/WSL hardening is not validated; use a dedicated Ubuntu/Debian VM or host"
+            return 1
+        fi
+        if [[ "$(execution_read_file /proc/1/comm 2>/dev/null)" != systemd ]] \
+            || ! systemctl show --property=Version --value >/dev/null 2>&1; then
+            die "Apply requires host systemd as PID 1 and an accessible system bus; refusing host-wide changes in this environment"
+            return 1
+        fi
+    elif [[ "$EXECUTION_ENVIRONMENT" != host ]]; then
+        log WARN "Diagnostic dry-run only: ${EXECUTION_ENVIRONMENT_REASON}; host-level controls may be unavailable and Apply is blocked"
+    fi
+    return 0
+}
+
 
 detect_os() {
     [[ -r /etc/os-release ]] || die "/etc/os-release is missing"
@@ -8612,6 +8684,7 @@ AppArmor report    : $([[ "$MODE" == "apply" && "$APPARMOR_STATUS" != "NOT AVAIL
 AIDE               : ${AIDE_STATUS}
 Fail2ban           : ${FAIL2BAN_STATUS}
 Remote Logging     : ${REMOTE_LOG_STATUS}
+Execution context  : ${EXECUTION_ENVIRONMENT} (${EXECUTION_ENVIRONMENT_REASON})
 Automatic Updates  : ${UPDATES_STATUS}
 Package upgrade    : ${PACKAGE_UPGRADE_STATUS}
 needrestart        : ${NEEDRESTART_STATUS}
@@ -8671,6 +8744,7 @@ main() {
     APPARMOR_COMPLETED=0
     parse_args "$@"
     check_root
+    check_execution_environment
     # Complete all terminal input before file logging starts.
     ask_remote_logging
     init_logging

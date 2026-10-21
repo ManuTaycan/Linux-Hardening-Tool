@@ -441,3 +441,35 @@ second Apply. Confirm no package removal or automatic reboot is proposed.
 Policy reference: the upstream [Ubuntu configuration](https://github.com/mvo5/unattended-upgrades/blob/master/data/50unattended-upgrades.Ubuntu),
 [Debian configuration](https://github.com/mvo5/unattended-upgrades/blob/master/data/50unattended-upgrades.Debian)
 and [origin-list handling](https://github.com/mvo5/unattended-upgrades/blob/master/unattended-upgrade).
+
+## Execution boundaries (#51)
+
+Apply targets a dedicated Ubuntu/Debian host or full VM with systemd as PID 1,
+an accessible system bus and APT. Before any prompt, file log, backup, package
+operation or hardening phase, it checks systemd's container/chroot/user-namespace
+detection, container environment/filesystem markers and cgroup evidence. A
+positive container signal or an inconclusive environment blocks Apply. Root
+or extra Linux capabilities do not bypass this gate.
+
+| Environment | Current policy |
+| --- | --- |
+| Dedicated Ubuntu/Debian host or full VM | Apply may pass preflight; role-specific acceptance still required |
+| Docker/Podman/OCI, including privileged or host-network containers | Apply blocked; shared kernel/network/mount exposure can affect the host |
+| LXC/LXD, systemd-nspawn, OpenVZ | Apply blocked, even with systemd or delegated capabilities |
+| Kubernetes workloads, rootless containers, private user namespace | Apply blocked |
+| Chroot, WSL, missing detector, ambiguous environment or non-systemd PID 1 | Apply blocked |
+| Dry-run in an unsupported environment | Read-only diagnostics/planning where tools exist; host controls may be unavailable |
+
+Kernel module lockdown, sysctl, audit, boot/initramfs, firewall, host package and
+service changes are not safe generic container controls. This repository does
+not claim support for any container family or automatically enable privileged
+operation. Detection is evidence-based, not a security boundary against a
+malicious root operator who conceals its environment or modifies the script.
+Use a dedicated VM for target acceptance and harden workload images/runtime
+policies separately. See [systemd's detection semantics](https://www.freedesktop.org/software/systemd/man/latest/systemd-detect-virt.html).
+
+Fixture regressions exercise positive signals, ambiguous detection, PID 1/bus
+requirements and main's early refusal before mutation. Manual compatibility
+checks still needed: run the actual CLI in disposable Docker/Podman, LXC/nspawn
+and a normal Ubuntu VM; confirm --help works, blocked Apply writes no log/backup
+and touches no host control, and dry-run reports diagnostic limitations.
